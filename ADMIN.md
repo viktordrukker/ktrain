@@ -11,6 +11,7 @@ Accepted admin identity:
 
 Fallback for local/dev:
 - `x-admin-pin: <ADMIN_PIN>`
+- First deploy: use current PIN to log into `Settings / Admin`, then set a new PIN in the `Admin PIN` block.
 
 ## Admin-only Routes
 - `/api/admin/*`

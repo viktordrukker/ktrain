@@ -56,9 +56,14 @@ function parseGroups(req) {
   return String(raw).split(/[;,]/).map((x) => x.trim()).filter(Boolean);
 }
 
+function getCurrentAdminPin() {
+  const runtime = readRuntimeConfig();
+  return String(runtime.adminPin || ADMIN_PIN);
+}
+
 function isAdmin(req) {
   const pin = req.headers["x-admin-pin"];
-  if (pin && pin === ADMIN_PIN) return true;
+  if (pin && pin === getCurrentAdminPin()) return true;
   const user = req.headers["x-forwarded-user"] || req.headers["x-auth-request-user"];
   if (!user) return false;
   const groups = parseGroups(req);
@@ -526,6 +531,46 @@ app.post("/api/admin/reset", requireAdmin, adminLimiter, async (req, res) => {
   const scope = req.body?.scope || "all";
   await repo.reset(scope);
   res.json({ ok: true });
+});
+
+app.get("/api/admin/pin/status", requireAdmin, adminLimiter, async (req, res) => {
+  const current = getCurrentAdminPin();
+  res.json({
+    ok: true,
+    pinIsDefault: current === "change-me",
+    source: readRuntimeConfig().adminPin ? "runtime" : "env"
+  });
+});
+
+app.post("/api/admin/pin/change", requireAdmin, adminLimiter, async (req, res) => {
+  const { currentPin, newPin } = req.body || {};
+  const activePin = getCurrentAdminPin();
+  const pinFromHeader = String(req.headers["x-admin-pin"] || "");
+
+  if (pinFromHeader && pinFromHeader !== activePin) {
+    return res.status(403).json({ ok: false, error: "Invalid current admin pin" });
+  }
+  if (!pinFromHeader && currentPin && String(currentPin) !== activePin) {
+    return res.status(403).json({ ok: false, error: "Current pin mismatch" });
+  }
+
+  const candidate = String(newPin || "").trim();
+  if (candidate.length < 6) {
+    return res.status(400).json({ ok: false, error: "New pin must be at least 6 characters" });
+  }
+  if (candidate === "change-me") {
+    return res.status(400).json({ ok: false, error: "New pin cannot be the default value" });
+  }
+
+  const runtime = readRuntimeConfig();
+  writeRuntimeConfig({
+    ...runtime,
+    adminPin: candidate,
+    adminPinUpdatedAt: new Date().toISOString(),
+    adminPinUpdatedBy: req.headers["x-forwarded-user"] || "admin"
+  });
+
+  return res.json({ ok: true, pinChanged: true });
 });
 
 app.post("/api/admin/seed-defaults", requireAdmin, adminLimiter, async (req, res) => {
