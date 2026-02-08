@@ -127,7 +127,14 @@ jobs:
                 git fetch --depth 1 origin main
                 git reset --hard FETCH_HEAD
               else
-                git clone --depth 1 "https://github.com/${{ github.repository }}.git" .
+                git init
+                if git remote get-url origin >/dev/null 2>&1; then
+                  git remote set-url origin "https://github.com/${{ github.repository }}.git"
+                else
+                  git remote add origin "https://github.com/${{ github.repository }}.git"
+                fi
+                git fetch --depth 1 origin main
+                git checkout -B main FETCH_HEAD
               fi
               ls -la
             fi
