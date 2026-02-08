@@ -1,0 +1,23 @@
+ktrain.thedrukkers.com {
+  encode gzip
+
+  @admin path /admin* /settings-admin* /api/admin* /api/settings*
+  handle @admin {
+    forward_auth authelia:9091 {
+      uri /api/authz/forward-auth
+      copy_headers Remote-User Remote-Groups
+    }
+
+    reverse_proxy ktrain:3000 {
+      header_up X-Forwarded-User {http.request.header.Remote-User}
+      header_up X-Forwarded-Groups {http.request.header.Remote-Groups}
+      header_up X-Request-Id {http.request_id}
+    }
+  }
+
+  handle {
+    reverse_proxy ktrain:3000 {
+      header_up X-Request-Id {http.request_id}
+    }
+  }
+}

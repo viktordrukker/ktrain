@@ -1,0 +1,21 @@
+{
+  "name": "ktrain-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js",
+    "reset": "node cli/reset.js",
+    "migrate": "node -e \"const { initDb } = require('./db'); (async()=>{ const { adapter } = await initDb(); await adapter.ping(); await adapter.close(); console.log('migrate ok'); })().catch(err=>{ console.error(err); process.exit(1); });\""
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.6.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "helmet": "^7.1.0",
+    "pg": "^8.12.0"
+  }
+}

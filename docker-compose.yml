@@ -1,0 +1,56 @@
+services:
+  ktrain:
+    build: .
+    image: ghcr.io/viktordrukker/ktrain:latest
+    container_name: ktrain
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      - PORT=${PORT:-3000}
+      - DB_DRIVER=${DB_DRIVER:-sqlite}
+      - DB_RUNTIME_CONFIG_PATH=${DB_RUNTIME_CONFIG_PATH:-/data/runtime-db.json}
+      - SQLITE_PATH=${SQLITE_PATH:-/data/ktrain.sqlite}
+      - POSTGRES_HOST=${POSTGRES_HOST:-ktrain_postgres}
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+      - POSTGRES_DB=${POSTGRES_DB:-ktrain}
+      - POSTGRES_USER=${POSTGRES_USER:-ktrain}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-change-me}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+      - ADMIN_PIN=${ADMIN_PIN:-change-me}
+      - AUTH_TRUST_PROXY=${AUTH_TRUST_PROXY:-true}
+      - AUTH_ADMIN_GROUPS=${AUTH_ADMIN_GROUPS:-admins,ldap-admins}
+      - DB_SWITCH_DUMP_DIR=${DB_SWITCH_DUMP_DIR:-/data/db-switch}
+      - DB_SWITCH_RESTART_CMD=${DB_SWITCH_RESTART_CMD:-}
+      - DB_SWITCH_POSTGRES_UP_CMD=${DB_SWITCH_POSTGRES_UP_CMD:-}
+      - DB_SWITCH_AUDIT_LOG=${DB_SWITCH_AUDIT_LOG:-/data/db-switch/switch-audit.log}
+    volumes:
+      - ktrain-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/healthz"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+  ktrain_postgres:
+    image: postgres:16-alpine
+    container_name: ktrain_postgres
+    profiles: ["postgres"]
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-ktrain}
+      - POSTGRES_USER=${POSTGRES_USER:-ktrain}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-change-me}
+    volumes:
+      - ktrain-postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ktrain} -d ${POSTGRES_DB:-ktrain}"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  ktrain-data:
+  ktrain-postgres-data:
