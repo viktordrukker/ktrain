@@ -117,6 +117,21 @@ jobs:
             ls -la
             find . -maxdepth 2 -type f -name "*env*" || true
 
+            if [ ! -f docker-compose.yml ]; then
+              echo "No deployment artifacts found in $DEPLOY_PATH. Bootstrapping from git..."
+              if ! command -v git >/dev/null 2>&1; then
+                sudo apt-get update
+                sudo apt-get install -y git
+              fi
+              if [ -d .git ]; then
+                git fetch --depth 1 origin main
+                git reset --hard FETCH_HEAD
+              else
+                git clone --depth 1 "https://github.com/${{ github.repository }}.git" .
+              fi
+              ls -la
+            fi
+
             if [ ! -f .env ]; then
               if [ -f .env.example ]; then
                 cp .env.example .env
@@ -146,6 +161,11 @@ jobs:
               chmod 600 .env
             fi
 
-            chmod +x ./scripts/*.sh
+            if [ -d ./scripts ]; then
+              chmod +x ./scripts/*.sh || true
+            else
+              echo "scripts directory is missing after bootstrap"
+              exit 1
+            fi
             export IMAGE="ghcr.io/${{ github.repository }}:${{ github.event.inputs.image_tag || 'latest' }}"
             APP_DIR="$DEPLOY_PATH" IMAGE="$IMAGE" ./scripts/deploy_remote.sh
