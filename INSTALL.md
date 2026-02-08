@@ -160,6 +160,14 @@ curl -i http://127.0.0.1:3000/readyz
 - Keep `.env` and DB dumps private.
 
 ## 13) DB Backend Switching
+UI first (recommended):
+- Open `Settings / Admin` -> `Admin`
+- Enter admin PIN
+- Configure `SQLite path` or Postgres host/port/db/user/password or full connection string
+- Click `Save DB config`
+- Click `Switch to SQLite` or `Switch to Postgres`
+- Use `Rollback DB switch` if needed
+
 Status:
 ```bash
 curl -s http://127.0.0.1:3000/api/admin/db/status -H 'x-admin-pin: <ADMIN_PIN>'

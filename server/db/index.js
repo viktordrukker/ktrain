@@ -15,6 +15,26 @@ const POSTGRES = {
   password: process.env.POSTGRES_PASSWORD || "ktrain"
 };
 
+function sanitizeDbConfig(input = {}) {
+  const postgresInput = input.postgres || {};
+  return {
+    sqlitePath: String(input.sqlitePath || SQLITE_PATH),
+    postgres: {
+      host: String(postgresInput.host || POSTGRES.host),
+      port: Number(postgresInput.port || POSTGRES.port),
+      database: String(postgresInput.database || POSTGRES.database),
+      user: String(postgresInput.user || POSTGRES.user),
+      password: String(postgresInput.password || POSTGRES.password),
+      connectionString: postgresInput.connectionString ? String(postgresInput.connectionString) : ""
+    }
+  };
+}
+
+function resolveDbConfig() {
+  const runtime = readRuntimeConfig();
+  return sanitizeDbConfig(runtime.dbConfig || {});
+}
+
 function loadMigrationSql(driver) {
   const file = path.join(__dirname, "migrations", driver, "001_init.sql");
   return fs.readFileSync(file, "utf8");
@@ -26,14 +46,52 @@ function resolveDriver() {
 }
 
 async function createAdapter(driver) {
+  const config = resolveDbConfig();
   if (driver === "postgres") {
-    const adapter = new PostgresAdapter({ migrationSql: loadMigrationSql("postgres"), postgres: POSTGRES });
+    const adapter = new PostgresAdapter({
+      migrationSql: loadMigrationSql("postgres"),
+      postgres: config.postgres.connectionString
+        ? { connectionString: config.postgres.connectionString }
+        : {
+            host: config.postgres.host,
+            port: config.postgres.port,
+            database: config.postgres.database,
+            user: config.postgres.user,
+            password: config.postgres.password
+          }
+    });
     await adapter.init();
     return adapter;
   }
-  const adapter = new SqliteAdapter({ sqlitePath: SQLITE_PATH, migrationSql: loadMigrationSql("sqlite") });
+  const adapter = new SqliteAdapter({ sqlitePath: config.sqlitePath, migrationSql: loadMigrationSql("sqlite") });
   await adapter.init();
   return adapter;
+}
+
+async function createPostgresAdapterForConfig(inputConfig = {}) {
+  const safe = sanitizeDbConfig({ postgres: inputConfig }).postgres;
+  const pgConfig = safe.connectionString
+    ? { connectionString: safe.connectionString }
+    : {
+        host: safe.host,
+        port: safe.port,
+        database: safe.database,
+        user: safe.user,
+        password: safe.password
+      };
+  const adapter = new PostgresAdapter({ migrationSql: loadMigrationSql("postgres"), postgres: pgConfig });
+  await adapter.init();
+  return adapter;
+}
+
+async function testPostgresConfig(inputConfig = {}) {
+  const adapter = await createPostgresAdapterForConfig(inputConfig);
+  try {
+    await adapter.ping();
+    return true;
+  } finally {
+    await adapter.close();
+  }
 }
 
 async function initDb() {
@@ -46,6 +104,9 @@ module.exports = {
   DB_DRIVER_ENV,
   SQLITE_PATH,
   POSTGRES,
+  sanitizeDbConfig,
+  resolveDbConfig,
+  testPostgresConfig,
   resolveDriver,
   createAdapter,
   initDb

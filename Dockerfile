@@ -19,13 +19,14 @@ ENV SQLITE_PATH=/data/ktrain.sqlite
 ENV DB_RUNTIME_CONFIG_PATH=/data/runtime-db.json
 ENV ADMIN_PIN=change-me
 
-RUN addgroup -S app && adduser -S app -G app
+RUN apk add --no-cache su-exec && addgroup -S app && adduser -S app -G app
 COPY --from=server-build /app/server/node_modules ./server/node_modules
 COPY server ./server
 COPY --from=client-build /app/client/dist ./client/dist
-RUN mkdir -p /data && chown -R app:app /app /data
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh && mkdir -p /data && chown -R app:app /app /data
 
-USER app
 EXPOSE 3000
 VOLUME ["/data"]
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["node", "server/index.js"]
