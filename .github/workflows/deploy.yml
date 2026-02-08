@@ -96,7 +96,7 @@ jobs:
           port: ${{ secrets.HETZNER_PORT }}
           username: ${{ secrets.HETZNER_USER }}
           key: ${{ secrets.HETZNER_SSH_KEY }}
-          source: "Dockerfile,docker-compose.yml,.env.example,client,server,scripts"
+          source: "Dockerfile,docker-compose.yml,client,server,scripts"
           target: "${{ secrets.DEPLOY_PATH }}"
           overwrite: true
 
@@ -109,14 +109,44 @@ jobs:
           key: ${{ secrets.HETZNER_SSH_KEY }}
           script: |
             set -euo pipefail
-            mkdir -p "${{ secrets.DEPLOY_PATH }}"
-            cd "${{ secrets.DEPLOY_PATH }}"
+            DEPLOY_PATH="${{ secrets.DEPLOY_PATH }}"
+            mkdir -p "$DEPLOY_PATH"
+            cd "$DEPLOY_PATH"
+            echo "Deploy path: $DEPLOY_PATH"
+            pwd
+            ls -la
+            find . -maxdepth 2 -type f -name "*env*" || true
 
             if [ ! -f .env ]; then
-              cp .env.example .env
+              if [ -f .env.example ]; then
+                cp .env.example .env
+              elif [ -f env.example ]; then
+                cp env.example .env
+              else
+                cat > .env <<'EOF'
+PORT=3000
+NODE_ENV=production
+DB_DRIVER=sqlite
+DB_RUNTIME_CONFIG_PATH=/data/runtime-db.json
+DB_SWITCH_DUMP_DIR=/data/db-switch
+DB_SWITCH_RESTART_CMD=
+DB_SWITCH_POSTGRES_UP_CMD=
+DB_SWITCH_AUDIT_LOG=/data/db-switch/switch-audit.log
+SQLITE_PATH=/data/ktrain.sqlite
+POSTGRES_HOST=ktrain_postgres
+POSTGRES_PORT=5432
+POSTGRES_DB=ktrain
+POSTGRES_USER=ktrain
+POSTGRES_PASSWORD=change-me
+OPENAI_MODEL=gpt-4o-mini
+ADMIN_PIN=change-me
+AUTH_TRUST_PROXY=true
+AUTH_ADMIN_GROUPS=admins,ldap-admins
+EOF
+              fi
               chmod 600 .env
             fi
 
             chmod +x ./scripts/*.sh
             export IMAGE="ghcr.io/${{ github.repository }}:${{ github.event.inputs.image_tag || 'latest' }}"
-            APP_DIR="${{ secrets.DEPLOY_PATH }}" IMAGE="$IMAGE" ./scripts/deploy_remote.sh
+            APP_DIR="$DEPLOY_PATH" IMAGE="$IMAGE" ./scripts/deploy_remote.sh
