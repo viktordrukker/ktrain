@@ -123,26 +123,25 @@ jobs:
               elif [ -f env.example ]; then
                 cp env.example .env
               else
-                cat > .env <<'EOF'
-PORT=3000
-NODE_ENV=production
-DB_DRIVER=sqlite
-DB_RUNTIME_CONFIG_PATH=/data/runtime-db.json
-DB_SWITCH_DUMP_DIR=/data/db-switch
-DB_SWITCH_RESTART_CMD=
-DB_SWITCH_POSTGRES_UP_CMD=
-DB_SWITCH_AUDIT_LOG=/data/db-switch/switch-audit.log
-SQLITE_PATH=/data/ktrain.sqlite
-POSTGRES_HOST=ktrain_postgres
-POSTGRES_PORT=5432
-POSTGRES_DB=ktrain
-POSTGRES_USER=ktrain
-POSTGRES_PASSWORD=change-me
-OPENAI_MODEL=gpt-4o-mini
-ADMIN_PIN=change-me
-AUTH_TRUST_PROXY=true
-AUTH_ADMIN_GROUPS=admins,ldap-admins
-EOF
+                printf '%s\n' \
+                  'PORT=3000' \
+                  'NODE_ENV=production' \
+                  'DB_DRIVER=sqlite' \
+                  'DB_RUNTIME_CONFIG_PATH=/data/runtime-db.json' \
+                  'DB_SWITCH_DUMP_DIR=/data/db-switch' \
+                  'DB_SWITCH_RESTART_CMD=' \
+                  'DB_SWITCH_POSTGRES_UP_CMD=' \
+                  'DB_SWITCH_AUDIT_LOG=/data/db-switch/switch-audit.log' \
+                  'SQLITE_PATH=/data/ktrain.sqlite' \
+                  'POSTGRES_HOST=ktrain_postgres' \
+                  'POSTGRES_PORT=5432' \
+                  'POSTGRES_DB=ktrain' \
+                  'POSTGRES_USER=ktrain' \
+                  'POSTGRES_PASSWORD=change-me' \
+                  'OPENAI_MODEL=gpt-4o-mini' \
+                  'ADMIN_PIN=change-me' \
+                  'AUTH_TRUST_PROXY=true' \
+                  'AUTH_ADMIN_GROUPS=admins,ldap-admins' > .env
               fi
               chmod 600 .env
             fi
