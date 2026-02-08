@@ -3,8 +3,8 @@ services:
     build: .
     image: ghcr.io/viktordrukker/ktrain:latest
     container_name: ktrain
-    ports:
-      - "3000:3000"
+    expose:
+      - "3000"
     environment:
       - PORT=${PORT:-3000}
       - DB_DRIVER=${DB_DRIVER:-sqlite}
@@ -25,6 +25,9 @@ services:
       - DB_SWITCH_AUDIT_LOG=${DB_SWITCH_AUDIT_LOG:-/data/db-switch/switch-audit.log}
     volumes:
       - ktrain-data:/data
+    networks:
+      - ktrain_net
+      - caddy_net
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/healthz"]
@@ -42,6 +45,8 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-change-me}
     volumes:
       - ktrain-postgres-data:/var/lib/postgresql/data
+    networks:
+      - ktrain_net
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ktrain} -d ${POSTGRES_DB:-ktrain}"]
@@ -52,3 +57,9 @@ services:
 volumes:
   ktrain-data:
   ktrain-postgres-data:
+
+networks:
+  ktrain_net:
+    driver: bridge
+  caddy_net:
+    external: true
