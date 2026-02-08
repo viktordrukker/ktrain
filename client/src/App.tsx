@@ -66,6 +66,30 @@ type VocabPack = {
   createdAt: string;
 };
 
+type DbAdminConfig = {
+  sqlitePath: string;
+  postgres: {
+    host: string;
+    port: number;
+    database: string;
+    user: string;
+    password: string;
+    connectionString?: string;
+  };
+};
+
+type DbAdminStatus = {
+  activeDriver: "sqlite" | "postgres";
+  maintenanceMode: boolean;
+  counts?: {
+    settings: number;
+    leaderboard: number;
+    vocab_packs: number;
+  };
+  dbConfig?: DbAdminConfig;
+  runtime?: any;
+};
+
 type Screen = "home" | "game" | "results" | "leaderboard" | "settings";
 
 type GameSettings = {
@@ -410,16 +434,69 @@ const API = {
     if (!res.ok) throw new Error("Test failed");
     return res.json();
   },
-  async getSettings(): Promise<AppSettings> {
-    const res = await fetch("/api/settings");
+  async getDbStatus(pin: string): Promise<DbAdminStatus> {
+    const res = await fetch("/api/admin/db/status", {
+      headers: { "x-admin-pin": pin }
+    });
+    if (!res.ok) throw new Error("Failed to load DB status");
+    return res.json();
+  },
+  async getDbConfig(pin: string): Promise<{ dbConfig: DbAdminConfig; activeDriver: "sqlite" | "postgres" }> {
+    const res = await fetch("/api/admin/db/config", {
+      headers: { "x-admin-pin": pin }
+    });
+    if (!res.ok) throw new Error("Failed to load DB config");
+    return res.json();
+  },
+  async saveDbConfig(pin: string, payload: DbAdminConfig, verify = true) {
+    const res = await fetch("/api/admin/db/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-admin-pin": pin },
+      body: JSON.stringify({ ...payload, verify })
+    });
+    if (!res.ok) throw new Error("Failed to save DB config");
+    return res.json();
+  },
+  async switchDb(pin: string, target: "sqlite" | "postgres") {
+    const res = await fetch("/api/admin/db/switch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-admin-pin": pin },
+      body: JSON.stringify({ target, mode: "copy-then-switch", verify: true })
+    });
+    if (!res.ok) throw new Error("DB switch failed");
+    return res.json();
+  },
+  async rollbackDb(pin: string) {
+    const res = await fetch("/api/admin/db/rollback", {
+      method: "POST",
+      headers: { "x-admin-pin": pin }
+    });
+    if (!res.ok) throw new Error("DB rollback failed");
+    return res.json();
+  },
+  async testDbConnection(pin: string, payload: { postgres: DbAdminConfig["postgres"] }) {
+    const res = await fetch("/api/admin/db/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-admin-pin": pin },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error("Postgres test connection failed");
+    return res.json();
+  },
+  async getSettings(pin?: string): Promise<AppSettings> {
+    const headers: Record<string, string> = {};
+    if (pin) headers["x-admin-pin"] = pin;
+    const res = await fetch("/api/settings", { headers });
     if (!res.ok) throw new Error("Failed to load settings");
     const data = await res.json();
     return data.settings as AppSettings;
   },
-  async saveSettings(payload: AppSettings): Promise<AppSettings> {
+  async saveSettings(payload: AppSettings, pin?: string): Promise<AppSettings> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (pin) headers["x-admin-pin"] = pin;
     const res = await fetch("/api/settings", {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(payload)
     });
     if (!res.ok) throw new Error("Failed to save settings");
@@ -811,7 +888,11 @@ function App() {
   };
 
   useEffect(() => {
-    API.getSettings()
+    if (!adminPin) {
+      setSettingsLoaded(true);
+      return;
+    }
+    API.getSettings(adminPin || undefined)
       .then((loaded) => {
         const derived = deriveMaxAllowed(loaded.allowedLevels);
         const maxAllowed = typeof loaded.maxAllowedLevel === "number"
@@ -832,7 +913,7 @@ function App() {
         setSettingsLoaded(true);
       })
       .catch(() => setSettingsLoaded(true));
-  }, []);
+  }, [adminPin]);
 
   useEffect(() => {
     if (screen !== "game") return;
@@ -868,11 +949,12 @@ function App() {
 
   useEffect(() => {
     if (!settingsLoaded) return;
+    if (!adminPin) return;
     const id = window.setTimeout(() => {
-      API.saveSettings(appSettings).catch(() => null);
+      API.saveSettings(appSettings, adminPin).catch(() => null);
     }, 500);
     return () => window.clearTimeout(id);
-  }, [appSettings, settingsLoaded]);
+  }, [appSettings, settingsLoaded, adminPin]);
 
   const resetSessionState = () => {
     setTasks([]);
@@ -1865,7 +1947,114 @@ function SettingsScreen({
   const [generateName, setGenerateName] = useState("New Pack");
   const [manualEdit, setManualEdit] = useState<Record<number, string>>({});
   const [openaiStatus, setOpenaiStatus] = useState("");
+  const [dbStatus, setDbStatus] = useState<DbAdminStatus | null>(null);
+  const [dbConfig, setDbConfig] = useState<DbAdminConfig>({
+    sqlitePath: "/data/ktrain.sqlite",
+    postgres: {
+      host: "ktrain_postgres",
+      port: 5432,
+      database: "ktrain",
+      user: "ktrain",
+      password: "",
+      connectionString: ""
+    }
+  });
+  const [dbMessage, setDbMessage] = useState("");
+  const [dbBusy, setDbBusy] = useState(false);
   const themePreview = applyVisibilityGuard(computeTheme(appSettings), appSettings.visibilityGuard).theme;
+
+  const refreshDb = async () => {
+    if (!adminPin) {
+      setDbMessage("Enter admin PIN first.");
+      return;
+    }
+    setDbBusy(true);
+    setDbMessage("");
+    try {
+      const [status, configRes] = await Promise.all([
+        API.getDbStatus(adminPin),
+        API.getDbConfig(adminPin)
+      ]);
+      setDbStatus(status);
+      setDbConfig(configRes.dbConfig);
+      setDbMessage(`DB status loaded. Active: ${status.activeDriver}`);
+    } catch (err: any) {
+      setDbMessage(err?.message || "Failed to load DB status");
+    } finally {
+      setDbBusy(false);
+    }
+  };
+
+  const saveDbConfig = async () => {
+    if (!adminPin) {
+      setDbMessage("Enter admin PIN first.");
+      return;
+    }
+    setDbBusy(true);
+    setDbMessage("");
+    try {
+      await API.saveDbConfig(adminPin, dbConfig, true);
+      setDbMessage("DB config saved and verified.");
+      await refreshDb();
+    } catch (err: any) {
+      setDbMessage(err?.message || "Failed to save DB config");
+    } finally {
+      setDbBusy(false);
+    }
+  };
+
+  const switchDb = async (target: "sqlite" | "postgres") => {
+    if (!adminPin) {
+      setDbMessage("Enter admin PIN first.");
+      return;
+    }
+    setDbBusy(true);
+    setDbMessage("");
+    try {
+      const result = await API.switchDb(adminPin, target);
+      setDbMessage(`Switched to ${result.targetDriver || target}.`);
+      await refreshDb();
+    } catch (err: any) {
+      setDbMessage(err?.message || "DB switch failed");
+    } finally {
+      setDbBusy(false);
+    }
+  };
+
+  const rollbackDb = async () => {
+    if (!adminPin) {
+      setDbMessage("Enter admin PIN first.");
+      return;
+    }
+    setDbBusy(true);
+    setDbMessage("");
+    try {
+      const result = await API.rollbackDb(adminPin);
+      setDbMessage(`Rollback complete. Active: ${result.activeDriver}`);
+      await refreshDb();
+    } catch (err: any) {
+      setDbMessage(err?.message || "DB rollback failed");
+    } finally {
+      setDbBusy(false);
+    }
+  };
+
+  const testPostgresConnection = async () => {
+    if (!adminPin) {
+      setDbMessage("Enter admin PIN first.");
+      return;
+    }
+    setDbBusy(true);
+    setDbMessage("");
+    try {
+      await API.testDbConnection(adminPin, { postgres: dbConfig.postgres });
+      setDbMessage("Postgres connection successful.");
+    } catch (err: any) {
+      setDbMessage(err?.message || "Postgres connection failed");
+    } finally {
+      setDbBusy(false);
+    }
+  };
 
   const updateSettings = (patch: Partial<AppSettings>) => {
     setAppSettings((prev) => ({
@@ -2458,6 +2647,84 @@ function SettingsScreen({
             <SettingRow label="Admin PIN" helper="Required for resets and vocab admin actions.">
               <TextInput value={adminPin} onChange={(e) => setAdminPin(e.currentTarget.value)} placeholder="PIN" />
             </SettingRow>
+            <Divider my="sm" />
+            <SettingRow label="Database status" helper="Current backend and runtime status.">
+              <Group>
+                <Button variant="light" loading={dbBusy} onClick={refreshDb}>Refresh DB status</Button>
+                <Badge variant="light">Active: {dbStatus?.activeDriver || "unknown"}</Badge>
+                <Badge variant="light">Maintenance: {dbStatus?.maintenanceMode ? "ON" : "OFF"}</Badge>
+              </Group>
+            </SettingRow>
+            <SettingRow label="SQLite path" helper="Used when driver is sqlite.">
+              <TextInput
+                value={dbConfig.sqlitePath}
+                onChange={(e) => setDbConfig((prev) => ({ ...prev, sqlitePath: e.currentTarget.value }))}
+                placeholder="/data/ktrain.sqlite"
+              />
+            </SettingRow>
+            <SettingRow label="Postgres connection string" helper="Optional. If set, host/port/db/user/password are ignored.">
+              <TextInput
+                value={dbConfig.postgres.connectionString || ""}
+                onChange={(e) => setDbConfig((prev) => ({ ...prev, postgres: { ...prev.postgres, connectionString: e.currentTarget.value } }))}
+                placeholder="postgres://user:pass@host:5432/db"
+              />
+            </SettingRow>
+            <SettingRow label="Postgres host" helper="Used when connection string is empty.">
+              <TextInput
+                value={dbConfig.postgres.host}
+                onChange={(e) => setDbConfig((prev) => ({ ...prev, postgres: { ...prev.postgres, host: e.currentTarget.value } }))}
+              />
+            </SettingRow>
+            <SettingRow label="Postgres port" helper="Default 5432.">
+              <NumberInput
+                value={dbConfig.postgres.port}
+                min={1}
+                max={65535}
+                onChange={(value) => setDbConfig((prev) => ({ ...prev, postgres: { ...prev.postgres, port: Number(value) || 5432 } }))}
+              />
+            </SettingRow>
+            <SettingRow label="Postgres database" helper="Database name.">
+              <TextInput
+                value={dbConfig.postgres.database}
+                onChange={(e) => setDbConfig((prev) => ({ ...prev, postgres: { ...prev.postgres, database: e.currentTarget.value } }))}
+              />
+            </SettingRow>
+            <SettingRow label="Postgres user" helper="DB username.">
+              <TextInput
+                value={dbConfig.postgres.user}
+                onChange={(e) => setDbConfig((prev) => ({ ...prev, postgres: { ...prev.postgres, user: e.currentTarget.value } }))}
+              />
+            </SettingRow>
+            <SettingRow label="Postgres password" helper="Stored server-side in runtime config.">
+              <TextInput
+                type="password"
+                value={dbConfig.postgres.password}
+                onChange={(e) => setDbConfig((prev) => ({ ...prev, postgres: { ...prev.postgres, password: e.currentTarget.value } }))}
+              />
+            </SettingRow>
+            <SettingRow label="DB actions" helper="Save config, switch backend, or rollback to last dump.">
+              <Group>
+                <Button variant="light" loading={dbBusy} onClick={testPostgresConnection}>Test Postgres connection</Button>
+                <Button variant="light" loading={dbBusy} onClick={saveDbConfig}>Save DB config</Button>
+                <Button variant="light" color="teal" loading={dbBusy} onClick={() => switchDb("sqlite")}>Switch to SQLite</Button>
+                <Button variant="light" color="blue" loading={dbBusy} onClick={() => switchDb("postgres")}>Switch to Postgres</Button>
+                <Button variant="light" color="red" loading={dbBusy} onClick={rollbackDb}>Rollback DB switch</Button>
+              </Group>
+            </SettingRow>
+            {dbStatus?.counts && (
+              <div className="setting-row full">
+                <Alert color="blue" title="DB counts">
+                  settings={dbStatus.counts.settings}, leaderboard={dbStatus.counts.leaderboard}, vocab_packs={dbStatus.counts.vocab_packs}
+                </Alert>
+              </div>
+            )}
+            {dbMessage && (
+              <div className="setting-row full">
+                <Alert color="yellow" title="Database backend">
+                  {dbMessage}
+                </Alert>
+              </div>
+            )}
             <Divider my="sm" />
             <SettingRow label="OpenAI API key" helper="Server-side only.">
               <TextInput value={openaiKey} onChange={(e) => setOpenaiKey(e.currentTarget.value)} placeholder="sk-..." />

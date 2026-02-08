@@ -8,7 +8,7 @@ const fs = require("fs");
 const crypto = require("crypto");
 const { exec } = require("child_process");
 const { promisify } = require("util");
-const { initDb, createAdapter, resolveDriver, DB_DRIVER_ENV } = require("./db");
+const { initDb, createAdapter, resolveDriver, DB_DRIVER_ENV, resolveDbConfig, sanitizeDbConfig, testPostgresConfig } = require("./db");
 const { loadSettings, saveSettings } = require("./settings");
 const { readRuntimeConfig, writeRuntimeConfig, RUNTIME_CONFIG_PATH } = require("./db/runtime-config");
 const defaults = require("./data/defaults");
@@ -545,9 +545,56 @@ app.get("/api/admin/db/status", requireAdmin, adminLimiter, async (req, res) => 
     activeDriver,
     maintenanceMode,
     dbDriverEnv: DB_DRIVER_ENV,
+    dbConfig: resolveDbConfig(),
     runtime,
     counts
   });
+});
+
+app.get("/api/admin/db/config", requireAdmin, adminLimiter, async (req, res) => {
+  res.json({
+    ok: true,
+    activeDriver,
+    dbConfig: resolveDbConfig(),
+    runtime: readRuntimeConfig()
+  });
+});
+
+app.post("/api/admin/db/config", requireAdmin, adminLimiter, async (req, res) => {
+  try {
+    const nextConfig = sanitizeDbConfig(req.body || {});
+    const runtime = readRuntimeConfig();
+    writeRuntimeConfig({
+      ...runtime,
+      dbConfig: nextConfig,
+      dbConfigUpdatedAt: new Date().toISOString(),
+      dbConfigUpdatedBy: req.headers["x-forwarded-user"] || "admin"
+    });
+
+    if (req.body?.verify) {
+      const probe = await createAdapter("postgres");
+      await probe.ping();
+      await probe.close();
+    }
+
+    if (req.body?.restart && DB_SWITCH_RESTART_CMD) {
+      await execAsync(DB_SWITCH_RESTART_CMD);
+    }
+
+    return res.json({ ok: true, dbConfig: nextConfig, activeDriver });
+  } catch (err) {
+    return res.status(400).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+app.post("/api/admin/db/test", requireAdmin, adminLimiter, async (req, res) => {
+  try {
+    const postgres = req.body?.postgres || {};
+    await testPostgresConfig(postgres);
+    return res.json({ ok: true, message: "Postgres connection successful" });
+  } catch (err) {
+    return res.status(400).json({ ok: false, error: String(err.message || err) });
+  }
 });
 
 app.post("/api/admin/db/switch", requireAdmin, adminLimiter, async (req, res) => {

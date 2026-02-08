@@ -22,6 +22,12 @@ Fallback for local/dev:
 curl -s http://127.0.0.1:3000/api/admin/db/status -H 'x-admin-pin: <ADMIN_PIN>'
 ```
 
+UI path:
+- `Settings / Admin` -> `Admin` section -> `Database status`
+- Enter admin PIN, click `Refresh DB status`
+- Edit SQLite/Postgres config, then `Save DB config`
+- Use `Switch to SQLite`, `Switch to Postgres`, or `Rollback DB switch`
+
 ## DB Switch (copy-then-switch)
 ```bash
 curl -X POST http://127.0.0.1:3000/api/admin/db/switch \
