@@ -474,6 +474,22 @@ const API = {
     if (!res.ok) throw new Error("DB rollback failed");
     return res.json();
   },
+  async getAdminPinStatus(pin: string): Promise<{ pinIsDefault: boolean; source: string }> {
+    const res = await fetch("/api/admin/pin/status", {
+      headers: { "x-admin-pin": pin }
+    });
+    if (!res.ok) throw new Error("Failed to load admin pin status");
+    return res.json();
+  },
+  async changeAdminPin(pin: string, currentPin: string, newPin: string) {
+    const res = await fetch("/api/admin/pin/change", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-admin-pin": pin },
+      body: JSON.stringify({ currentPin, newPin })
+    });
+    if (!res.ok) throw new Error("Failed to change admin pin");
+    return res.json();
+  },
   async testDbConnection(pin: string, payload: { postgres: DbAdminConfig["postgres"] }) {
     const res = await fetch("/api/admin/db/test", {
       method: "POST",
@@ -1961,6 +1977,11 @@ function SettingsScreen({
   });
   const [dbMessage, setDbMessage] = useState("");
   const [dbBusy, setDbBusy] = useState(false);
+  const [pinStatus, setPinStatus] = useState<{ pinIsDefault: boolean; source: string } | null>(null);
+  const [newAdminPin, setNewAdminPin] = useState("");
+  const [confirmAdminPin, setConfirmAdminPin] = useState("");
+  const [pinBusy, setPinBusy] = useState(false);
+  const [pinMessage, setPinMessage] = useState("");
   const themePreview = applyVisibilityGuard(computeTheme(appSettings), appSettings.visibilityGuard).theme;
 
   const refreshDb = async () => {
@@ -1982,6 +2003,48 @@ function SettingsScreen({
       setDbMessage(err?.message || "Failed to load DB status");
     } finally {
       setDbBusy(false);
+    }
+  };
+
+  const refreshPinStatus = async () => {
+    if (!adminPin) {
+      setPinStatus(null);
+      return;
+    }
+    try {
+      const status = await API.getAdminPinStatus(adminPin);
+      setPinStatus(status);
+    } catch {
+      setPinStatus(null);
+    }
+  };
+
+  const rotateAdminPin = async () => {
+    if (!adminPin) {
+      setPinMessage("Enter current admin PIN first.");
+      return;
+    }
+    if (newAdminPin.length < 6) {
+      setPinMessage("New PIN must be at least 6 characters.");
+      return;
+    }
+    if (newAdminPin !== confirmAdminPin) {
+      setPinMessage("New PIN confirmation does not match.");
+      return;
+    }
+    setPinBusy(true);
+    setPinMessage("");
+    try {
+      await API.changeAdminPin(adminPin, adminPin, newAdminPin);
+      setAdminPin(newAdminPin);
+      setNewAdminPin("");
+      setConfirmAdminPin("");
+      setPinMessage("Admin PIN updated.");
+      await refreshPinStatus();
+    } catch (err: any) {
+      setPinMessage(err?.message || "Failed to update admin PIN.");
+    } finally {
+      setPinBusy(false);
     }
   };
 
@@ -2055,6 +2118,11 @@ function SettingsScreen({
       setDbBusy(false);
     }
   };
+
+  useEffect(() => {
+    if (!adminPin) return;
+    refreshPinStatus().catch(() => null);
+  }, [adminPin]);
 
   const updateSettings = (patch: Partial<AppSettings>) => {
     setAppSettings((prev) => ({
@@ -2645,8 +2713,43 @@ function SettingsScreen({
             description="OpenAI, resets, and admin PIN."
           >
             <SettingRow label="Admin PIN" helper="Required for resets and vocab admin actions.">
-              <TextInput value={adminPin} onChange={(e) => setAdminPin(e.currentTarget.value)} placeholder="PIN" />
+              <Group>
+                <TextInput value={adminPin} onChange={(e) => setAdminPin(e.currentTarget.value)} placeholder="Current PIN" />
+                <Button variant="light" onClick={refreshPinStatus}>Check PIN status</Button>
+                {pinStatus && <Badge variant="light">Source: {pinStatus.source}</Badge>}
+              </Group>
             </SettingRow>
+            {pinStatus?.pinIsDefault && (
+              <div className="setting-row full">
+                <Alert color="red" title="Default PIN in use">
+                  You are using the default admin PIN. Change it now before production use.
+                </Alert>
+              </div>
+            )}
+            <SettingRow label="New admin PIN" helper="Set this on first deploy. Minimum 6 characters.">
+              <Group>
+                <TextInput
+                  type="password"
+                  value={newAdminPin}
+                  onChange={(e) => setNewAdminPin(e.currentTarget.value)}
+                  placeholder="New PIN"
+                />
+                <TextInput
+                  type="password"
+                  value={confirmAdminPin}
+                  onChange={(e) => setConfirmAdminPin(e.currentTarget.value)}
+                  placeholder="Confirm new PIN"
+                />
+                <Button loading={pinBusy} onClick={rotateAdminPin}>Update PIN</Button>
+              </Group>
+            </SettingRow>
+            {pinMessage && (
+              <div className="setting-row full">
+                <Alert color="yellow" title="Admin PIN">
+                  {pinMessage}
+                </Alert>
+              </div>
+            )}
             <Divider my="sm" />
             <SettingRow label="Database status" helper="Current backend and runtime status.">
               <Group>

@@ -20,6 +20,8 @@ Required:
 - `ADMIN_PIN=change-me`
 - `OPENAI_MODEL=gpt-4o-mini`
 
+On first deploy, open `Settings / Admin` and rotate the default admin PIN immediately.
+
 Auth:
 - `AUTH_TRUST_PROXY=true`
 - `AUTH_ADMIN_GROUPS=admins,ldap-admins`
