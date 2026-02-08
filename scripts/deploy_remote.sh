@@ -6,11 +6,23 @@ IMAGE="${IMAGE:-ghcr.io/viktordrukker/ktrain:latest}"
 
 cd "$APP_DIR"
 
+if ! docker compose version >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update
+    sudo apt-get install -y docker-compose-plugin
+  else
+    echo "docker compose is missing and cannot be installed automatically on this host"
+    exit 1
+  fi
+fi
+
 echo "Pulling image: $IMAGE"
-docker pull "$IMAGE"
+if ! docker pull "$IMAGE"; then
+  echo "Image pull failed, falling back to server-side build."
+fi
 
 echo "Starting services"
-docker compose up -d --no-deps ktrain
+docker compose up -d --build ktrain
 
 echo "Running DB migration for active backend"
 docker compose exec -T ktrain sh -lc 'cd /app/server && npm run migrate'
