@@ -29,6 +29,12 @@ fi
 echo "Starting services"
 docker compose up -d --build ktrain
 
+echo "Ensuring ktrain is attached to caddy_net"
+KTRAIN_IN_CADDY_NET="$(docker inspect -f '{{json .NetworkSettings.Networks.caddy_net}}' ktrain 2>/dev/null || true)"
+if [ "$KTRAIN_IN_CADDY_NET" = "null" ] || [ -z "$KTRAIN_IN_CADDY_NET" ]; then
+  docker network connect --alias ktrain caddy_net ktrain
+fi
+
 echo "Running DB migration for active backend"
 docker compose exec -T ktrain sh -lc 'cd /app/server && npm run migrate'
 
