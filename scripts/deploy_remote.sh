@@ -16,6 +16,11 @@ if ! docker compose version >/dev/null 2>&1; then
   fi
 fi
 
+if ! docker network inspect caddy_net >/dev/null 2>&1; then
+  echo "Creating external network: caddy_net"
+  docker network create caddy_net
+fi
+
 echo "Pulling image: $IMAGE"
 if ! docker pull "$IMAGE"; then
   echo "Image pull failed, falling back to server-side build."
