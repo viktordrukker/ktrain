@@ -6,12 +6,14 @@ Toddler keyboard trainer webapp (React + Node) with Docker-first deployment, pro
 
 ## Highlights
 - Learning and contest modes with leaderboard persistence
-- Admin-only reset, vocab management, and DB backend switching
-- Health endpoints: `/healthz`, `/readyz`
-- Adapter-based DAL (`server/db/adapters/sqlite.js`, `server/db/adapters/postgres.js`)
-- Safe DB switch flow with dump/verify/rollback
+- Policy-based RBAC (`OWNER`, `ADMIN`, `MODERATOR`, `USER`, `GUEST`)
+- Reverse-proxy identity integration with trusted proxy checks
+- Encrypted per-user secret storage (AES-256-GCM)
+- DB adapter model with SQLite and Postgres
+- Deterministic migrations with status and rollback support
+- Runtime config store in DB (`app_config`) with safe-key controls
+- Diagnostics endpoints for no-test confidence (`/api/diagnostics/*`)
 - Docker + GitHub Actions CI/CD + Hetzner deploy script
-- Caddy + Authelia ready routing model
 
 ## Quick Start (Docker)
 ```bash
@@ -38,6 +40,10 @@ Admin-only endpoints:
 
 ## Core Scripts
 - `scripts/db_migrate.sh`
+- `scripts/migrate_status.sh`
+- `scripts/migrate_rollback.sh`
+- `scripts/bootstrap.sh`
+- `scripts/healthcheck.sh`
 - `scripts/switch_db.sh`
 - `scripts/backup_sqlite.sh`
 - `scripts/restore_sqlite.sh`
@@ -49,3 +55,5 @@ Admin-only endpoints:
 - `INSTALL.md`: install + runtime troubleshooting
 - `DEPLOY.md`: CI/CD and Hetzner deployment flow
 - `ADMIN.md`: admin auth, DB switching, rollback, maintenance
+- `SECURITY.md`: RBAC, auth trust model, encryption and OWASP controls
+- `RUNBOOK.md`: incident, backup/restore, diagnostics, rollback

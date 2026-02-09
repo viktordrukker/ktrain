@@ -1,68 +1,58 @@
 # Admin Operations
 
+## Role Model
+- `OWNER`: security-critical control plane, role assignments.
+- `ADMIN`: settings/content/config/DB operations.
+- `MODERATOR`: diagnostics and audit read.
+
+RBAC is enforced server-side for all protected routes.
+
 ## Admin Access Model
-Admin checks are server-side.
+- Primary: reverse-proxy identity headers (`x-forwarded-user`, `x-forwarded-groups`).
+- Headers are accepted only from trusted proxy IPs.
+- Fallback: `x-admin-pin` for local/break-glass admin access.
 
-Accepted admin identity:
-- Reverse proxy headers from Authelia:
-  - `x-forwarded-user`
-  - `x-forwarded-groups`
-- Group match against `AUTH_ADMIN_GROUPS`
-
-Fallback for local/dev:
-- `x-admin-pin: <ADMIN_PIN>`
-- First deploy: use current PIN to log into `Settings / Admin`, then set a new PIN in the `Admin PIN` block.
-
-## Admin-only Routes
-- `/api/admin/*`
-- `/api/settings`
-- Frontend pages `/admin*`, `/settings-admin*`
-
-## DB Status
+## Owner Bootstrap
+- Preferred: set `OWNER_EMAIL` and restart.
+- Alternate (when no owner exists):
 ```bash
-curl -s http://127.0.0.1:3000/api/admin/db/status -H 'x-admin-pin: <ADMIN_PIN>'
-```
-
-UI path:
-- `Settings / Admin` -> `Admin` section -> `Database status`
-- Enter admin PIN, click `Refresh DB status`
-- Edit SQLite/Postgres config, then `Save DB config`
-- Use `Switch to SQLite`, `Switch to Postgres`, or `Rollback DB switch`
-
-## DB Switch (copy-then-switch)
-```bash
-curl -X POST http://127.0.0.1:3000/api/admin/db/switch \
+curl -X POST http://127.0.0.1:3000/api/admin/owner/bootstrap \
   -H 'content-type: application/json' \
   -H 'x-admin-pin: <ADMIN_PIN>' \
-  -d '{"target":"postgres","mode":"copy-then-switch","verify":true}'
+  -d '{"confirm":true}'
 ```
 
-Behavior:
-1. Enables maintenance mode
-2. Dumps source DB to `/data/db-switch/*.json`
-3. Restores into target DB
-4. Verifies table counts
-5. Updates runtime config (`/data/runtime-db.json`)
-6. Optionally executes restart command (`DB_SWITCH_RESTART_CMD`)
+## DB Status and Control
+- `GET /api/admin/db/status`
+- `POST /api/admin/db/switch`
+- `POST /api/admin/db/rollback`
+- `POST /api/admin/db/migrations/rollback-last`
 
-## Rollback
-```bash
-curl -X POST http://127.0.0.1:3000/api/admin/db/rollback -H 'x-admin-pin: <ADMIN_PIN>'
-```
+## Runtime Config Management
+- `GET /api/admin/config`
+- `POST /api/admin/config`
+- `GET /api/admin/config/export`
+- `POST /api/admin/config/import`
 
-## Maintenance Safety
-During switch/rollback:
-- New game/task generation and result writes are blocked with `503`
+Only safe keys are accepted:
+- `app.settings`
+- `app.features`
+- `contest.rules`
+- `generator.defaults`
+- `theme.defaults`
 
-## Audit Trail
-Switch attempts are appended to:
-- `DB_SWITCH_AUDIT_LOG` (default `/data/db-switch/switch-audit.log`)
+## User and Role Management
+- `GET /api/admin/users`
+- `POST /api/admin/users/:id/role`
 
-## Backup and Restore
-SQLite:
-- `scripts/backup_sqlite.sh`
-- `scripts/restore_sqlite.sh`
+Role assignment is owner-only.
 
-Postgres:
-- `scripts/backup_postgres.sh`
-- `scripts/restore_postgres.sh`
+## Diagnostics
+- `GET /api/diagnostics/rbac`
+- `GET /api/diagnostics/db`
+- `GET /api/diagnostics/config`
+- `GET /api/diagnostics/encryption`
+- `GET /api/diagnostics/startup`
+
+## Audit Logs
+- `GET /api/admin/audit-logs?limit=100`

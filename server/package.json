@@ -8,7 +8,9 @@
     "start": "node index.js",
     "dev": "node index.js",
     "reset": "node cli/reset.js",
-    "migrate": "node -e \"const { initDb } = require('./db'); (async()=>{ const { adapter } = await initDb(); await adapter.ping(); await adapter.close(); console.log('migrate ok'); })().catch(err=>{ console.error(err); process.exit(1); });\""
+    "migrate": "node cli/migrate.js up",
+    "migrate:status": "node cli/migrate.js status",
+    "migrate:rollback": "node cli/migrate.js rollback"
   },
   "dependencies": {
     "better-sqlite3": "^9.6.0",

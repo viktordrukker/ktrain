@@ -158,6 +158,12 @@ function sanitizeSettings(input = {}) {
 }
 
 async function loadSettings(repo) {
+  if (repo.getConfig) {
+    const row = await repo.getConfig("app.settings", "global", "global");
+    if (row?.valueJson) {
+      return sanitizeSettings(row.valueJson || {});
+    }
+  }
   const raw = await repo.getSetting(SETTINGS_KEY);
   if (!raw) return DEFAULT_SETTINGS;
   try {
@@ -169,6 +175,9 @@ async function loadSettings(repo) {
 
 async function saveSettings(repo, input) {
   const safe = sanitizeSettings(input || {});
+  if (repo.setConfig) {
+    await repo.setConfig("app.settings", "global", "global", safe, "settings_api");
+  }
   await repo.setSetting(SETTINGS_KEY, JSON.stringify(safe));
   return safe;
 }
