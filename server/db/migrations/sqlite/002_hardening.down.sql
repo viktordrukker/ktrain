@@ -1,0 +1,10 @@
+DROP INDEX IF EXISTS idx_audit_log_created;
+DROP INDEX IF EXISTS idx_app_config_scope;
+DROP INDEX IF EXISTS idx_users_role;
+DROP INDEX IF EXISTS idx_vocab_packs_packtype_active;
+DROP INDEX IF EXISTS idx_leaderboard_sort;
+DROP TABLE IF EXISTS audit_log;
+DROP TABLE IF EXISTS app_config;
+DROP TABLE IF EXISTS user_secrets;
+DROP TABLE IF EXISTS users;
+DELETE FROM schema_migrations WHERE id = '002_hardening.sql';

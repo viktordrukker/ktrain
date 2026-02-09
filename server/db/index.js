@@ -3,6 +3,7 @@ const path = require("path");
 const { SqliteAdapter } = require("./adapters/sqlite");
 const { PostgresAdapter } = require("./adapters/postgres");
 const { readRuntimeConfig } = require("./runtime-config");
+const { migrateUp, migrationStatus, rollbackLast } = require("./migration-runner");
 
 const DB_DRIVER_ENV = process.env.DB_DRIVER || "sqlite";
 const SQLITE_PATH = process.env.SQLITE_PATH || process.env.DB_PATH || "/data/ktrain.sqlite";
@@ -61,10 +62,12 @@ async function createAdapter(driver) {
           }
     });
     await adapter.init();
+    await migrateUp(adapter, "postgres");
     return adapter;
   }
   const adapter = new SqliteAdapter({ sqlitePath: config.sqlitePath, migrationSql: loadMigrationSql("sqlite") });
   await adapter.init();
+  await migrateUp(adapter, "sqlite");
   return adapter;
 }
 
@@ -81,6 +84,7 @@ async function createPostgresAdapterForConfig(inputConfig = {}) {
       };
   const adapter = new PostgresAdapter({ migrationSql: loadMigrationSql("postgres"), postgres: pgConfig });
   await adapter.init();
+  await migrateUp(adapter, "postgres");
   return adapter;
 }
 
@@ -100,6 +104,14 @@ async function initDb() {
   return { adapter, driver };
 }
 
+async function getMigrationStatus(adapter, driver) {
+  return migrationStatus(adapter, driver);
+}
+
+async function rollbackLastMigration(adapter, driver) {
+  return rollbackLast(adapter, driver);
+}
+
 module.exports = {
   DB_DRIVER_ENV,
   SQLITE_PATH,
@@ -109,5 +121,7 @@ module.exports = {
   testPostgresConfig,
   resolveDriver,
   createAdapter,
-  initDb
+  initDb,
+  getMigrationStatus,
+  rollbackLastMigration
 };
