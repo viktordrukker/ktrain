@@ -980,11 +980,45 @@ app.get("/api/user/profile", requirePermission(Permissions.SESSION_READ), withAs
 
 app.put("/api/user/profile", requirePermission(Permissions.SESSION_READ), withAsync(async (req, res) => {
   if (!req.actor?.isAuthenticated) throw new AppError("Authentication required", { status: 401, code: "UNAUTHORIZED", expose: true });
-  const displayName = asString(req.body?.displayName || "", { min: 1, max: 64, field: "displayName" });
+  const displayName = asString(req.body?.displayName || "", { min: 1, max: 64, field: "displayName" }).trim();
+  const existing = await repo.findUserByDisplayName(displayName);
+  if (existing && Number(existing.id) !== Number(req.actor.id)) {
+    throw new AppError("Display name is already taken", { status: 409, code: "DISPLAY_NAME_TAKEN", expose: true });
+  }
   const avatarUrl = String(req.body?.avatarUrl || "");
   const user = await repo.updateUserProfile(req.actor.id, { displayName, avatarUrl });
   await audit(req, "user.profile.update", "user", String(req.actor.id));
   res.json({ ok: true, profile: user });
+}));
+
+app.get("/api/user/display-name/availability", requirePermission(Permissions.SESSION_READ), withAsync(async (req, res) => {
+  if (!req.actor?.isAuthenticated) throw new AppError("Authentication required", { status: 401, code: "UNAUTHORIZED", expose: true });
+  const displayName = asString(req.query.name || "", { min: 1, max: 64, field: "name" }).trim();
+  const existing = await repo.findUserByDisplayName(displayName);
+  const available = !existing || Number(existing.id) === Number(req.actor.id);
+  res.json({ ok: true, available });
+}));
+
+app.put("/api/user/password", requirePermission(Permissions.SESSION_READ), authLimiter, withAsync(async (req, res) => {
+  if (!req.actor?.isAuthenticated) throw new AppError("Authentication required", { status: 401, code: "UNAUTHORIZED", expose: true });
+  const currentPassword = asString(req.body?.currentPassword || "", { min: 1, max: 128, field: "currentPassword" });
+  const newPassword = asString(req.body?.newPassword || "", { min: 10, max: 128, field: "newPassword" });
+  const policy = validatePasswordPolicy(newPassword);
+  if (!policy.ok) throw badRequest(policy.message);
+  if (currentPassword === newPassword) throw badRequest("New password must be different from current password");
+  const identity = await getPasswordIdentityByEmail(repo, req.actor.email || "");
+  const ok = await verifyPassword(currentPassword, identity?.passwordhash || identity?.passwordHash || "");
+  if (!ok) {
+    await audit(req, "user.password.change", "user", String(req.actor.id), { ok: false });
+    throw new AppError("Current password is incorrect", { status: 400, code: "PASSWORD_INVALID", expose: true });
+  }
+  const passwordHash = await hashPassword(newPassword);
+  await upsertPasswordIdentity(repo, req.actor.id, passwordHash);
+  await repo.revokeAuthSessionsForUser(req.actor.id);
+  const fresh = await repo.findUserById(req.actor.id);
+  await issueSessionForUser(req, res, fresh, "user.password.change");
+  await audit(req, "user.password.change", "user", String(req.actor.id), { ok: true });
+  res.json({ ok: true });
 }));
 
 app.get("/api/user/openai-key/status", requirePermission(Permissions.SESSION_READ), withAsync(async (req, res) => {
@@ -1325,6 +1359,17 @@ app.get("/api/admin/service-settings", requirePermission(Permissions.ADMIN_CONFI
 
 app.post("/api/admin/service-settings/email", requirePermission(Permissions.ADMIN_CONFIG_MANAGE), adminLimiter, withAsync(async (req, res) => {
   const payload = requireObject(req.body || {}, "email settings");
+  const current = await smtpService.getEmailSettings();
+  const merged = {
+    enabled: Boolean(payload.enabled),
+    host: String(payload.host || "").trim(),
+    username: String(payload.username || "").trim(),
+    fromAddress: String(payload.fromAddress || "").trim(),
+    password: String(payload.password || current.password || "")
+  };
+  if (merged.enabled && (!merged.host || !merged.username || !merged.fromAddress || !merged.password)) {
+    throw badRequest("SMTP cannot be enabled until host, username, from address, and password are configured");
+  }
   await smtpService.saveEmailSettings(payload, req.actor?.externalSubject || "admin");
   await configStore.setSafe("service.email.status", {
     lastTestOk: false,
@@ -1366,7 +1411,12 @@ app.post("/api/admin/service-settings/auth/google", requirePermission(Permission
   const payload = requireObject(req.body || {}, "google auth settings");
   const enabled = Boolean(payload.enabled);
   const clientId = String(payload.clientId || "").trim();
-  if (enabled && !clientId) throw badRequest("Google clientId is required when enabled");
+  const existingSecret = await repo.getSystemSecret("google.client_secret");
+  const hasIncomingSecret = Boolean(String(payload.clientSecret || "").trim());
+  const hasStoredSecret = Boolean(existingSecret?.ciphertext && existingSecret?.iv && (existingSecret?.authTag || existingSecret?.authtag));
+  if (enabled && (!clientId || (!hasIncomingSecret && !hasStoredSecret))) {
+    throw badRequest("Google cannot be enabled until client ID and client secret are configured");
+  }
 
   const providers = await configStore.get("auth.providers", {
     scope: "global",
@@ -1381,7 +1431,7 @@ app.post("/api/admin/service-settings/auth/google", requirePermission(Permission
     }
   }, { scope: "global", scopeId: "global", updatedBy: req.actor?.externalSubject || "admin" });
 
-  if (payload.clientSecret) {
+  if (hasIncomingSecret) {
     const encrypted = encryptionService.encrypt(String(payload.clientSecret));
     await repo.setSystemSecret("google.client_secret", encrypted, req.actor?.externalSubject || "admin");
   }

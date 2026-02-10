@@ -155,6 +155,13 @@ class SqliteAdapter {
     return mapUserRow(row);
   }
 
+  async findUserByDisplayName(displayName) {
+    const row = this.db
+      .prepare("SELECT * FROM users WHERE lower(trim(displayName)) = lower(trim(?)) LIMIT 1")
+      .get(displayName);
+    return mapUserRow(row);
+  }
+
   async findUserById(id) {
     const row = this.db.prepare("SELECT * FROM users WHERE id = ? LIMIT 1").get(id);
     return mapUserRow(row);

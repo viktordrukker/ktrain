@@ -135,7 +135,19 @@ type ConfigStatus = {
   config_version: number;
 };
 
-type Screen = "home" | "game" | "results" | "leaderboard" | "settings";
+type ClientErrorTrace = {
+  at: string;
+  action: string;
+  message: string;
+  status?: number;
+  code?: string;
+  requestId?: string;
+  url?: string;
+  stack?: string;
+  details?: any;
+};
+
+type Screen = "home" | "game" | "results" | "leaderboard" | "settings" | "about";
 
 type GameSettings = {
   mode: Mode;
@@ -410,16 +422,39 @@ function withAuthHeaders(base: Record<string, string> = {}) {
   return base;
 }
 
+class ApiError extends Error {
+  status?: number;
+  code?: string;
+  requestId?: string;
+  url?: string;
+  details?: any;
+}
+
 async function parseApiError(res: Response, fallback: string) {
+  const requestId = res.headers.get("x-request-id") || undefined;
   try {
     const data = await res.json();
-    return String(data?.error || data?.message || fallback);
+    const err = new ApiError(String(data?.error || data?.message || fallback));
+    err.status = res.status;
+    err.code = data?.code;
+    err.requestId = data?.requestId || requestId;
+    err.url = res.url;
+    err.details = data;
+    return err;
   } catch {
     try {
       const text = await res.text();
-      return text ? String(text) : fallback;
+      const err = new ApiError(text ? String(text) : fallback);
+      err.status = res.status;
+      err.requestId = requestId;
+      err.url = res.url;
+      return err;
     } catch {
-      return fallback;
+      const err = new ApiError(fallback);
+      err.status = res.status;
+      err.requestId = requestId;
+      err.url = res.url;
+      return err;
     }
   }
 }
@@ -431,7 +466,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ level, count, contentMode, language })
     });
-    if (!res.ok) throw new Error("Failed to generate tasks");
+    if (!res.ok) throw await parseApiError(res, "Failed to generate tasks");
     return res.json();
   },
   async saveResult(payload: any) {
@@ -440,13 +475,13 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Failed to save result");
+    if (!res.ok) throw await parseApiError(res, "Failed to save result");
     return res.json();
   },
   async getLeaderboard(filters: any): Promise<{ entries: LeaderboardEntry[]; myRank: number | null }> {
     const params = new URLSearchParams(filters).toString();
     const res = await fetch(`/api/leaderboard?${params}`, { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load leaderboard");
+    if (!res.ok) throw await parseApiError(res, "Failed to load leaderboard");
     const data = await res.json();
     return {
       entries: data.entries as LeaderboardEntry[],
@@ -455,32 +490,75 @@ const API = {
   },
   async getPublicSession() {
     const res = await fetch("/api/public/session", { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load session");
+    if (!res.ok) throw await parseApiError(res, "Failed to load session");
+    return res.json();
+  },
+  async getUserProfile() {
+    const res = await fetch("/api/user/profile", { headers: withAuthHeaders() });
+    if (!res.ok) throw await parseApiError(res, "Failed to load profile");
+    return res.json();
+  },
+  async updateUserProfile(payload: { displayName: string; avatarUrl?: string }) {
+    const res = await fetch("/api/user/profile", {
+      method: "PUT",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw await parseApiError(res, "Failed to update profile");
+    return res.json();
+  },
+  async checkDisplayNameAvailability(name: string) {
+    const params = new URLSearchParams({ name });
+    const res = await fetch(`/api/user/display-name/availability?${params.toString()}`, { headers: withAuthHeaders() });
+    if (!res.ok) throw await parseApiError(res, "Failed to check display name");
+    return res.json();
+  },
+  async changePassword(payload: { currentPassword: string; newPassword: string }) {
+    const res = await fetch("/api/user/password", {
+      method: "PUT",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw await parseApiError(res, "Failed to update password");
+    return res.json();
+  },
+  async getOwnOpenAIKeyStatus() {
+    const res = await fetch("/api/user/openai-key/status", { headers: withAuthHeaders() });
+    if (!res.ok) throw await parseApiError(res, "Failed to load OpenAI key status");
+    return res.json();
+  },
+  async saveOwnOpenAIKey(apiKey: string) {
+    const res = await fetch("/api/user/openai-key", {
+      method: "PUT",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ apiKey })
+    });
+    if (!res.ok) throw await parseApiError(res, "Failed to save OpenAI key");
     return res.json();
   },
   async getHealth() {
     const res = await fetch("/api/health");
-    if (!res.ok) throw new Error("Failed to load health");
+    if (!res.ok) throw await parseApiError(res, "Failed to load health");
     return res.json();
   },
   async getPublicVersion() {
     const res = await fetch("/api/public/version");
-    if (!res.ok) throw new Error("Failed to load public version");
+    if (!res.ok) throw await parseApiError(res, "Failed to load public version");
     return res.json();
   },
   async getSetupStatus() {
     const res = await fetch("/api/setup/status", { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load setup status");
+    if (!res.ok) throw await parseApiError(res, "Failed to load setup status");
     return res.json();
   },
   async getPublicConfigStatus() {
     const res = await fetch("/api/public/config/status", { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load public config status");
+    if (!res.ok) throw await parseApiError(res, "Failed to load public config status");
     return res.json();
   },
   async completeSetup() {
     const res = await fetch("/api/setup/complete", { method: "POST", headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to complete setup");
+    if (!res.ok) throw await parseApiError(res, "Failed to complete setup");
     return res.json();
   },
   async setupCreateAdmin(payload: { email: string; displayName: string; password: string }) {
@@ -489,22 +567,22 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error(await parseApiError(res, "Failed to create setup admin"));
+    if (!res.ok) throw await parseApiError(res, "Failed to create setup admin");
     return res.json();
   },
   async getSetupDbStatus() {
     const res = await fetch("/api/setup/db-status", { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load setup database status");
+    if (!res.ok) throw await parseApiError(res, "Failed to load setup database status");
     return res.json();
   },
   async bootstrapOwner() {
     const res = await fetch("/api/setup/bootstrap-owner", { method: "POST", headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to bootstrap owner");
+    if (!res.ok) throw await parseApiError(res, "Failed to bootstrap owner");
     return res.json();
   },
   async getAuthProviders() {
     const res = await fetch("/api/auth/providers");
-    if (!res.ok) throw new Error("Failed to load providers");
+    if (!res.ok) throw await parseApiError(res, "Failed to load providers");
     return res.json();
   },
   async authWithGoogle(credential: string) {
@@ -514,7 +592,7 @@ const API = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ credential })
     });
-    if (!res.ok) throw new Error("Google sign-in failed");
+    if (!res.ok) throw await parseApiError(res, "Google sign-in failed");
     return res.json();
   },
   async registerWithPassword(payload: { email: string; displayName: string; password: string }) {
@@ -524,7 +602,7 @@ const API = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Registration failed");
+    if (!res.ok) throw await parseApiError(res, "Registration failed");
     return res.json();
   },
   async loginWithPassword(payload: { email: string; password: string }) {
@@ -534,7 +612,7 @@ const API = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Invalid email or password");
+    if (!res.ok) throw await parseApiError(res, "Invalid email or password");
     return res.json();
   },
   async requestPasswordReset(email: string) {
@@ -544,7 +622,7 @@ const API = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email })
     });
-    if (!res.ok) throw new Error("Password reset request failed");
+    if (!res.ok) throw await parseApiError(res, "Password reset request failed");
     return res.json();
   },
   async confirmPasswordReset(payload: { token: string; password: string }) {
@@ -554,22 +632,22 @@ const API = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Password reset failed");
+    if (!res.ok) throw await parseApiError(res, "Password reset failed");
     return res.json();
   },
   async logout() {
     const res = await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin", headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Logout failed");
+    if (!res.ok) throw await parseApiError(res, "Logout failed");
     return res.json();
   },
   async getAvailableLanguages(level: number) {
     const res = await fetch(`/api/packs/languages?level=${level}`, { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load available languages");
+    if (!res.ok) throw await parseApiError(res, "Failed to load available languages");
     return res.json();
   },
   async getLiveStats() {
     const res = await fetch("/api/live/stats", { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load live stats");
+    if (!res.ok) throw await parseApiError(res, "Failed to load live stats");
     return res.json();
   },
   async heartbeat(sessionId: string, mode: Mode) {
@@ -578,7 +656,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ sessionId, mode })
     });
-    if (!res.ok) throw new Error("Heartbeat failed");
+    if (!res.ok) throw await parseApiError(res, "Heartbeat failed");
     return res.json();
   },
   async adminReset(scope: string, _pin?: string) {
@@ -587,19 +665,19 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ scope })
     });
-    if (!res.ok) throw new Error("Reset failed");
+    if (!res.ok) throw await parseApiError(res, "Reset failed");
   },
   async adminSeedDefaults(_pin?: string) {
     const res = await fetch("/api/admin/seed-defaults", {
       method: "POST",
       headers: withAuthHeaders({ "Content-Type": "application/json" })
     });
-    if (!res.ok) throw new Error("Seed failed");
+    if (!res.ok) throw await parseApiError(res, "Seed failed");
   },
   async getLanguagePacks(filters: any = {}) {
     const params = new URLSearchParams(filters).toString();
     const res = await fetch(`/api/admin/language-packs?${params}`, { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load language packs");
+    if (!res.ok) throw await parseApiError(res, "Failed to load language packs");
     return res.json();
   },
   async getVocabPacks(): Promise<VocabPack[]> {
@@ -632,7 +710,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Test failed");
+    if (!res.ok) throw await parseApiError(res, "Test failed");
     return res.json();
   },
   async updateLanguagePack(id: number, payload: any) {
@@ -641,7 +719,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Language pack update failed");
+    if (!res.ok) throw await parseApiError(res, "Language pack update failed");
     return res.json();
   },
   async generateLanguagePack(payload: any) {
@@ -650,12 +728,12 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Language pack generation failed");
+    if (!res.ok) throw await parseApiError(res, "Language pack generation failed");
     return res.json();
   },
   async exportLanguagePacks() {
     const res = await fetch("/api/admin/language-packs/export", { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Language pack export failed");
+    if (!res.ok) throw await parseApiError(res, "Language pack export failed");
     return res.json();
   },
   async importLanguagePacks(payload: any) {
@@ -664,17 +742,17 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Language pack import failed");
+    if (!res.ok) throw await parseApiError(res, "Language pack import failed");
     return res.json();
   },
   async getDbStatus(_pin?: string): Promise<DbAdminStatus> {
     const res = await fetch("/api/admin/db/status", { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load DB status");
+    if (!res.ok) throw await parseApiError(res, "Failed to load DB status");
     return res.json();
   },
   async getDbConfig(_pin?: string): Promise<{ dbConfig: DbAdminConfig; activeDriver: "sqlite" | "postgres" }> {
     const res = await fetch("/api/admin/db/config", { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load DB config");
+    if (!res.ok) throw await parseApiError(res, "Failed to load DB config");
     return res.json();
   },
   async saveDbConfig(_pinOrPayload: any, payloadOrVerify?: any, verify = true) {
@@ -685,7 +763,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ ...payload, verify: finalVerify })
     });
-    if (!res.ok) throw new Error("Failed to save DB config");
+    if (!res.ok) throw await parseApiError(res, "Failed to save DB config");
     return res.json();
   },
   async switchDb(pinOrTarget: any, maybeTarget?: "sqlite" | "postgres") {
@@ -695,7 +773,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ target, mode: "copy-then-switch", verify: true })
     });
-    if (!res.ok) throw new Error("DB switch failed");
+    if (!res.ok) throw await parseApiError(res, "DB switch failed");
     return res.json();
   },
   async rollbackDb(_pin?: string) {
@@ -703,7 +781,7 @@ const API = {
       method: "POST",
       headers: withAuthHeaders()
     });
-    if (!res.ok) throw new Error("DB rollback failed");
+    if (!res.ok) throw await parseApiError(res, "DB rollback failed");
     return res.json();
   },
   async testDbConnection(pinOrPayload: any, maybePayload?: { postgres: DbAdminConfig["postgres"] }) {
@@ -713,7 +791,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Postgres test connection failed");
+    if (!res.ok) throw await parseApiError(res, "Postgres test connection failed");
     return res.json();
   },
   async getAdminPinStatus(_pin?: string): Promise<{ pinIsDefault: boolean; source: string }> {
@@ -724,12 +802,12 @@ const API = {
   },
   async getServiceSettings() {
     const res = await fetch("/api/admin/service-settings", { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load service settings");
+    if (!res.ok) throw await parseApiError(res, "Failed to load service settings");
     return res.json();
   },
   async getAdminConfigStatus(): Promise<{ status: ConfigStatus }> {
     const res = await fetch("/api/admin/config/status", { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load config status");
+    if (!res.ok) throw await parseApiError(res, "Failed to load config status");
     return res.json();
   },
   async applyAdminConfig(changes: Array<{ key: string; valueJson: any; scope?: string; scopeId?: string }>, allowPartialSetup = false) {
@@ -738,7 +816,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ changes, allowPartialSetup })
     });
-    if (!res.ok) throw new Error("Failed to apply config");
+    if (!res.ok) throw await parseApiError(res, "Failed to apply config");
     return res.json();
   },
   async testSmtpConfig(payload: { to?: string; settings?: any }) {
@@ -747,17 +825,17 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload || {})
     });
-    if (!res.ok) throw new Error("SMTP test failed");
+    if (!res.ok) throw await parseApiError(res, "SMTP test failed");
     return res.json();
   },
   async testGoogleConfig() {
     const res = await fetch("/api/admin/config/test/google", { method: "POST", headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Google config test failed");
+    if (!res.ok) throw await parseApiError(res, "Google config test failed");
     return res.json();
   },
   async testDatabaseConfig() {
     const res = await fetch("/api/admin/config/test/db", { method: "POST", headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Database test failed");
+    if (!res.ok) throw await parseApiError(res, "Database test failed");
     return res.json();
   },
   async saveEmailSettings(payload: any) {
@@ -766,7 +844,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Failed to save email settings");
+    if (!res.ok) throw await parseApiError(res, "Failed to save email settings");
     return res.json();
   },
   async saveGoogleAuthSettings(payload: { enabled: boolean; clientId: string; clientSecret?: string }) {
@@ -775,7 +853,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Failed to save Google auth settings");
+    if (!res.ok) throw await parseApiError(res, "Failed to save Google auth settings");
     return res.json();
   },
   async sendTestEmail(to: string) {
@@ -784,29 +862,29 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ to })
     });
-    if (!res.ok) throw new Error("Failed to send test email");
+    if (!res.ok) throw await parseApiError(res, "Failed to send test email");
     return res.json();
   },
   async listCrashEvents(limit = 50, unresolvedOnly = false) {
     const res = await fetch(`/api/admin/crashes?limit=${limit}&unresolvedOnly=${unresolvedOnly ? "true" : "false"}`, {
       headers: withAuthHeaders()
     });
-    if (!res.ok) throw new Error("Failed to load crashes");
+    if (!res.ok) throw await parseApiError(res, "Failed to load crashes");
     return res.json();
   },
   async getCrashEvent(id: number) {
     const res = await fetch(`/api/admin/crashes/${id}`, { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load crash details");
+    if (!res.ok) throw await parseApiError(res, "Failed to load crash details");
     return res.json();
   },
   async acknowledgeCrashEvent(id: number) {
     const res = await fetch(`/api/admin/crashes/${id}/ack`, { method: "POST", headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to acknowledge crash");
+    if (!res.ok) throw await parseApiError(res, "Failed to acknowledge crash");
     return res.json();
   },
   async getSettings(_pin?: string): Promise<AppSettings> {
     const res = await fetch("/api/settings", { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load settings");
+    if (!res.ok) throw await parseApiError(res, "Failed to load settings");
     const data = await res.json();
     return data.settings as AppSettings;
   },
@@ -816,7 +894,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Failed to save settings");
+    if (!res.ok) throw await parseApiError(res, "Failed to save settings");
     const data = await res.json();
     return data.settings as AppSettings;
   }
@@ -1113,6 +1191,8 @@ function App() {
   const [setupAdminPassword, setSetupAdminPassword] = useState("");
   const [publicConfigOverall, setPublicConfigOverall] = useState<ConfigOverall>("READY");
   const [setupDbStatus, setSetupDbStatus] = useState<any>(null);
+  const [clientErrors, setClientErrors] = useState<ClientErrorTrace[]>([]);
+  const [errorLogOpen, setErrorLogOpen] = useState(false);
   const [savePartial, setSavePartial] = useState(false);
   const [levelConverted, setLevelConverted] = useState(false);
   const [authEmail, setAuthEmail] = useState("");
@@ -1120,6 +1200,8 @@ function App() {
   const [authDisplayName, setAuthDisplayName] = useState("");
   const [authMode, setAuthMode] = useState<"login" | "register" | "forgot">("login");
   const [authMessage, setAuthMessage] = useState("");
+  const [showAuthModal, setShowAuthModal] = useState(false);
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [passwordResetToken, setPasswordResetToken] = useState("");
   const [passwordResetPassword, setPasswordResetPassword] = useState("");
   const [sessionUser, setSessionUser] = useState<any>(null);
@@ -1206,6 +1288,22 @@ function App() {
   );
   const isSetupRoute = window.location.pathname === "/setup";
   const isSetupRequired = publicConfigOverall === "SETUP_REQUIRED";
+
+  const reportClientError = useCallback((action: string, err: any) => {
+    const apiErr = err as ApiError;
+    const trace: ClientErrorTrace = {
+      at: new Date().toISOString(),
+      action,
+      message: String(apiErr?.message || err || "Unknown error"),
+      status: apiErr?.status,
+      code: apiErr?.code,
+      requestId: apiErr?.requestId,
+      url: apiErr?.url,
+      stack: typeof apiErr?.stack === "string" ? apiErr.stack : undefined,
+      details: apiErr?.details
+    };
+    setClientErrors((prev) => [trace, ...prev].slice(0, 50));
+  }, []);
   const themeVars = {
     "--bg": theme.background,
     "--bg-alt": theme.backgroundAlt,
@@ -1272,10 +1370,25 @@ function App() {
       setShowStopModal(true);
       return;
     }
+    if (window.location.pathname === "/about") {
+      window.history.pushState({}, "", "/");
+    }
     if (screen !== "home") {
       navigateFromSettings("home");
     }
   };
+
+  useEffect(() => {
+    if (window.location.pathname === "/about") {
+      setScreen("about");
+    }
+  }, []);
+
+  useEffect(() => {
+    if (screen !== "about" && window.location.pathname === "/about") {
+      window.history.replaceState({}, "", "/");
+    }
+  }, [screen]);
 
   useEffect(() => {
     if (isSetupRoute || isSetupRequired) return;
@@ -1283,7 +1396,10 @@ function App() {
       .then((session) => {
         setSessionUser(session.actor?.isAuthenticated ? session.actor : null);
       })
-      .catch(() => setSessionUser(null));
+      .catch((err) => {
+        setSessionUser(null);
+        reportClientError("load_public_session", err);
+      });
 
     const params = new URLSearchParams(window.location.search);
     const resetToken = params.get("reset_token");
@@ -1292,7 +1408,7 @@ function App() {
       setAuthMode("forgot");
       window.history.replaceState({}, "", window.location.pathname);
     }
-  }, [isSetupRoute, isSetupRequired]);
+  }, [isSetupRoute, isSetupRequired, reportClientError]);
 
   useEffect(() => {
     API.getPublicConfigStatus()
@@ -1303,8 +1419,9 @@ function App() {
       .catch(() => {
         setPublicConfigOverall("SETUP_REQUIRED");
         setSetupWizardOpen(true);
+        reportClientError("load_public_config_status", new Error("Failed to load public config status"));
       });
-  }, []);
+  }, [reportClientError]);
 
   useEffect(() => {
     if (isSetupRoute || isSetupRequired) return;
@@ -1317,8 +1434,9 @@ function App() {
       .catch(() => {
         setGoogleClientId("");
         setPasswordResetEnabled(false);
+        reportClientError("load_auth_providers", new Error("Failed to load auth providers"));
       });
-  }, [isSetupRoute, isSetupRequired]);
+  }, [isSetupRoute, isSetupRequired, reportClientError]);
 
   const refreshSetupStatus = useCallback(async () => {
     try {
@@ -1338,8 +1456,9 @@ function App() {
       }
     } catch {
       setSetupStatus(null);
+      reportClientError("refresh_setup_status", new Error("Failed to refresh setup status"));
     }
-  }, []);
+  }, [reportClientError]);
 
   useEffect(() => {
     refreshSetupStatus().catch(() => null);
@@ -1349,8 +1468,11 @@ function App() {
     if (isSetupRoute || isSetupRequired) return;
     API.getHealth()
       .then((health) => setAppMode(String(health?.appMode || "info")))
-      .catch(() => setAppMode("info"));
-  }, [isSetupRoute, isSetupRequired]);
+      .catch((err) => {
+        setAppMode("info");
+        reportClientError("load_health", err);
+      });
+  }, [isSetupRoute, isSetupRequired, reportClientError]);
 
   useEffect(() => {
     if (isSetupRoute || isSetupRequired) return;
@@ -1365,8 +1487,11 @@ function App() {
         contact: data?.contact,
         appMode: data?.appMode
       }))
-      .catch(() => setPublicVersion(null));
-  }, [isSetupRoute, isSetupRequired]);
+      .catch((err) => {
+        setPublicVersion(null);
+        reportClientError("load_public_version", err);
+      });
+  }, [isSetupRoute, isSetupRequired, reportClientError]);
 
   useEffect(() => {
     if (isAdminUser) setAdminPin("rbac");
@@ -1406,6 +1531,21 @@ function App() {
     script.onload = init;
     document.body.appendChild(script);
   }, [googleClientId]);
+
+  useEffect(() => {
+    const onWindowError = (event: ErrorEvent) => {
+      reportClientError("window_error", event.error || new Error(event.message || "Unhandled window error"));
+    };
+    const onUnhandledRejection = (event: PromiseRejectionEvent) => {
+      reportClientError("unhandled_rejection", event.reason || new Error("Unhandled rejection"));
+    };
+    window.addEventListener("error", onWindowError);
+    window.addEventListener("unhandledrejection", onUnhandledRejection);
+    return () => {
+      window.removeEventListener("error", onWindowError);
+      window.removeEventListener("unhandledrejection", onUnhandledRejection);
+    };
+  }, [reportClientError]);
 
   useEffect(() => {
     if (!adminPin) {
@@ -1531,6 +1671,10 @@ function App() {
 
   const startGame = async () => {
     setStatusMessage("");
+    if (!sessionUser && !String(settings.playerName || "").trim()) {
+      setStatusMessage("Guest nickname is required.");
+      return;
+    }
     const generated = await API.generateTasks(settings.level, 40, settings.contentMode, settings.language);
     if (generated.language !== settings.language) {
       setSettings((prev) => ({ ...prev, language: generated.language || prev.language }));
@@ -1576,8 +1720,9 @@ function App() {
   const endGame = async () => {
     const endTime = Date.now();
     const totalMs = endTime - startTime;
+    const derivedPlayerName = sessionUser?.displayName || sessionUser?.email || settings.playerName || "Player";
     const result = {
-      playerName: settings.playerName || "Player",
+      playerName: derivedPlayerName,
       contestType: settings.contestType,
       level: settings.level,
       contentMode: settings.contentMode,
@@ -1897,13 +2042,13 @@ function App() {
   async function submitEmailAuth() {
     if (!authEmail) {
       setAuthMessage("Enter an email address first.");
-      return;
+      return false;
     }
     try {
       if (authMode === "register") {
         if (!authPassword) {
           setAuthMessage("Enter a password.");
-          return;
+          return false;
         }
         const result = await API.registerWithPassword({
           email: authEmail,
@@ -1912,15 +2057,16 @@ function App() {
         });
         setSessionUser(result.user || null);
         setAuthMessage("Account created and signed in.");
+        return true;
       } else if (authMode === "forgot") {
         if (!passwordResetEnabled) {
           setAuthMessage("Password reset email is unavailable. Ask an admin to configure SMTP.");
-          return;
+          return false;
         }
         if (passwordResetToken) {
           if (!passwordResetPassword) {
             setAuthMessage("Enter a new password.");
-            return;
+            return false;
           }
           await API.confirmPasswordReset({ token: passwordResetToken, password: passwordResetPassword });
           const session = await API.getPublicSession();
@@ -1929,21 +2075,26 @@ function App() {
           setPasswordResetPassword("");
           setAuthMode("login");
           setAuthMessage("Password updated.");
+          return true;
         } else {
           const data = await API.requestPasswordReset(authEmail);
           setAuthMessage(data?.message || "If the account exists, a reset email was sent.");
+          return false;
         }
       } else {
         if (!authPassword) {
           setAuthMessage("Enter your password.");
-          return;
+          return false;
         }
         const result = await API.loginWithPassword({ email: authEmail, password: authPassword });
         setSessionUser(result.user || null);
         setAuthMessage("Signed in.");
+        return true;
       }
     } catch (err: any) {
       setAuthMessage(err?.message || "Authentication failed.");
+      reportClientError("submit_email_auth", err);
+      return false;
     }
   }
 
@@ -1954,6 +2105,7 @@ function App() {
       setAuthMessage("Signed in with Google.");
     } catch (err: any) {
       setAuthMessage(err?.message || "Google sign-in failed.");
+      reportClientError("google_sign_in", err);
     }
   }
 
@@ -1995,12 +2147,12 @@ function App() {
     const poll = () => {
       API.getLiveStats()
         .then((data) => setLiveStats(data.stats || { total: 0, authorized: 0, guests: 0, modes: [] }))
-        .catch(() => null);
+        .catch((err) => reportClientError("poll_live_stats", err));
     };
     poll();
     const id = window.setInterval(poll, 15000);
     return () => window.clearInterval(id);
-  }, [isSetupRoute, isSetupRequired]);
+  }, [isSetupRoute, isSetupRequired, reportClientError]);
 
   const path = window.location.pathname;
   const isTextFitDiagnostics = path === "/diagnostics/text-fit";
@@ -2168,6 +2320,7 @@ function App() {
                       await refreshSetupStatus();
                     } catch (err: any) {
                       setSetupMessage(err?.message || "Admin setup failed.");
+                      reportClientError("setup_create_admin", err);
                     }
                   }}
                 >
@@ -2203,6 +2356,7 @@ function App() {
                       await refreshSetupStatus();
                     } catch (err: any) {
                       setSetupMessage(err?.message || "Owner bootstrap failed.");
+                      reportClientError("setup_bootstrap_owner", err);
                     }
                   }}
                 >
@@ -2218,6 +2372,7 @@ function App() {
                     await refreshSetupStatus();
                   } catch (err: any) {
                     setSetupMessage(err?.message || "Failed to complete setup.");
+                    reportClientError("setup_complete", err);
                   }
                 }}
               >
@@ -2227,9 +2382,135 @@ function App() {
           </Group>
         </Stack>
       </Modal>
+      <Modal opened={errorLogOpen} onClose={() => setErrorLogOpen(false)} title="Error Diagnostics" size="xl" centered>
+        <Stack gap="sm">
+          <Text size="sm">
+            Share this payload when reporting issues. It includes request IDs for backend correlation.
+          </Text>
+          <Textarea
+            minRows={12}
+            autosize
+            readOnly
+            value={JSON.stringify(clientErrors, null, 2)}
+          />
+          <Group justify="space-between">
+            <Button
+              variant="light"
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(JSON.stringify(clientErrors, null, 2));
+                  setStatusMessage("Error diagnostics copied.");
+                } catch {
+                  setStatusMessage("Failed to copy diagnostics.");
+                }
+              }}
+            >
+              Copy diagnostics
+            </Button>
+            <Button
+              color="red"
+              variant="light"
+              onClick={() => {
+                setClientErrors([]);
+                setStatusMessage("Error diagnostics cleared.");
+              }}
+            >
+              Clear
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
+      <Modal opened={showAuthModal} onClose={() => setShowAuthModal(false)} title="Sign in" centered>
+        <Stack gap="sm">
+          <SegmentedControl
+            value={authMode}
+            onChange={(value) => setAuthMode(value as "login" | "register" | "forgot")}
+            data={[
+              { value: "login", label: "Email login" },
+              { value: "register", label: "Sign up" },
+              { value: "forgot", label: "Forgot password" }
+            ]}
+          />
+          <TextInput
+            label="Email"
+            value={authEmail}
+            onChange={(e) => setAuthEmail(e.currentTarget.value)}
+            placeholder="you@example.com"
+          />
+          {authMode === "register" && (
+            <TextInput
+              label="Display name"
+              value={authDisplayName}
+              onChange={(e) => setAuthDisplayName(e.currentTarget.value)}
+              placeholder="Player"
+            />
+          )}
+          {(authMode === "login" || authMode === "register") && (
+            <TextInput
+              type="password"
+              label="Password"
+              value={authPassword}
+              onChange={(e) => setAuthPassword(e.currentTarget.value)}
+              placeholder="At least 10 characters"
+            />
+          )}
+          {authMode === "forgot" && passwordResetToken && (
+            <TextInput
+              type="password"
+              label="New password"
+              value={passwordResetPassword}
+              onChange={(e) => setPasswordResetPassword(e.currentTarget.value)}
+              placeholder="Enter a new password"
+            />
+          )}
+          <Button
+            disabled={authMode === "forgot" && !passwordResetEnabled}
+            onClick={async () => {
+              const ok = await submitEmailAuth();
+              if (ok) setShowAuthModal(false);
+            }}
+          >
+            {authMode === "register"
+              ? "Create account"
+              : authMode === "forgot"
+                ? (passwordResetToken ? "Set new password" : "Send reset email")
+                : "Sign in"}
+          </Button>
+          {authMode === "forgot" && !passwordResetEnabled && (
+            <Text size="xs" c="dimmed">Password reset requires SMTP settings from an admin.</Text>
+          )}
+          {googleClientId && <div id="google-signin-button" />}
+          {authMessage && <Text size="xs" c="dimmed">{authMessage}</Text>}
+        </Stack>
+      </Modal>
       <header className="topbar">
         <UnstyledButton className="brand" onClick={handleBrandClick} aria-label="Go to main menu">K-TRAIN</UnstyledButton>
         <div className="topbar-actions">
+          {!isSetupRoute && !isSetupRequired && (
+            <Button variant="light" size="xs" onClick={() => { window.history.pushState({}, "", "/about"); setScreen("about"); }}>About</Button>
+          )}
+          {!isSetupRoute && !isSetupRequired && !sessionUser && (
+            <Button variant="light" size="xs" onClick={() => setShowAuthModal(true)}>Log in</Button>
+          )}
+          {!isSetupRoute && !isSetupRequired && sessionUser && (
+            <div className="account-menu-wrap">
+              <Button variant="light" size="xs" onClick={() => setAccountMenuOpen((v) => !v)}>
+                {sessionUser.displayName || sessionUser.email || "Account"}
+              </Button>
+              {accountMenuOpen && (
+                <Card className="account-menu" withBorder shadow="sm">
+                  <Stack gap={6}>
+                    <Button size="xs" variant="subtle" onClick={() => { setScreen("settings"); setAccountMenuOpen(false); }}>Account</Button>
+                    <Button size="xs" variant="subtle" onClick={() => { setScreen("settings"); setAccountMenuOpen(false); }}>Settings</Button>
+                    <Button size="xs" color="red" variant="subtle" onClick={() => { setAccountMenuOpen(false); void signOut(); }}>Log out</Button>
+                  </Stack>
+                </Card>
+              )}
+            </div>
+          )}
+          <Button variant={clientErrors.length > 0 ? "filled" : "light"} size="xs" color={clientErrors.length > 0 ? "red" : undefined} onClick={() => setErrorLogOpen(true)}>
+            Errors: {clientErrors.length}
+          </Button>
           <Button
             variant="light"
             size="xs"
@@ -2246,90 +2527,42 @@ function App() {
         </Alert>
       )}
 
+      {screen === "about" && (
+        <div className="screen home">
+          <Title order={1}>About K-TRAIN</Title>
+          <Card className="form-card" shadow="sm" radius="lg" withBorder>
+            <Stack gap="sm">
+              <Text>K-TRAIN is a typing game for toddlers through adults, from first letters to timed challenges.</Text>
+              <Text size="sm">Current modes: Learning and Contest. Experimental modes are planned and may appear behind admin controls.</Text>
+              <Text size="sm">Global leaderboard ranks authorized players by score, speed, and accuracy.</Text>
+              <Text size="sm">Privacy and safety: kid-safe default content, no public email exposure, and admin-governed service settings.</Text>
+              <Group>
+                <Button variant="light" onClick={() => { window.history.pushState({}, "", "/"); setScreen("home"); }}>Back to game</Button>
+                <Button variant="light" onClick={() => setScreen("settings")}>Settings / Admin</Button>
+              </Group>
+            </Stack>
+          </Card>
+        </div>
+      )}
+
       {screen === "home" && (
         <div className="screen home">
           <Title order={1}>Keyboard Trainer</Title>
           <Text>Big keys. Big wins.</Text>
           <Card className="form-card" shadow="sm" radius="lg" withBorder>
             <Stack gap="md">
-              <TextInput
-                label="Player name"
-                value={settings.playerName}
-                onChange={(e) => setSettings({ ...settings, playerName: e.target.value })}
-                placeholder="Player"
-              />
-              <Card withBorder radius="md" p="sm">
-                <Stack gap="xs">
-                  <Text fw={600}>Account</Text>
-                  {sessionUser ? (
-                    <>
-                      <Text size="sm">Signed in as {sessionUser.displayName || sessionUser.email}</Text>
-                      <Button variant="light" size="xs" onClick={signOut}>Sign out</Button>
-                    </>
-                  ) : (
-                    <>
-                      <SegmentedControl
-                        value={authMode}
-                        onChange={(value) => setAuthMode(value as "login" | "register" | "forgot")}
-                        data={[
-                          { value: "login", label: "Email login" },
-                          { value: "register", label: "Sign up" },
-                          { value: "forgot", label: "Forgot password" }
-                        ]}
-                      />
-                      <TextInput
-                        label="Email"
-                        value={authEmail}
-                        onChange={(e) => setAuthEmail(e.currentTarget.value)}
-                        placeholder="you@example.com"
-                      />
-                      {authMode === "register" && (
-                        <TextInput
-                          label="Display name"
-                          value={authDisplayName}
-                          onChange={(e) => setAuthDisplayName(e.currentTarget.value)}
-                          placeholder="Player"
-                        />
-                      )}
-                      {(authMode === "login" || authMode === "register") && (
-                        <TextInput
-                          type="password"
-                          label="Password"
-                          value={authPassword}
-                          onChange={(e) => setAuthPassword(e.currentTarget.value)}
-                          placeholder="At least 10 characters"
-                        />
-                      )}
-                      {authMode === "forgot" && passwordResetToken && (
-                        <TextInput
-                          type="password"
-                          label="New password"
-                          value={passwordResetPassword}
-                          onChange={(e) => setPasswordResetPassword(e.currentTarget.value)}
-                          placeholder="Enter a new password"
-                        />
-                      )}
-                      <Button
-                        variant="light"
-                        size="xs"
-                        disabled={authMode === "forgot" && !passwordResetEnabled}
-                        onClick={submitEmailAuth}
-                      >
-                        {authMode === "register"
-                          ? "Create account"
-                          : authMode === "forgot"
-                            ? (passwordResetToken ? "Set new password" : "Send reset email")
-                            : "Sign in"}
-                      </Button>
-                      {authMode === "forgot" && !passwordResetEnabled && (
-                        <Text size="xs" c="dimmed">Password reset requires SMTP settings from an admin.</Text>
-                      )}
-                      {googleClientId && <div id="google-signin-button" />}
-                      {authMessage && <Text size="xs" c="dimmed">{authMessage}</Text>}
-                    </>
-                  )}
-                </Stack>
-              </Card>
+              {sessionUser ? (
+                <Card withBorder radius="md" p="sm">
+                  <Text fw={600}>Playing as: {sessionUser.displayName || sessionUser.email || "Player"}</Text>
+                </Card>
+              ) : (
+                <TextInput
+                  label="Guest nickname"
+                  value={settings.playerName}
+                  onChange={(e) => setSettings({ ...settings, playerName: e.target.value })}
+                  placeholder="Guest"
+                />
+              )}
               <Stack gap="xs">
                 <Text fw={600}>Mode</Text>
                 <SegmentedControl
@@ -2567,6 +2800,8 @@ function App() {
           hasUnsavedSettings={hasUnsavedSettings}
           lastSettingsAppliedAt={lastSettingsAppliedAt}
           publicVersion={publicVersion}
+          sessionUser={sessionUser}
+          selectedLanguage={settings.language}
           onReloadPacks={loadPacks}
           onReset={async (scope) => {
             try {
@@ -2750,21 +2985,42 @@ function SettingsSection({
   );
 }
 
+const SETTINGS_HELP: Record<string, string> = {
+  "Max level (up to)": "Higher levels introduce longer strings and faster complexity. Start lower for young learners.",
+  "Visibility Guard": "Automatically adjusts risky color combinations for readability. AAA is the safest default.",
+  "Language": "Only published language packs are available for selection at start.",
+  "OpenAI API key": "Used only for pack generation and stored encrypted on the server.",
+  "SMTP enabled": "Email features stay disabled until SMTP credentials are valid and tested.",
+  "Google auth enabled": "Google sign-in can only be enabled after a valid OAuth client is configured.",
+  "Postgres connection string": "Optional shortcut for Postgres connectivity. If set, host/user fields are ignored.",
+  "Debug layout overlay": "Shows fit diagnostics while playing to speed up UI troubleshooting."
+};
+
 function SettingRow({
   label,
   helper,
+  hint,
   children,
   full
 }: {
   label: string;
   helper?: string;
+  hint?: string;
   children: React.ReactNode;
   full?: boolean;
 }) {
+  const resolvedHint = hint || SETTINGS_HELP[label];
   return (
     <div className={`setting-row${full ? " full" : ""}`}>
       <div className="setting-label">
-        <Text fw={600}>{label}</Text>
+        <Group gap={6} align="center">
+          <Text fw={600}>{label}</Text>
+          {resolvedHint && (
+            <Tooltip label={resolvedHint} withArrow>
+              <button type="button" className="setting-help" aria-label={`Help for ${label}`}>i</button>
+            </Tooltip>
+          )}
+        </Group>
         {helper && <Text size="sm" c="dimmed">{helper}</Text>}
       </div>
       <div className="setting-control">
@@ -2836,7 +3092,9 @@ function SettingsScreen({
   onResetSettingsDraft,
   hasUnsavedSettings,
   lastSettingsAppliedAt,
-  publicVersion
+  publicVersion,
+  sessionUser,
+  selectedLanguage
 }: {
   isAdmin: boolean;
   appSettings: AppSettings;
@@ -2862,6 +3120,8 @@ function SettingsScreen({
   hasUnsavedSettings: boolean;
   lastSettingsAppliedAt: string;
   publicVersion: PublicVersion | null;
+  sessionUser: any;
+  selectedLanguage: string;
 }) {
   const [openaiKey, setOpenaiKey] = useState("");
   const [storeKey, setStoreKey] = useState(false);
@@ -2898,6 +3158,7 @@ function SettingsScreen({
   });
   const [emailTestTo, setEmailTestTo] = useState("");
   const [emailMessage, setEmailMessage] = useState("");
+  const [savedEmailSettings, setSavedEmailSettings] = useState<any | null>(null);
   const [googleSettings, setGoogleSettings] = useState({
     enabled: false,
     clientId: "",
@@ -2905,6 +3166,8 @@ function SettingsScreen({
     hasClientSecret: false
   });
   const [googleMessage, setGoogleMessage] = useState("");
+  const [savedGoogleSettings, setSavedGoogleSettings] = useState<any | null>(null);
+  const [savedDbConfig, setSavedDbConfig] = useState<DbAdminConfig | null>(null);
   const [pinStatus, setPinStatus] = useState<{ pinIsDefault: boolean; source: string } | null>(null);
   const [newAdminPin, setNewAdminPin] = useState("");
   const [confirmAdminPin, setConfirmAdminPin] = useState("");
@@ -2918,6 +3181,49 @@ function SettingsScreen({
   const [languagePackModalOpen, setLanguagePackModalOpen] = useState(false);
   const [configStatus, setConfigStatus] = useState<ConfigStatus | null>(null);
   const [configStatusMessage, setConfigStatusMessage] = useState("");
+  const [openaiConfigured, setOpenaiConfigured] = useState(false);
+  const [openaiDirty, setOpenaiDirty] = useState(false);
+  const [profileDisplayName, setProfileDisplayName] = useState("");
+  const [profileNameStatus, setProfileNameStatus] = useState("");
+  const [profileNameAvailable, setProfileNameAvailable] = useState(true);
+  const [profileCurrentPassword, setProfileCurrentPassword] = useState("");
+  const [profileNewPassword, setProfileNewPassword] = useState("");
+  const [profileConfirmPassword, setProfileConfirmPassword] = useState("");
+  const [profileMessage, setProfileMessage] = useState("");
+  const normalizeEmailDraft = (value: any) => ({
+    enabled: Boolean(value?.enabled),
+    host: String(value?.host || ""),
+    port: Number(value?.port || 587),
+    secure: Boolean(value?.secure),
+    username: String(value?.username || ""),
+    fromAddress: String(value?.fromAddress || ""),
+    fromName: String(value?.fromName || "KTrain"),
+    hasPassword: Boolean(value?.hasPassword)
+  });
+  const normalizeGoogleDraft = (value: any) => ({
+    enabled: Boolean(value?.enabled),
+    clientId: String(value?.clientId || ""),
+    hasClientSecret: Boolean(value?.hasClientSecret)
+  });
+  const emailDirty = Boolean(
+    savedEmailSettings
+      && (
+        JSON.stringify(normalizeEmailDraft(emailSettings)) !== JSON.stringify(normalizeEmailDraft(savedEmailSettings))
+        || Boolean(String(emailSettings.password || "").trim())
+      )
+  );
+  const googleDirty = Boolean(
+    savedGoogleSettings
+      && (
+        JSON.stringify(normalizeGoogleDraft(googleSettings)) !== JSON.stringify(normalizeGoogleDraft(savedGoogleSettings))
+        || Boolean(String(googleSettings.clientSecret || "").trim())
+      )
+  );
+  const dbDirty = Boolean(savedDbConfig && JSON.stringify(dbConfig) !== JSON.stringify(savedDbConfig));
+  const hasAnyUnsaved = hasUnsavedSettings || openaiDirty || emailDirty || googleDirty || dbDirty;
+  const openaiGenerationReady = isAdmin && openaiConfigured && !openaiDirty;
+  const smtpToggleLocked = Boolean(configStatus && configStatus.optional.smtp !== "READY");
+  const googleToggleLocked = Boolean(configStatus && configStatus.optional.googleAuth !== "READY");
   const themePreview = applyVisibilityGuard(computeTheme(appSettings), appSettings.visibilityGuard).theme;
 
   const refreshConfigStatus = async () => {
@@ -2932,6 +3238,74 @@ function SettingsScreen({
     } catch (err: any) {
       setConfigStatusMessage(err?.message || "Failed to load config status.");
     }
+  };
+
+  const applyAllSettings = async () => {
+    let ok = true;
+    if (hasUnsavedSettings) {
+      ok = await onApplySettings();
+    }
+    if (!ok) return false;
+    if (isAdmin && adminPin && dbDirty) {
+      try {
+        await API.saveDbConfig(adminPin, dbConfig, true);
+        setSavedDbConfig(dbConfig);
+        setDbMessage("DB config saved and verified.");
+      } catch (err: any) {
+        setDbMessage(err?.message || "Failed to save DB config");
+        return false;
+      }
+    }
+    if (isAdmin && adminPin && emailDirty) {
+      try {
+        await API.saveEmailSettings(emailSettings);
+        const nextEmail = {
+          ...emailSettings,
+          password: "",
+          hasPassword: emailSettings.hasPassword || Boolean(String(emailSettings.password || "").trim())
+        };
+        setEmailSettings(nextEmail);
+        setSavedEmailSettings(nextEmail);
+        setEmailMessage("Email settings saved.");
+      } catch (err: any) {
+        setEmailMessage(err?.message || "Failed to save email settings.");
+        return false;
+      }
+    }
+    if (isAdmin && adminPin && googleDirty) {
+      try {
+        await API.saveGoogleAuthSettings({
+          enabled: Boolean(googleSettings.enabled),
+          clientId: String(googleSettings.clientId || "").trim(),
+          clientSecret: String(googleSettings.clientSecret || "").trim() || undefined
+        });
+        const nextGoogle = {
+          ...googleSettings,
+          clientId: String(googleSettings.clientId || "").trim(),
+          clientSecret: "",
+          hasClientSecret: googleSettings.hasClientSecret || Boolean(String(googleSettings.clientSecret || "").trim())
+        };
+        setGoogleSettings(nextGoogle);
+        setSavedGoogleSettings(nextGoogle);
+        setGoogleMessage("Google auth settings saved.");
+      } catch (err: any) {
+        setGoogleMessage(err?.message || "Failed to save Google auth settings.");
+        return false;
+      }
+    }
+    if (openaiDirty) {
+      try {
+        await API.saveOwnOpenAIKey(openaiKey.trim());
+        setOpenaiConfigured(true);
+        setOpenaiDirty(false);
+        setOpenaiStatus("OpenAI key saved.");
+      } catch (err: any) {
+        setOpenaiStatus(err?.message || "Failed to save OpenAI key.");
+        return false;
+      }
+    }
+    await refreshConfigStatus();
+    return true;
   };
 
   const refreshDb = async () => {
@@ -2949,11 +3323,16 @@ function SettingsScreen({
       API.getServiceSettings().then((service) => {
         const email = service?.settings?.email || {};
         const google = service?.settings?.auth?.google || {};
-        setEmailSettings((prev) => ({ ...prev, ...email, password: "" }));
-        setGoogleSettings((prev) => ({ ...prev, ...google, clientSecret: "" }));
+        const nextEmail = { ...emailSettings, ...email, password: "" };
+        const nextGoogle = { ...googleSettings, ...google, clientSecret: "" };
+        setEmailSettings(nextEmail);
+        setSavedEmailSettings(nextEmail);
+        setGoogleSettings(nextGoogle);
+        setSavedGoogleSettings(nextGoogle);
       }).catch(() => null);
       setDbStatus(status);
       setDbConfig(configRes.dbConfig);
+      setSavedDbConfig(configRes.dbConfig);
       setDbMessage(`DB status loaded. Active: ${status.activeDriver}`);
       await refreshConfigStatus();
     } catch (err: any) {
@@ -3046,6 +3425,7 @@ function SettingsScreen({
     setDbMessage("");
     try {
       await API.saveDbConfig(adminPin, dbConfig, true);
+      setSavedDbConfig(dbConfig);
       setDbMessage("DB config saved and verified.");
       await refreshDb();
     } catch (err: any) {
@@ -3115,6 +3495,9 @@ function SettingsScreen({
     }
     try {
       await API.saveEmailSettings(emailSettings);
+      const nextEmail = { ...emailSettings, password: "", hasPassword: emailSettings.hasPassword || Boolean(String(emailSettings.password || "").trim()) };
+      setEmailSettings(nextEmail);
+      setSavedEmailSettings(nextEmail);
       setEmailMessage("Email settings saved.");
       await refreshConfigStatus();
     } catch (err: any) {
@@ -3148,7 +3531,14 @@ function SettingsScreen({
         clientSecret: String(googleSettings.clientSecret || "").trim() || undefined
       });
       setGoogleMessage("Google auth settings saved.");
-      setGoogleSettings((prev) => ({ ...prev, clientSecret: "" }));
+      const nextGoogle = {
+        ...googleSettings,
+        clientId: String(googleSettings.clientId || "").trim(),
+        clientSecret: "",
+        hasClientSecret: googleSettings.hasClientSecret || Boolean(String(googleSettings.clientSecret || "").trim())
+      };
+      setGoogleSettings(nextGoogle);
+      setSavedGoogleSettings(nextGoogle);
       await refreshConfigStatus();
     } catch (err: any) {
       setGoogleMessage(err?.message || "Failed to save Google auth settings.");
@@ -3160,7 +3550,80 @@ function SettingsScreen({
     refreshPinStatus().catch(() => null);
     refreshCrashes().catch(() => null);
     refreshConfigStatus().catch(() => null);
+    API.getServiceSettings()
+      .then((service) => {
+        const email = service?.settings?.email || {};
+        const google = service?.settings?.auth?.google || {};
+        const nextEmail = { ...emailSettings, ...email, password: "" };
+        const nextGoogle = { ...googleSettings, ...google, clientSecret: "" };
+        setEmailSettings(nextEmail);
+        setSavedEmailSettings(nextEmail);
+        setGoogleSettings(nextGoogle);
+        setSavedGoogleSettings(nextGoogle);
+      })
+      .catch(() => null);
+    API.getDbConfig(adminPin)
+      .then((configRes) => {
+        setDbConfig(configRes.dbConfig);
+        setSavedDbConfig(configRes.dbConfig);
+      })
+      .catch(() => null);
+    API.getOwnOpenAIKeyStatus()
+      .then((data) => {
+        setOpenaiConfigured(Boolean(data?.configured));
+        setOpenaiDirty(false);
+      })
+      .catch(() => {
+        setOpenaiConfigured(false);
+      });
   }, [adminPin]);
+
+  useEffect(() => {
+    if (!sessionUser) {
+      setProfileDisplayName("");
+      return;
+    }
+    API.getUserProfile()
+      .then((data) => {
+        const display = String(data?.profile?.displayName || sessionUser.displayName || "");
+        setProfileDisplayName(display);
+        setProfileNameAvailable(true);
+        setProfileNameStatus("");
+      })
+      .catch(() => null);
+  }, [sessionUser]);
+
+  useEffect(() => {
+    if (!sessionUser) return;
+    const trimmed = profileDisplayName.trim();
+    if (!trimmed) {
+      setProfileNameAvailable(false);
+      setProfileNameStatus("Display name is required.");
+      return;
+    }
+    const id = window.setTimeout(() => {
+      API.checkDisplayNameAvailability(trimmed)
+        .then((data) => {
+          const available = Boolean(data?.available);
+          setProfileNameAvailable(available);
+          setProfileNameStatus(available ? "Display name is available." : "Display name is already taken.");
+        })
+        .catch(() => {
+          setProfileNameAvailable(true);
+          setProfileNameStatus("");
+        });
+    }, 350);
+    return () => window.clearTimeout(id);
+  }, [profileDisplayName, sessionUser]);
+
+  useEffect(() => {
+    if (configStatus?.optional?.smtp && configStatus.optional.smtp !== "READY") {
+      setEmailSettings((prev) => ({ ...prev, enabled: false }));
+    }
+    if (configStatus?.optional?.googleAuth && configStatus.optional.googleAuth !== "READY") {
+      setGoogleSettings((prev) => ({ ...prev, enabled: false }));
+    }
+  }, [configStatus]);
 
   const updateSettings = (patch: Partial<AppSettings>) => {
     setAppSettings((prev) => ({
@@ -3207,6 +3670,7 @@ function SettingsScreen({
           <div className="nav-title">Settings</div>
           {[
             { id: "start", label: "Start & Player" },
+            { id: "account", label: "Account" },
             { id: "child-text", label: "Child & Text" },
             { id: "theme", label: "Theme & Visibility" },
             { id: "effects", label: "Effects" },
@@ -3244,8 +3708,30 @@ function SettingsScreen({
                 : "Changes apply immediately for authorized admin accounts."}
             </Text>
             <Group>
-              <Button variant="light" disabled={!hasUnsavedSettings} onClick={onResetSettingsDraft}>Reset</Button>
-              <Button disabled={!hasUnsavedSettings || !adminPin} onClick={() => void onApplySettings()}>Apply</Button>
+              <Button
+                variant="light"
+                disabled={!hasAnyUnsaved}
+                onClick={() => {
+                  onResetSettingsDraft();
+                  setOpenaiKey("");
+                  setOpenaiDirty(false);
+                  if (savedEmailSettings) {
+                    setEmailSettings({ ...savedEmailSettings, password: "" });
+                    setEmailMessage("Unsaved email changes discarded.");
+                  }
+                  if (savedGoogleSettings) {
+                    setGoogleSettings({ ...savedGoogleSettings, clientSecret: "" });
+                    setGoogleMessage("Unsaved Google changes discarded.");
+                  }
+                  if (savedDbConfig) {
+                    setDbConfig(savedDbConfig);
+                    setDbMessage("Unsaved DB config changes discarded.");
+                  }
+                }}
+              >
+                Reset
+              </Button>
+              <Button disabled={!hasAnyUnsaved || !adminPin} onClick={() => void applyAllSettings()}>Apply</Button>
               {isAdmin && <Button variant="light" onClick={() => refreshConfigStatus().catch(() => null)}>Refresh status</Button>}
               <Text size="xs" c="dimmed">
                 {lastSettingsAppliedAt ? `Last applied: ${new Date(lastSettingsAppliedAt).toLocaleString()}` : "Not applied yet"}
@@ -3285,6 +3771,77 @@ function SettingsScreen({
             <Group>
               <Button variant="light" onClick={onBack}>Open Main Menu</Button>
             </Group>
+          </SettingsSection>
+
+          <SettingsSection
+            id="account"
+            title="Account"
+            description="Manage your profile name and password."
+          >
+            {sessionUser ? (
+              <>
+                <SettingRow label="Display name" helper="Shown on leaderboard and in active session badges.">
+                  <TextInput value={profileDisplayName} onChange={(e) => setProfileDisplayName(e.currentTarget.value)} />
+                </SettingRow>
+                {profileNameStatus && (
+                  <div className="setting-row full">
+                    <Alert color={profileNameAvailable ? "green" : "yellow"}>{profileNameStatus}</Alert>
+                  </div>
+                )}
+                <SettingRow label="Profile actions" helper="Save your current display name.">
+                  <Button
+                    variant="light"
+                    disabled={!profileDisplayName.trim() || !profileNameAvailable}
+                    onClick={async () => {
+                      try {
+                        await API.updateUserProfile({ displayName: profileDisplayName.trim() });
+                        setProfileMessage("Profile updated.");
+                      } catch (err: any) {
+                        setProfileMessage(err?.message || "Failed to update profile.");
+                      }
+                    }}
+                  >
+                    Save profile
+                  </Button>
+                </SettingRow>
+                <Divider my="sm" />
+                <SettingRow label="Current password" helper="Required to change your password.">
+                  <TextInput type="password" value={profileCurrentPassword} onChange={(e) => setProfileCurrentPassword(e.currentTarget.value)} />
+                </SettingRow>
+                <SettingRow label="New password" helper="10-128 characters with at least one letter and one number.">
+                  <TextInput type="password" value={profileNewPassword} onChange={(e) => setProfileNewPassword(e.currentTarget.value)} />
+                </SettingRow>
+                <SettingRow label="Confirm new password">
+                  <TextInput type="password" value={profileConfirmPassword} onChange={(e) => setProfileConfirmPassword(e.currentTarget.value)} />
+                </SettingRow>
+                <SettingRow label="Password actions">
+                  <Button
+                    variant="light"
+                    disabled={!profileCurrentPassword || !profileNewPassword || profileNewPassword !== profileConfirmPassword}
+                    onClick={async () => {
+                      try {
+                        await API.changePassword({ currentPassword: profileCurrentPassword, newPassword: profileNewPassword });
+                        setProfileCurrentPassword("");
+                        setProfileNewPassword("");
+                        setProfileConfirmPassword("");
+                        setProfileMessage("Password updated.");
+                      } catch (err: any) {
+                        setProfileMessage(err?.message || "Failed to update password.");
+                      }
+                    }}
+                  >
+                    Change password
+                  </Button>
+                </SettingRow>
+                {profileMessage && (
+                  <div className="setting-row full">
+                    <Alert color="blue">{profileMessage}</Alert>
+                  </div>
+                )}
+              </>
+            ) : (
+              <Alert color="yellow">Sign in to manage your account profile.</Alert>
+            )}
           </SettingsSection>
 
           <SettingsSection
@@ -3744,18 +4301,20 @@ function SettingsScreen({
                         onChange={(value) => setGenerateCount(Number(value) || 10)}
                       />
                       <Button
-                        disabled={Boolean(configStatus && configStatus.optional.openai !== "READY")}
+                        disabled={!openaiGenerationReady}
                         onClick={async () => {
-                          await onGenerate({ topic: generateName, count: generateCount, type: generateType, language: settings.language });
+                          await onGenerate({ topic: generateName, count: generateCount, type: generateType, language: selectedLanguage });
                           onReloadPacks();
                         }}
                       >
                         Generate Draft
                       </Button>
                     </Group>
-                    {configStatus && configStatus.optional.openai !== "READY" && (
+                    {!openaiGenerationReady && (
                       <Alert color="yellow" title="OpenAI generation unavailable">
-                        Configure and validate OpenAI settings to enable generation. Built-in EN/RU packs remain available.
+                        {openaiDirty
+                          ? "Apply settings to enable generation."
+                          : "Configure your OpenAI key to enable generation. Built-in EN/RU packs remain available."}
                       </Alert>
                     )}
 
@@ -3873,6 +4432,9 @@ function SettingsScreen({
                 >
                   Contact
                 </Button>
+                <Button variant="light" component="a" href="/about">
+                  Public About
+                </Button>
               </Group>
             </SettingRow>
           </SettingsSection>
@@ -3899,7 +4461,12 @@ function SettingsScreen({
             </SettingRow>
             <Divider my="sm" />
             <SettingRow label="SMTP enabled" helper="Optional service. Disable to keep app running without email.">
-              <Switch checked={Boolean(emailSettings.enabled)} onChange={(e) => setEmailSettings({ ...emailSettings, enabled: e.currentTarget.checked })} />
+              <Switch
+                checked={Boolean(emailSettings.enabled)}
+                disabled={smtpToggleLocked}
+                onChange={(e) => setEmailSettings({ ...emailSettings, enabled: e.currentTarget.checked })}
+              />
+              {smtpToggleLocked && <Text size="xs" c="dimmed">Add working configuration to enable this feature.</Text>}
             </SettingRow>
             <SettingRow label="SMTP host" helper="Used for password reset emails and notifications.">
               <TextInput value={emailSettings.host} onChange={(e) => setEmailSettings({ ...emailSettings, host: e.currentTarget.value })} placeholder="smtp.example.com" />
@@ -3935,7 +4502,12 @@ function SettingsScreen({
             )}
             <Divider my="sm" />
             <SettingRow label="Google auth enabled" helper="Optional login method for end users.">
-              <Switch checked={Boolean(googleSettings.enabled)} onChange={(e) => setGoogleSettings({ ...googleSettings, enabled: e.currentTarget.checked })} />
+              <Switch
+                checked={Boolean(googleSettings.enabled)}
+                disabled={googleToggleLocked}
+                onChange={(e) => setGoogleSettings({ ...googleSettings, enabled: e.currentTarget.checked })}
+              />
+              {googleToggleLocked && <Text size="xs" c="dimmed">Add working configuration to enable this feature.</Text>}
             </SettingRow>
             <SettingRow label="Google client ID" helper="OAuth client ID for browser sign-in.">
               <TextInput value={googleSettings.clientId} onChange={(e) => setGoogleSettings({ ...googleSettings, clientId: e.currentTarget.value })} />
@@ -4127,7 +4699,14 @@ function SettingsScreen({
             )}
             <Divider my="sm" />
             <SettingRow label="OpenAI API key" helper="Server-side only.">
-              <TextInput value={openaiKey} onChange={(e) => setOpenaiKey(e.currentTarget.value)} placeholder="sk-..." />
+              <TextInput
+                value={openaiKey}
+                onChange={(e) => {
+                  setOpenaiKey(e.currentTarget.value);
+                  setOpenaiDirty(Boolean(e.currentTarget.value.trim()));
+                }}
+                placeholder={openaiConfigured ? "Configured (enter new key to rotate)" : "sk-..."}
+              />
             </SettingRow>
             <SettingRow label="Store key in database" helper="Insecure. Use only on trusted devices.">
               <Switch
@@ -4151,6 +4730,11 @@ function SettingsScreen({
                 Test key
               </Button>
             </SettingRow>
+            {openaiDirty && (
+              <div className="setting-row full">
+                <Alert color="blue">OpenAI key changed. Apply settings to save it.</Alert>
+              </div>
+            )}
             {openaiStatus && <div className="status">{openaiStatus}</div>}
             <Divider my="sm" />
             <SettingRow label="Reset data" helper="Resets are permanent.">
