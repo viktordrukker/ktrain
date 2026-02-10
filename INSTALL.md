@@ -7,26 +7,41 @@ docker compose up --build -d
 ./scripts/bootstrap.sh
 ```
 
-## Iteration 2 Required Env
-- `OWNER_EMAIL`
+## Bootstrap Runtime Env (Minimal)
+Required:
 - `KTRAIN_MASTER_KEY` (32-byte hex/base64)
-- `APP_BASE_URL` (used for password reset links)
-- `APP_MODE` (`info`|`debug`|`advanced-debug`)
-- `AUTH_TRUST_PROXY=true`
-- `AUTH_TRUSTED_PROXY_IPS=<reverse-proxy-ip-list>`
+- `KTRAIN_BOOTSTRAP_DB` (sqlite path or postgres connection string for first boot / fallback)
 
-Optional auth:
-- `GOOGLE_CLIENT_ID` (enables Google sign-in)
+Optional:
+- `NODE_ENV` / `APP_ENV`
+
+All operational settings are DB-backed after bootstrap and should be changed from Settings/Admin.
+
+## Setup Mode Lifecycle
+- On startup, server computes `ConfigStatus` from DB-backed config.
+- If required checks fail (`database`, `adminUser`), app enters `SETUP_REQUIRED` mode.
+- In setup mode:
+  - `/readyz` returns `503`
+  - `/setup` and `/api/setup/*` are available
+  - normal app routes are gated
+- Once required checks pass, setup mode exits automatically without redeploy.
+
+Public status probe:
+```bash
+curl -fsS http://127.0.0.1:3000/api/public/config/status
+```
 
 ## Email (Password Reset) Setup
 Configure SMTP from Admin Service Settings in app UI:
+- enabled
 - host, port, username, password
 - from address and from name
 
 Notes:
 - SMTP password is encrypted at rest.
 - Test email endpoint is admin-only.
-- Password reset email flow is disabled until SMTP is configured.
+- Password reset email flow is feature-gated until SMTP is valid.
+- SMTP failure causes `DEGRADED` mode (not `SETUP_REQUIRED`).
 
 ## Language Packs
 - Default EN + RU published packs are auto-seeded on first run and re-seeded if missing.
@@ -37,6 +52,7 @@ Notes:
 ```bash
 ./scripts/healthcheck.sh
 curl -fsS http://127.0.0.1:3000/api/health
+./scripts/self_check_setup.sh
 ```
 Admin diagnostics:
 - `/api/diagnostics/rbac`
@@ -62,3 +78,13 @@ Admin diagnostics:
 ./scripts/db_migrate.sh
 ./scripts/migrate_status.sh
 ```
+
+## Troubleshooting
+- DB unreachable:
+  - `/readyz` fails and startup may enter recovery mode.
+  - check `KTRAIN_BOOTSTRAP_DB` and runtime DB config.
+- Setup required:
+  - `/api/public/config/status` returns `setupRequired=true`.
+  - open `/setup` and complete required steps.
+- Degraded mode:
+  - app runs, but optional features (SMTP/Google/OpenAI) are disabled until remediated in Settings/Admin.

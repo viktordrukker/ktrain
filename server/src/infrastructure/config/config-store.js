@@ -5,7 +5,9 @@ const SAFE_CONFIG_KEYS = new Set([
   "app.features",
   "app.runtime",
   "app.about",
+  "app.config_version",
   "app.wizard",
+  "service.email.status",
   "contest.rules",
   "generator.defaults",
   "theme.defaults",
@@ -57,6 +59,9 @@ class ConfigStore {
     this.assertScope(scope);
     await this.repo.setConfig(key, scope, scopeId, value, updatedBy);
     this.invalidate(key, scope, scopeId);
+    if (!(key === "app.config_version" && scope === "global" && scopeId === "global")) {
+      await this.bumpVersion(updatedBy);
+    }
     return { key, scope, scopeId, value };
   }
 
@@ -79,6 +84,28 @@ class ConfigStore {
       await this.repo.setConfig(row.key, row.scope || "global", row.scopeId || "global", row.valueJson, updatedBy);
       this.invalidate(row.key, row.scope || "global", row.scopeId || "global");
     }
+    await this.bumpVersion(updatedBy);
+  }
+
+  async getVersion() {
+    const row = await this.get("app.config_version", {
+      scope: "global",
+      scopeId: "global",
+      fallback: { version: 1, updatedAt: null }
+    });
+    const version = Number(row?.version || 1);
+    return Number.isFinite(version) && version > 0 ? version : 1;
+  }
+
+  async bumpVersion(updatedBy = "system") {
+    const current = await this.getVersion();
+    const next = current + 1;
+    await this.repo.setConfig("app.config_version", "global", "global", {
+      version: next,
+      updatedAt: new Date().toISOString()
+    }, updatedBy);
+    this.invalidate("app.config_version", "global", "global");
+    return next;
   }
 
   invalidate(key, scope, scopeId) {

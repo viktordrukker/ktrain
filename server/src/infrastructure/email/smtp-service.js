@@ -12,6 +12,7 @@ class SmtpService {
       scope: "global",
       scopeId: "global",
       fallback: {
+        enabled: false,
         host: "",
         port: 587,
         secure: false,
@@ -33,6 +34,7 @@ class SmtpService {
 
   async saveEmailSettings(input, updatedBy) {
     const safe = {
+      enabled: Boolean(input.enabled),
       host: String(input.host || "").trim(),
       port: Number(input.port || 587),
       secure: Boolean(input.secure),
@@ -56,6 +58,9 @@ class SmtpService {
 
   async send({ to, subject, text, html }) {
     const settings = await this.getEmailSettings();
+    if (!settings.enabled) {
+      throw new Error("Email service is disabled");
+    }
     if (!settings.host || !settings.username || !settings.password || !settings.fromAddress) {
       throw new Error("Email settings are incomplete");
     }
@@ -75,6 +80,42 @@ class SmtpService {
       text,
       html
     });
+  }
+
+  async testSettings(input = {}, testRecipient = null) {
+    const current = await this.getEmailSettings();
+    const merged = {
+      ...current,
+      ...input,
+      enabled: Boolean(input.enabled ?? current.enabled),
+      password: String(input.password || current.password || "")
+    };
+    if (!merged.enabled) {
+      throw new Error("Email service is disabled");
+    }
+    if (!merged.host || !merged.username || !merged.password || !merged.fromAddress) {
+      throw new Error("Email settings are incomplete");
+    }
+    const transporter = nodemailer.createTransport({
+      host: merged.host,
+      port: Number(merged.port || 587),
+      secure: Boolean(merged.secure),
+      auth: {
+        user: merged.username,
+        pass: merged.password
+      }
+    });
+    await transporter.verify();
+    if (testRecipient) {
+      await transporter.sendMail({
+        from: merged.fromName ? `\"${merged.fromName}\" <${merged.fromAddress}>` : merged.fromAddress,
+        to: testRecipient,
+        subject: "KTrain SMTP test",
+        text: "SMTP test message from KTrain admin settings.",
+        html: "<p>SMTP test message from KTrain admin settings.</p>"
+      });
+    }
+    return { ok: true };
   }
 }
 
