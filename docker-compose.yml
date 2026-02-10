@@ -1,7 +1,7 @@
 services:
   ktrain:
     build: .
-    image: ghcr.io/viktordrukker/ktrain:latest
+    image: ${IMAGE:-ghcr.io/viktordrukker/ktrain:latest}
     container_name: ktrain
     expose:
       - "3000"

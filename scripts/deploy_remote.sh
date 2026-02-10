@@ -23,11 +23,12 @@ fi
 
 echo "Pulling image: $IMAGE"
 if ! docker pull "$IMAGE"; then
-  echo "Image pull failed, falling back to server-side build."
+  echo "Image pull failed; deploy will attempt using locally cached image."
 fi
 
 echo "Starting services"
-docker compose up -d --build ktrain
+# WHY: Deploys must roll forward to the exact pushed image tag; avoid local rebuild drift.
+IMAGE="$IMAGE" docker compose up -d --force-recreate --no-build ktrain
 
 echo "Ensuring ktrain is attached to caddy_net"
 KTRAIN_IN_CADDY_NET="$(docker inspect -f '{{json .NetworkSettings.Networks.caddy_net}}' ktrain 2>/dev/null || true)"
