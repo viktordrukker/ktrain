@@ -410,6 +410,20 @@ function withAuthHeaders(base: Record<string, string> = {}) {
   return base;
 }
 
+async function parseApiError(res: Response, fallback: string) {
+  try {
+    const data = await res.json();
+    return String(data?.error || data?.message || fallback);
+  } catch {
+    try {
+      const text = await res.text();
+      return text ? String(text) : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+}
+
 const API = {
   async generateTasks(level: number, count: number, contentMode: ContentMode, language = "en"): Promise<{ tasks: Task[]; language: string; fallbackNotice?: string | null }> {
     const res = await fetch("/api/tasks/generate", {
@@ -475,7 +489,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Failed to create setup admin");
+    if (!res.ok) throw new Error(await parseApiError(res, "Failed to create setup admin"));
     return res.json();
   },
   async getSetupDbStatus() {
@@ -2128,7 +2142,13 @@ function App() {
                 <Text fw={600} size="sm">Create initial admin user</Text>
                 <TextInput label="Admin email" value={setupAdminEmail} onChange={(e) => setSetupAdminEmail(e.currentTarget.value)} />
                 <TextInput label="Display name" value={setupAdminName} onChange={(e) => setSetupAdminName(e.currentTarget.value)} />
-                <TextInput label="Password" type="password" value={setupAdminPassword} onChange={(e) => setSetupAdminPassword(e.currentTarget.value)} />
+                <TextInput
+                  label="Password"
+                  description="10-128 chars, include at least one letter and one number."
+                  type="password"
+                  value={setupAdminPassword}
+                  onChange={(e) => setSetupAdminPassword(e.currentTarget.value)}
+                />
                 <Button
                   onClick={async () => {
                     try {
