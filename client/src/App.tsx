@@ -1133,7 +1133,6 @@ function App() {
   const [playSessionId, setPlaySessionId] = useState<string>("");
   const [googleClientId, setGoogleClientId] = useState("");
   const [passwordResetEnabled, setPasswordResetEnabled] = useState(false);
-  const [languagePackModalOpen, setLanguagePackModalOpen] = useState(false);
   const [myRank, setMyRank] = useState<number | null>(null);
   const [appMode, setAppMode] = useState<string>("info");
   const [publicVersion, setPublicVersion] = useState<PublicVersion | null>(null);
@@ -1205,6 +1204,8 @@ function App() {
     () => JSON.stringify(appSettings) !== JSON.stringify(savedAppSettings),
     [appSettings, savedAppSettings]
   );
+  const isSetupRoute = window.location.pathname === "/setup";
+  const isSetupRequired = publicConfigOverall === "SETUP_REQUIRED";
   const themeVars = {
     "--bg": theme.background,
     "--bg-alt": theme.backgroundAlt,
@@ -1277,6 +1278,7 @@ function App() {
   };
 
   useEffect(() => {
+    if (isSetupRoute || isSetupRequired) return;
     API.getPublicSession()
       .then((session) => {
         setSessionUser(session.actor?.isAuthenticated ? session.actor : null);
@@ -1290,7 +1292,7 @@ function App() {
       setAuthMode("forgot");
       window.history.replaceState({}, "", window.location.pathname);
     }
-  }, []);
+  }, [isSetupRoute, isSetupRequired]);
 
   useEffect(() => {
     API.getPublicConfigStatus()
@@ -1305,6 +1307,7 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (isSetupRoute || isSetupRequired) return;
     API.getAuthProviders()
       .then((providers) => {
         const cid = providers?.google?.enabled ? providers.google.clientId || "" : "";
@@ -1315,7 +1318,7 @@ function App() {
         setGoogleClientId("");
         setPasswordResetEnabled(false);
       });
-  }, []);
+  }, [isSetupRoute, isSetupRequired]);
 
   const refreshSetupStatus = useCallback(async () => {
     try {
@@ -1343,12 +1346,14 @@ function App() {
   }, [refreshSetupStatus, sessionUser]);
 
   useEffect(() => {
+    if (isSetupRoute || isSetupRequired) return;
     API.getHealth()
       .then((health) => setAppMode(String(health?.appMode || "info")))
       .catch(() => setAppMode("info"));
-  }, []);
+  }, [isSetupRoute, isSetupRequired]);
 
   useEffect(() => {
+    if (isSetupRoute || isSetupRequired) return;
     API.getPublicVersion()
       .then((data) => setPublicVersion({
         version: String(data?.version || "0.0.0"),
@@ -1361,7 +1366,7 @@ function App() {
         appMode: data?.appMode
       }))
       .catch(() => setPublicVersion(null));
-  }, []);
+  }, [isSetupRoute, isSetupRequired]);
 
   useEffect(() => {
     if (isAdminUser) setAdminPin("rbac");
@@ -1970,6 +1975,10 @@ function App() {
   }, [screen]);
 
   useEffect(() => {
+    if (isSetupRoute || isSetupRequired) {
+      setAvailableLanguages(["en", "ru"]);
+      return;
+    }
     API.getAvailableLanguages(settings.level)
       .then((data) => {
         const langs = Array.isArray(data.languages) && data.languages.length > 0 ? data.languages : ["en", "ru"];
@@ -1979,9 +1988,10 @@ function App() {
         }
       })
       .catch(() => setAvailableLanguages(["en", "ru"]));
-  }, [settings.level]);
+  }, [settings.level, isSetupRoute, isSetupRequired]);
 
   useEffect(() => {
+    if (isSetupRoute || isSetupRequired) return;
     const poll = () => {
       API.getLiveStats()
         .then((data) => setLiveStats(data.stats || { total: 0, authorized: 0, guests: 0, modes: [] }))
@@ -1990,7 +2000,7 @@ function App() {
     poll();
     const id = window.setInterval(poll, 15000);
     return () => window.clearInterval(id);
-  }, []);
+  }, [isSetupRoute, isSetupRequired]);
 
   const path = window.location.pathname;
   const isTextFitDiagnostics = path === "/diagnostics/text-fit";
@@ -2905,6 +2915,7 @@ function SettingsScreen({
   const [selectedCrash, setSelectedCrash] = useState<CrashEvent | null>(null);
   const [crashBusy, setCrashBusy] = useState(false);
   const [crashMessage, setCrashMessage] = useState("");
+  const [languagePackModalOpen, setLanguagePackModalOpen] = useState(false);
   const [configStatus, setConfigStatus] = useState<ConfigStatus | null>(null);
   const [configStatusMessage, setConfigStatusMessage] = useState("");
   const themePreview = applyVisibilityGuard(computeTheme(appSettings), appSettings.visibilityGuard).theme;
