@@ -135,6 +135,18 @@ type ConfigStatus = {
   config_version: number;
 };
 
+type ClientErrorTrace = {
+  at: string;
+  action: string;
+  message: string;
+  status?: number;
+  code?: string;
+  requestId?: string;
+  url?: string;
+  stack?: string;
+  details?: any;
+};
+
 type Screen = "home" | "game" | "results" | "leaderboard" | "settings";
 
 type GameSettings = {
@@ -410,16 +422,39 @@ function withAuthHeaders(base: Record<string, string> = {}) {
   return base;
 }
 
+class ApiError extends Error {
+  status?: number;
+  code?: string;
+  requestId?: string;
+  url?: string;
+  details?: any;
+}
+
 async function parseApiError(res: Response, fallback: string) {
+  const requestId = res.headers.get("x-request-id") || undefined;
   try {
     const data = await res.json();
-    return String(data?.error || data?.message || fallback);
+    const err = new ApiError(String(data?.error || data?.message || fallback));
+    err.status = res.status;
+    err.code = data?.code;
+    err.requestId = data?.requestId || requestId;
+    err.url = res.url;
+    err.details = data;
+    return err;
   } catch {
     try {
       const text = await res.text();
-      return text ? String(text) : fallback;
+      const err = new ApiError(text ? String(text) : fallback);
+      err.status = res.status;
+      err.requestId = requestId;
+      err.url = res.url;
+      return err;
     } catch {
-      return fallback;
+      const err = new ApiError(fallback);
+      err.status = res.status;
+      err.requestId = requestId;
+      err.url = res.url;
+      return err;
     }
   }
 }
@@ -431,7 +466,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ level, count, contentMode, language })
     });
-    if (!res.ok) throw new Error("Failed to generate tasks");
+    if (!res.ok) throw await parseApiError(res, "Failed to generate tasks");
     return res.json();
   },
   async saveResult(payload: any) {
@@ -440,13 +475,13 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Failed to save result");
+    if (!res.ok) throw await parseApiError(res, "Failed to save result");
     return res.json();
   },
   async getLeaderboard(filters: any): Promise<{ entries: LeaderboardEntry[]; myRank: number | null }> {
     const params = new URLSearchParams(filters).toString();
     const res = await fetch(`/api/leaderboard?${params}`, { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load leaderboard");
+    if (!res.ok) throw await parseApiError(res, "Failed to load leaderboard");
     const data = await res.json();
     return {
       entries: data.entries as LeaderboardEntry[],
@@ -455,32 +490,32 @@ const API = {
   },
   async getPublicSession() {
     const res = await fetch("/api/public/session", { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load session");
+    if (!res.ok) throw await parseApiError(res, "Failed to load session");
     return res.json();
   },
   async getHealth() {
     const res = await fetch("/api/health");
-    if (!res.ok) throw new Error("Failed to load health");
+    if (!res.ok) throw await parseApiError(res, "Failed to load health");
     return res.json();
   },
   async getPublicVersion() {
     const res = await fetch("/api/public/version");
-    if (!res.ok) throw new Error("Failed to load public version");
+    if (!res.ok) throw await parseApiError(res, "Failed to load public version");
     return res.json();
   },
   async getSetupStatus() {
     const res = await fetch("/api/setup/status", { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load setup status");
+    if (!res.ok) throw await parseApiError(res, "Failed to load setup status");
     return res.json();
   },
   async getPublicConfigStatus() {
     const res = await fetch("/api/public/config/status", { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load public config status");
+    if (!res.ok) throw await parseApiError(res, "Failed to load public config status");
     return res.json();
   },
   async completeSetup() {
     const res = await fetch("/api/setup/complete", { method: "POST", headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to complete setup");
+    if (!res.ok) throw await parseApiError(res, "Failed to complete setup");
     return res.json();
   },
   async setupCreateAdmin(payload: { email: string; displayName: string; password: string }) {
@@ -489,22 +524,22 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error(await parseApiError(res, "Failed to create setup admin"));
+    if (!res.ok) throw await parseApiError(res, "Failed to create setup admin");
     return res.json();
   },
   async getSetupDbStatus() {
     const res = await fetch("/api/setup/db-status", { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load setup database status");
+    if (!res.ok) throw await parseApiError(res, "Failed to load setup database status");
     return res.json();
   },
   async bootstrapOwner() {
     const res = await fetch("/api/setup/bootstrap-owner", { method: "POST", headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to bootstrap owner");
+    if (!res.ok) throw await parseApiError(res, "Failed to bootstrap owner");
     return res.json();
   },
   async getAuthProviders() {
     const res = await fetch("/api/auth/providers");
-    if (!res.ok) throw new Error("Failed to load providers");
+    if (!res.ok) throw await parseApiError(res, "Failed to load providers");
     return res.json();
   },
   async authWithGoogle(credential: string) {
@@ -514,7 +549,7 @@ const API = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ credential })
     });
-    if (!res.ok) throw new Error("Google sign-in failed");
+    if (!res.ok) throw await parseApiError(res, "Google sign-in failed");
     return res.json();
   },
   async registerWithPassword(payload: { email: string; displayName: string; password: string }) {
@@ -524,7 +559,7 @@ const API = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Registration failed");
+    if (!res.ok) throw await parseApiError(res, "Registration failed");
     return res.json();
   },
   async loginWithPassword(payload: { email: string; password: string }) {
@@ -534,7 +569,7 @@ const API = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Invalid email or password");
+    if (!res.ok) throw await parseApiError(res, "Invalid email or password");
     return res.json();
   },
   async requestPasswordReset(email: string) {
@@ -544,7 +579,7 @@ const API = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email })
     });
-    if (!res.ok) throw new Error("Password reset request failed");
+    if (!res.ok) throw await parseApiError(res, "Password reset request failed");
     return res.json();
   },
   async confirmPasswordReset(payload: { token: string; password: string }) {
@@ -554,22 +589,22 @@ const API = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Password reset failed");
+    if (!res.ok) throw await parseApiError(res, "Password reset failed");
     return res.json();
   },
   async logout() {
     const res = await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin", headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Logout failed");
+    if (!res.ok) throw await parseApiError(res, "Logout failed");
     return res.json();
   },
   async getAvailableLanguages(level: number) {
     const res = await fetch(`/api/packs/languages?level=${level}`, { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load available languages");
+    if (!res.ok) throw await parseApiError(res, "Failed to load available languages");
     return res.json();
   },
   async getLiveStats() {
     const res = await fetch("/api/live/stats", { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load live stats");
+    if (!res.ok) throw await parseApiError(res, "Failed to load live stats");
     return res.json();
   },
   async heartbeat(sessionId: string, mode: Mode) {
@@ -578,7 +613,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ sessionId, mode })
     });
-    if (!res.ok) throw new Error("Heartbeat failed");
+    if (!res.ok) throw await parseApiError(res, "Heartbeat failed");
     return res.json();
   },
   async adminReset(scope: string, _pin?: string) {
@@ -587,19 +622,19 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ scope })
     });
-    if (!res.ok) throw new Error("Reset failed");
+    if (!res.ok) throw await parseApiError(res, "Reset failed");
   },
   async adminSeedDefaults(_pin?: string) {
     const res = await fetch("/api/admin/seed-defaults", {
       method: "POST",
       headers: withAuthHeaders({ "Content-Type": "application/json" })
     });
-    if (!res.ok) throw new Error("Seed failed");
+    if (!res.ok) throw await parseApiError(res, "Seed failed");
   },
   async getLanguagePacks(filters: any = {}) {
     const params = new URLSearchParams(filters).toString();
     const res = await fetch(`/api/admin/language-packs?${params}`, { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load language packs");
+    if (!res.ok) throw await parseApiError(res, "Failed to load language packs");
     return res.json();
   },
   async getVocabPacks(): Promise<VocabPack[]> {
@@ -632,7 +667,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Test failed");
+    if (!res.ok) throw await parseApiError(res, "Test failed");
     return res.json();
   },
   async updateLanguagePack(id: number, payload: any) {
@@ -641,7 +676,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Language pack update failed");
+    if (!res.ok) throw await parseApiError(res, "Language pack update failed");
     return res.json();
   },
   async generateLanguagePack(payload: any) {
@@ -650,12 +685,12 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Language pack generation failed");
+    if (!res.ok) throw await parseApiError(res, "Language pack generation failed");
     return res.json();
   },
   async exportLanguagePacks() {
     const res = await fetch("/api/admin/language-packs/export", { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Language pack export failed");
+    if (!res.ok) throw await parseApiError(res, "Language pack export failed");
     return res.json();
   },
   async importLanguagePacks(payload: any) {
@@ -664,17 +699,17 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Language pack import failed");
+    if (!res.ok) throw await parseApiError(res, "Language pack import failed");
     return res.json();
   },
   async getDbStatus(_pin?: string): Promise<DbAdminStatus> {
     const res = await fetch("/api/admin/db/status", { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load DB status");
+    if (!res.ok) throw await parseApiError(res, "Failed to load DB status");
     return res.json();
   },
   async getDbConfig(_pin?: string): Promise<{ dbConfig: DbAdminConfig; activeDriver: "sqlite" | "postgres" }> {
     const res = await fetch("/api/admin/db/config", { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load DB config");
+    if (!res.ok) throw await parseApiError(res, "Failed to load DB config");
     return res.json();
   },
   async saveDbConfig(_pinOrPayload: any, payloadOrVerify?: any, verify = true) {
@@ -685,7 +720,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ ...payload, verify: finalVerify })
     });
-    if (!res.ok) throw new Error("Failed to save DB config");
+    if (!res.ok) throw await parseApiError(res, "Failed to save DB config");
     return res.json();
   },
   async switchDb(pinOrTarget: any, maybeTarget?: "sqlite" | "postgres") {
@@ -695,7 +730,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ target, mode: "copy-then-switch", verify: true })
     });
-    if (!res.ok) throw new Error("DB switch failed");
+    if (!res.ok) throw await parseApiError(res, "DB switch failed");
     return res.json();
   },
   async rollbackDb(_pin?: string) {
@@ -703,7 +738,7 @@ const API = {
       method: "POST",
       headers: withAuthHeaders()
     });
-    if (!res.ok) throw new Error("DB rollback failed");
+    if (!res.ok) throw await parseApiError(res, "DB rollback failed");
     return res.json();
   },
   async testDbConnection(pinOrPayload: any, maybePayload?: { postgres: DbAdminConfig["postgres"] }) {
@@ -713,7 +748,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Postgres test connection failed");
+    if (!res.ok) throw await parseApiError(res, "Postgres test connection failed");
     return res.json();
   },
   async getAdminPinStatus(_pin?: string): Promise<{ pinIsDefault: boolean; source: string }> {
@@ -724,12 +759,12 @@ const API = {
   },
   async getServiceSettings() {
     const res = await fetch("/api/admin/service-settings", { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load service settings");
+    if (!res.ok) throw await parseApiError(res, "Failed to load service settings");
     return res.json();
   },
   async getAdminConfigStatus(): Promise<{ status: ConfigStatus }> {
     const res = await fetch("/api/admin/config/status", { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load config status");
+    if (!res.ok) throw await parseApiError(res, "Failed to load config status");
     return res.json();
   },
   async applyAdminConfig(changes: Array<{ key: string; valueJson: any; scope?: string; scopeId?: string }>, allowPartialSetup = false) {
@@ -738,7 +773,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ changes, allowPartialSetup })
     });
-    if (!res.ok) throw new Error("Failed to apply config");
+    if (!res.ok) throw await parseApiError(res, "Failed to apply config");
     return res.json();
   },
   async testSmtpConfig(payload: { to?: string; settings?: any }) {
@@ -747,17 +782,17 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload || {})
     });
-    if (!res.ok) throw new Error("SMTP test failed");
+    if (!res.ok) throw await parseApiError(res, "SMTP test failed");
     return res.json();
   },
   async testGoogleConfig() {
     const res = await fetch("/api/admin/config/test/google", { method: "POST", headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Google config test failed");
+    if (!res.ok) throw await parseApiError(res, "Google config test failed");
     return res.json();
   },
   async testDatabaseConfig() {
     const res = await fetch("/api/admin/config/test/db", { method: "POST", headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Database test failed");
+    if (!res.ok) throw await parseApiError(res, "Database test failed");
     return res.json();
   },
   async saveEmailSettings(payload: any) {
@@ -766,7 +801,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Failed to save email settings");
+    if (!res.ok) throw await parseApiError(res, "Failed to save email settings");
     return res.json();
   },
   async saveGoogleAuthSettings(payload: { enabled: boolean; clientId: string; clientSecret?: string }) {
@@ -775,7 +810,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Failed to save Google auth settings");
+    if (!res.ok) throw await parseApiError(res, "Failed to save Google auth settings");
     return res.json();
   },
   async sendTestEmail(to: string) {
@@ -784,29 +819,29 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ to })
     });
-    if (!res.ok) throw new Error("Failed to send test email");
+    if (!res.ok) throw await parseApiError(res, "Failed to send test email");
     return res.json();
   },
   async listCrashEvents(limit = 50, unresolvedOnly = false) {
     const res = await fetch(`/api/admin/crashes?limit=${limit}&unresolvedOnly=${unresolvedOnly ? "true" : "false"}`, {
       headers: withAuthHeaders()
     });
-    if (!res.ok) throw new Error("Failed to load crashes");
+    if (!res.ok) throw await parseApiError(res, "Failed to load crashes");
     return res.json();
   },
   async getCrashEvent(id: number) {
     const res = await fetch(`/api/admin/crashes/${id}`, { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load crash details");
+    if (!res.ok) throw await parseApiError(res, "Failed to load crash details");
     return res.json();
   },
   async acknowledgeCrashEvent(id: number) {
     const res = await fetch(`/api/admin/crashes/${id}/ack`, { method: "POST", headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to acknowledge crash");
+    if (!res.ok) throw await parseApiError(res, "Failed to acknowledge crash");
     return res.json();
   },
   async getSettings(_pin?: string): Promise<AppSettings> {
     const res = await fetch("/api/settings", { headers: withAuthHeaders() });
-    if (!res.ok) throw new Error("Failed to load settings");
+    if (!res.ok) throw await parseApiError(res, "Failed to load settings");
     const data = await res.json();
     return data.settings as AppSettings;
   },
@@ -816,7 +851,7 @@ const API = {
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Failed to save settings");
+    if (!res.ok) throw await parseApiError(res, "Failed to save settings");
     const data = await res.json();
     return data.settings as AppSettings;
   }
@@ -1113,6 +1148,8 @@ function App() {
   const [setupAdminPassword, setSetupAdminPassword] = useState("");
   const [publicConfigOverall, setPublicConfigOverall] = useState<ConfigOverall>("READY");
   const [setupDbStatus, setSetupDbStatus] = useState<any>(null);
+  const [clientErrors, setClientErrors] = useState<ClientErrorTrace[]>([]);
+  const [errorLogOpen, setErrorLogOpen] = useState(false);
   const [savePartial, setSavePartial] = useState(false);
   const [levelConverted, setLevelConverted] = useState(false);
   const [authEmail, setAuthEmail] = useState("");
@@ -1206,6 +1243,22 @@ function App() {
   );
   const isSetupRoute = window.location.pathname === "/setup";
   const isSetupRequired = publicConfigOverall === "SETUP_REQUIRED";
+
+  const reportClientError = useCallback((action: string, err: any) => {
+    const apiErr = err as ApiError;
+    const trace: ClientErrorTrace = {
+      at: new Date().toISOString(),
+      action,
+      message: String(apiErr?.message || err || "Unknown error"),
+      status: apiErr?.status,
+      code: apiErr?.code,
+      requestId: apiErr?.requestId,
+      url: apiErr?.url,
+      stack: typeof apiErr?.stack === "string" ? apiErr.stack : undefined,
+      details: apiErr?.details
+    };
+    setClientErrors((prev) => [trace, ...prev].slice(0, 50));
+  }, []);
   const themeVars = {
     "--bg": theme.background,
     "--bg-alt": theme.backgroundAlt,
@@ -1283,7 +1336,10 @@ function App() {
       .then((session) => {
         setSessionUser(session.actor?.isAuthenticated ? session.actor : null);
       })
-      .catch(() => setSessionUser(null));
+      .catch((err) => {
+        setSessionUser(null);
+        reportClientError("load_public_session", err);
+      });
 
     const params = new URLSearchParams(window.location.search);
     const resetToken = params.get("reset_token");
@@ -1292,7 +1348,7 @@ function App() {
       setAuthMode("forgot");
       window.history.replaceState({}, "", window.location.pathname);
     }
-  }, [isSetupRoute, isSetupRequired]);
+  }, [isSetupRoute, isSetupRequired, reportClientError]);
 
   useEffect(() => {
     API.getPublicConfigStatus()
@@ -1303,8 +1359,9 @@ function App() {
       .catch(() => {
         setPublicConfigOverall("SETUP_REQUIRED");
         setSetupWizardOpen(true);
+        reportClientError("load_public_config_status", new Error("Failed to load public config status"));
       });
-  }, []);
+  }, [reportClientError]);
 
   useEffect(() => {
     if (isSetupRoute || isSetupRequired) return;
@@ -1317,8 +1374,9 @@ function App() {
       .catch(() => {
         setGoogleClientId("");
         setPasswordResetEnabled(false);
+        reportClientError("load_auth_providers", new Error("Failed to load auth providers"));
       });
-  }, [isSetupRoute, isSetupRequired]);
+  }, [isSetupRoute, isSetupRequired, reportClientError]);
 
   const refreshSetupStatus = useCallback(async () => {
     try {
@@ -1338,8 +1396,9 @@ function App() {
       }
     } catch {
       setSetupStatus(null);
+      reportClientError("refresh_setup_status", new Error("Failed to refresh setup status"));
     }
-  }, []);
+  }, [reportClientError]);
 
   useEffect(() => {
     refreshSetupStatus().catch(() => null);
@@ -1349,8 +1408,11 @@ function App() {
     if (isSetupRoute || isSetupRequired) return;
     API.getHealth()
       .then((health) => setAppMode(String(health?.appMode || "info")))
-      .catch(() => setAppMode("info"));
-  }, [isSetupRoute, isSetupRequired]);
+      .catch((err) => {
+        setAppMode("info");
+        reportClientError("load_health", err);
+      });
+  }, [isSetupRoute, isSetupRequired, reportClientError]);
 
   useEffect(() => {
     if (isSetupRoute || isSetupRequired) return;
@@ -1365,8 +1427,11 @@ function App() {
         contact: data?.contact,
         appMode: data?.appMode
       }))
-      .catch(() => setPublicVersion(null));
-  }, [isSetupRoute, isSetupRequired]);
+      .catch((err) => {
+        setPublicVersion(null);
+        reportClientError("load_public_version", err);
+      });
+  }, [isSetupRoute, isSetupRequired, reportClientError]);
 
   useEffect(() => {
     if (isAdminUser) setAdminPin("rbac");
@@ -1406,6 +1471,21 @@ function App() {
     script.onload = init;
     document.body.appendChild(script);
   }, [googleClientId]);
+
+  useEffect(() => {
+    const onWindowError = (event: ErrorEvent) => {
+      reportClientError("window_error", event.error || new Error(event.message || "Unhandled window error"));
+    };
+    const onUnhandledRejection = (event: PromiseRejectionEvent) => {
+      reportClientError("unhandled_rejection", event.reason || new Error("Unhandled rejection"));
+    };
+    window.addEventListener("error", onWindowError);
+    window.addEventListener("unhandledrejection", onUnhandledRejection);
+    return () => {
+      window.removeEventListener("error", onWindowError);
+      window.removeEventListener("unhandledrejection", onUnhandledRejection);
+    };
+  }, [reportClientError]);
 
   useEffect(() => {
     if (!adminPin) {
@@ -1944,6 +2024,7 @@ function App() {
       }
     } catch (err: any) {
       setAuthMessage(err?.message || "Authentication failed.");
+      reportClientError("submit_email_auth", err);
     }
   }
 
@@ -1954,6 +2035,7 @@ function App() {
       setAuthMessage("Signed in with Google.");
     } catch (err: any) {
       setAuthMessage(err?.message || "Google sign-in failed.");
+      reportClientError("google_sign_in", err);
     }
   }
 
@@ -1995,12 +2077,12 @@ function App() {
     const poll = () => {
       API.getLiveStats()
         .then((data) => setLiveStats(data.stats || { total: 0, authorized: 0, guests: 0, modes: [] }))
-        .catch(() => null);
+        .catch((err) => reportClientError("poll_live_stats", err));
     };
     poll();
     const id = window.setInterval(poll, 15000);
     return () => window.clearInterval(id);
-  }, [isSetupRoute, isSetupRequired]);
+  }, [isSetupRoute, isSetupRequired, reportClientError]);
 
   const path = window.location.pathname;
   const isTextFitDiagnostics = path === "/diagnostics/text-fit";
@@ -2168,6 +2250,7 @@ function App() {
                       await refreshSetupStatus();
                     } catch (err: any) {
                       setSetupMessage(err?.message || "Admin setup failed.");
+                      reportClientError("setup_create_admin", err);
                     }
                   }}
                 >
@@ -2203,6 +2286,7 @@ function App() {
                       await refreshSetupStatus();
                     } catch (err: any) {
                       setSetupMessage(err?.message || "Owner bootstrap failed.");
+                      reportClientError("setup_bootstrap_owner", err);
                     }
                   }}
                 >
@@ -2218,6 +2302,7 @@ function App() {
                     await refreshSetupStatus();
                   } catch (err: any) {
                     setSetupMessage(err?.message || "Failed to complete setup.");
+                    reportClientError("setup_complete", err);
                   }
                 }}
               >
@@ -2227,9 +2312,50 @@ function App() {
           </Group>
         </Stack>
       </Modal>
+      <Modal opened={errorLogOpen} onClose={() => setErrorLogOpen(false)} title="Error Diagnostics" size="xl" centered>
+        <Stack gap="sm">
+          <Text size="sm">
+            Share this payload when reporting issues. It includes request IDs for backend correlation.
+          </Text>
+          <Textarea
+            minRows={12}
+            autosize
+            readOnly
+            value={JSON.stringify(clientErrors, null, 2)}
+          />
+          <Group justify="space-between">
+            <Button
+              variant="light"
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(JSON.stringify(clientErrors, null, 2));
+                  setStatusMessage("Error diagnostics copied.");
+                } catch {
+                  setStatusMessage("Failed to copy diagnostics.");
+                }
+              }}
+            >
+              Copy diagnostics
+            </Button>
+            <Button
+              color="red"
+              variant="light"
+              onClick={() => {
+                setClientErrors([]);
+                setStatusMessage("Error diagnostics cleared.");
+              }}
+            >
+              Clear
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
       <header className="topbar">
         <UnstyledButton className="brand" onClick={handleBrandClick} aria-label="Go to main menu">K-TRAIN</UnstyledButton>
         <div className="topbar-actions">
+          <Button variant={clientErrors.length > 0 ? "filled" : "light"} size="xs" color={clientErrors.length > 0 ? "red" : undefined} onClick={() => setErrorLogOpen(true)}>
+            Errors: {clientErrors.length}
+          </Button>
           <Button
             variant="light"
             size="xs"
