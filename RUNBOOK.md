@@ -7,7 +7,7 @@
 
 ## Startup and Bootstrap
 1. `cp .env.example .env`
-2. Configure `ADMIN_PIN`, `OWNER_EMAIL`, `KTRAIN_MASTER_KEY`.
+2. Configure `OWNER_EMAIL`, `KTRAIN_MASTER_KEY`, `APP_BASE_URL`.
 3. `docker compose up --build -d`
 4. `./scripts/bootstrap.sh`
 
@@ -25,7 +25,7 @@
 ## DB Switching (Admin Only)
 - API: `POST /api/admin/db/switch`
 - Rollback: `POST /api/admin/db/rollback`
-- Host helper: `ADMIN_PIN=<pin> ./scripts/switch_db.sh postgres`
+- Host helper: `ADMIN_BEARER_TOKEN=<token> ./scripts/switch_db.sh postgres`
 
 ## Diagnostics (Admin)
 - RBAC: `GET /api/diagnostics/rbac`

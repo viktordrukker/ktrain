@@ -15,8 +15,4 @@ for i in {1..30}; do
   sleep 1
 done
 
-echo "[bootstrap] seeding defaults (idempotent)"
-curl -fsS -X POST "${KTRAIN_API_BASE:-http://127.0.0.1:3000}/api/admin/seed-defaults" \
-  -H "x-admin-pin: ${ADMIN_PIN:-change-me}" >/dev/null || true
-
-echo "[bootstrap] done"
+echo "[bootstrap] done (default packs are auto-seeded at startup when missing)"

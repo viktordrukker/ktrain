@@ -7,23 +7,24 @@
 4. Run migrations
 5. Restart and verify readiness
 
-## One-Command Remote Deploy
-```bash
-APP_DIR=/opt/ktrain IMAGE=ghcr.io/<owner>/<repo>:latest ./scripts/deploy_remote.sh
-```
+## Required Runtime Config
+- `OWNER_EMAIL`
+- `KTRAIN_MASTER_KEY`
+- `APP_BASE_URL`
+- `AUTH_TRUST_PROXY=true`
+- `AUTH_TRUSTED_PROXY_IPS`
 
-## Post-Deploy Checks
+Optional:
+- `GOOGLE_CLIENT_ID` for Google sign-in
+
+## Post-Deploy Validation
 ```bash
 ./scripts/healthcheck.sh
-curl -fsS http://127.0.0.1:3000/api/diagnostics/startup -H 'x-admin-pin: <ADMIN_PIN>'
+curl -fsS http://127.0.0.1:3000/api/diagnostics/startup -H 'Authorization: Bearer <ADMIN_TOKEN>'
 ```
 
 ## Rollback
-- Application image rollback: redeploy previous tag.
-- Data-plane rollback:
+- App image rollback: deploy previous image tag.
+- Data plane rollback:
   - `POST /api/admin/db/rollback`
-  - `./scripts/migrate_rollback.sh` (if migration down file exists)
-
-## Zero/Low Downtime Notes
-- Migrations are idempotent and run on startup.
-- DB switch uses copy-then-switch with count verification and rollback path.
+  - `./scripts/migrate_rollback.sh` (if down migration exists)

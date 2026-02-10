@@ -17,7 +17,7 @@ ENV PORT=3000
 ENV DB_DRIVER=sqlite
 ENV SQLITE_PATH=/data/ktrain.sqlite
 ENV DB_RUNTIME_CONFIG_PATH=/data/runtime-db.json
-ENV ADMIN_PIN=change-me
+ENV APP_BASE_URL=http://localhost:3000
 
 RUN apk add --no-cache su-exec && addgroup -S app && adduser -S app -G app
 COPY --from=server-build /app/server/node_modules ./server/node_modules

@@ -5,7 +5,8 @@ const SAFE_CONFIG_KEYS = new Set([
   "app.features",
   "contest.rules",
   "generator.defaults",
-  "theme.defaults"
+  "theme.defaults",
+  "service.email"
 ]);
 
 const VALID_SCOPES = new Set(["global", "tenant", "user"]);

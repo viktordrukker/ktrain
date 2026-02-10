@@ -16,7 +16,8 @@ services:
       - POSTGRES_USER=${POSTGRES_USER:-ktrain}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-change-me}
       - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
-      - ADMIN_PIN=${ADMIN_PIN:-change-me}
+      - APP_BASE_URL=${APP_BASE_URL:-http://localhost:3000}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
       - OWNER_EMAIL=${OWNER_EMAIL:-}
       - KTRAIN_MASTER_KEY=${KTRAIN_MASTER_KEY:-}
       - AUTH_TRUST_PROXY=${AUTH_TRUST_PROXY:-true}
