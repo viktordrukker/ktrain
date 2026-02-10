@@ -1,5 +1,10 @@
 const { badRequest } = require("../../shared/errors");
 
+/**
+ * Allow-listed config keys that can be written through ConfigStore.
+ *
+ * SECURITY: this prevents arbitrary key writes from changing server behavior.
+ */
 const SAFE_CONFIG_KEYS = new Set([
   "app.settings",
   "app.features",
@@ -60,6 +65,8 @@ class ConfigStore {
     await this.repo.setConfig(key, scope, scopeId, value, updatedBy);
     this.invalidate(key, scope, scopeId);
     if (!(key === "app.config_version" && scope === "global" && scopeId === "global")) {
+      // WHY: global monotonic config version gives operators and clients a cheap
+      // "did config change?" signal without diffing full payloads.
       await this.bumpVersion(updatedBy);
     }
     return { key, scope, scopeId, value };

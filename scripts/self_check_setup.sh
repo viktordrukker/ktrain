@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Minimal post-deploy health gate for setup/config state.
+# This script intentionally checks public status + readiness only.
 BASE_URL="${BASE_URL:-http://127.0.0.1:3000}"
 EXPECT_SETUP_REQUIRED="${EXPECT_SETUP_REQUIRED:-false}"
 

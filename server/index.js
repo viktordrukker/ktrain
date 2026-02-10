@@ -1,5 +1,14 @@
 require("dotenv").config();
 
+/**
+ * K-TRAIN server entrypoint.
+ *
+ * Architecture notes:
+ * - Bootstrap env is intentionally minimal (`KTRAIN_MASTER_KEY`, `KTRAIN_BOOTSTRAP_DB`).
+ * - Operational configuration is DB-backed via `ConfigStore` and validated at runtime.
+ * - Setup mode is state-derived from `ConfigStatus`; there is no static "wizard complete" truth.
+ * - Sensitive values must never be logged in plaintext.
+ */
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
@@ -61,6 +70,14 @@ const BUILD_INFO = {
   commit: process.env.APP_COMMIT || process.env.GIT_COMMIT || "unknown"
 };
 
+/**
+ * Environment contract (runtime):
+ * - REQUIRED: `KTRAIN_MASTER_KEY`
+ * - REQUIRED for DB bootstrap/fallback: `KTRAIN_BOOTSTRAP_DB`
+ * - Optional env values are boot defaults and may be superseded by DB config.
+ *
+ * SECURITY: treat env as bootstrap-only; do not assume env changes represent applied runtime config.
+ */
 const PORT = process.env.PORT || 3000;
 const OWNER_EMAIL = process.env.OWNER_EMAIL || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
@@ -187,6 +204,12 @@ async function refreshConfigStatus({ force = false } = {}) {
   return snapshot;
 }
 
+/**
+ * Setup mode route allowlist.
+ *
+ * WHY: when required config is missing/invalid we must block normal app behavior
+ * and only expose safe remediation/status routes.
+ */
 function isSetupPathAllowed(req) {
   const p = req.path || "/";
   if (p === "/healthz" || p === "/readyz" || p === "/setup") return true;
@@ -1584,6 +1607,8 @@ app.post("/api/admin/config/apply", requirePermission(Permissions.ADMIN_CONFIG_M
 
   const status = await refreshConfigStatus({ force: true });
   if (!allowPartialSetup && status?.overall === "SETUP_REQUIRED") {
+    // WHY: reject and rollback by default so an admin cannot accidentally persist
+    // blocking required-config regressions outside explicit setup workflows.
     await configStore.importSafeConfig(snapshot, req.actor?.externalSubject || "admin:rollback");
     await refreshConfigStatus({ force: true });
     throw new AppError("Apply rejected: required configuration became invalid", {
@@ -1899,6 +1924,8 @@ async function seedDefaultRuntimeConfig() {
 }
 
 async function start() {
+  // SECURITY: encryption master key is mandatory; fail-fast avoids undefined
+  // behavior when reading/writing encrypted secrets.
   if (!process.env.KTRAIN_MASTER_KEY) {
     throw new Error("KTRAIN_MASTER_KEY is required");
   }

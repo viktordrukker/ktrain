@@ -1091,6 +1091,7 @@ function App() {
   const [showUnsavedSettingsModal, setShowUnsavedSettingsModal] = useState(false);
   const [pendingScreen, setPendingScreen] = useState<Screen | null>(null);
   const [setupStatus, setSetupStatus] = useState<any>(null);
+  // WHY: setup modal visibility is derived from backend ConfigStatus, not local wizard flags.
   const [setupWizardOpen, setSetupWizardOpen] = useState(false);
   const [setupMessage, setSetupMessage] = useState("");
   const [setupAdminEmail, setSetupAdminEmail] = useState("");

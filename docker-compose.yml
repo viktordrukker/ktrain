@@ -7,28 +7,29 @@ services:
       - "3000"
     environment:
       - PORT=${PORT:-3000}
-      - DB_DRIVER=${DB_DRIVER:-sqlite}
+      - DB_DRIVER=${DB_DRIVER:-postgres}
       - DB_RUNTIME_CONFIG_PATH=${DB_RUNTIME_CONFIG_PATH:-/data/runtime-db.json}
       - SQLITE_PATH=${SQLITE_PATH:-/data/ktrain.sqlite}
-      - POSTGRES_HOST=${POSTGRES_HOST:-ktrain_postgres}
+      - POSTGRES_HOST=${POSTGRES_HOST:-ff_postgres}
       - POSTGRES_PORT=${POSTGRES_PORT:-5432}
       - POSTGRES_DB=${POSTGRES_DB:-ktrain}
       - POSTGRES_USER=${POSTGRES_USER:-ktrain}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-change-me}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-stillnobodypasseshere}
       - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
       - APP_BASE_URL=${APP_BASE_URL:-http://localhost:3000}
       - APP_MODE=${APP_MODE:-info}
-      - APP_VERSION=${APP_VERSION:-0.0.0}
-      - APP_BUILD=${APP_BUILD:-0}
+      - APP_VERSION=${APP_VERSION:-1.0.0}
+      - APP_BUILD=${APP_BUILD:-19}
       - APP_COMMIT=${APP_COMMIT:-unknown}
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
       - SESSION_COOKIE_NAME=${SESSION_COOKIE_NAME:-ktrain_session}
       - SESSION_TTL_MS=${SESSION_TTL_MS:-2592000000}
       - ADVANCED_DEBUG_TTL_MINUTES=${ADVANCED_DEBUG_TTL_MINUTES:-30}
       - CRASH_REPORTS_DIR=${CRASH_REPORTS_DIR:-/data/crash-reports}
-      - CRASH_ALERT_EMAILS=${CRASH_ALERT_EMAILS:-}
-      - OWNER_EMAIL=${OWNER_EMAIL:-}
-      - KTRAIN_MASTER_KEY=${KTRAIN_MASTER_KEY:-}
+      - CRASH_ALERT_EMAILS=${CRASH_ALERT_EMAILS:-vdrukker@#thedrukkers.com}
+      - OWNER_EMAIL=${OWNER_EMAIL:-vdrukker@thedrukkers.com}
+      - KTRAIN_MASTER_KEY=${KTRAIN_MASTER_KEY:-pedyty6EkRmcsIfDz/+DpzRbsj9qcoQleL5mybRgbr8=}
+      - KTRAIN_BOOTSTRAP_DB=${KTRAIN_BOOTSTRAP_DB:-postgres://ktrain:stillnobodypasseshere@ff_postgres:5432/ktrain}
       - AUTH_TRUST_PROXY=${AUTH_TRUST_PROXY:-true}
       - AUTH_TRUSTED_PROXY_IPS=${AUTH_TRUSTED_PROXY_IPS:-}
       - AUTH_OWNER_GROUPS=${AUTH_OWNER_GROUPS:-owners}
@@ -51,28 +52,8 @@ services:
       timeout: 5s
       retries: 5
 
-  ktrain_postgres:
-    image: postgres:16-alpine
-    container_name: ktrain_postgres
-    profiles: ["postgres"]
-    environment:
-      - POSTGRES_DB=${POSTGRES_DB:-ktrain}
-      - POSTGRES_USER=${POSTGRES_USER:-ktrain}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-change-me}
-    volumes:
-      - ktrain-postgres-data:/var/lib/postgresql/data
-    networks:
-      - ktrain_net
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ktrain} -d ${POSTGRES_DB:-ktrain}"]
-      interval: 20s
-      timeout: 5s
-      retries: 5
-
 volumes:
   ktrain-data:
-  ktrain-postgres-data:
 
 networks:
   ktrain_net:
