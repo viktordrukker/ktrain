@@ -12,11 +12,14 @@ const { loadSettings, saveSettings } = require("./settings");
 const { readRuntimeConfig, writeRuntimeConfig, RUNTIME_CONFIG_PATH } = require("./db/runtime-config");
 const { Roles, Permissions, normalizeRole, hasPermission } = require("./src/domain/rbac");
 const { resolveActor } = require("./src/application/identity");
+const { createAuthSession, createMagicLink, consumeMagicLink, getOrCreateUserByEmail, hashToken } = require("./src/application/auth");
+const { seedBuiltinLanguagePacks, strictPrompt } = require("./src/application/language-packs");
 const { checkConfigSchema, checkMigrations, checkRequiredIndexes, checkEncryption } = require("./src/application/self-checks");
 const { requestContextMiddleware, requirePermission, withAsync, errorHandler } = require("./src/interface/http/middleware");
 const { asEnum, asNumber, asString, parseJsonArrayOfStrings, requireObject } = require("./src/interface/http/validation");
 const { ConfigStore, SAFE_CONFIG_KEYS } = require("./src/infrastructure/config/config-store");
 const { EncryptionService } = require("./src/infrastructure/security/encryption");
+const { SmtpService } = require("./src/infrastructure/email/smtp-service");
 const logger = require("./src/shared/logger");
 const { AppError, badRequest } = require("./src/shared/errors");
 const defaults = require("./data/defaults");
@@ -27,14 +30,16 @@ const app = express();
 let repo;
 let configStore;
 let encryptionService;
+let smtpService;
 let activeDriver = resolveDriver();
 let maintenanceMode = false;
 let startupSelfChecks = {};
 
 const PORT = process.env.PORT || 3000;
-const ADMIN_PIN = process.env.ADMIN_PIN || "change-me";
 const OWNER_EMAIL = process.env.OWNER_EMAIL || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const APP_BASE_URL = process.env.APP_BASE_URL || "http://localhost:3000";
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const AUTH_OWNER_GROUPS = String(process.env.AUTH_OWNER_GROUPS || "owners").split(",").map((x) => x.trim()).filter(Boolean);
 const AUTH_ADMIN_GROUPS = String(process.env.AUTH_ADMIN_GROUPS || "admins,ldap-admins").split(",").map((x) => x.trim()).filter(Boolean);
 const AUTH_MODERATOR_GROUPS = String(process.env.AUTH_MODERATOR_GROUPS || "moderators").split(",").map((x) => x.trim()).filter(Boolean);
@@ -70,16 +75,10 @@ app.disable("x-powered-by");
 app.use(requestContextMiddleware());
 app.use(withAsync(resolveRequestActor));
 
-function getCurrentAdminPin() {
-  const runtime = readRuntimeConfig();
-  return String(runtime.adminPin || ADMIN_PIN);
-}
-
 async function resolveRequestActor(req, res, next) {
   req.actor = await resolveActor({
     req,
     repo,
-    getAdminPin: getCurrentAdminPin,
     options: {
       ownerEmail: OWNER_EMAIL,
       authTrustProxy: AUTH_TRUST_PROXY,
@@ -209,16 +208,16 @@ async function getActivePack(type) {
   };
 }
 
-async function generateTasks(level, count, contentMode) {
+async function generateTasks(level, count, contentMode, language = "en") {
   const tasks = [];
 
-  const packLevel2 = contentMode === "vocab" ? await getActivePack("level2") : null;
-  const packLevel3 = contentMode === "vocab" ? await getActivePack("level3") : null;
-  const packSentence = contentMode === "vocab" ? await getActivePack("sentence_words") : null;
+  const level2PackItems = contentMode === "vocab" ? await repo.getPublishedPackItems({ language, type: "level2" }) : [];
+  const level3PackItems = contentMode === "vocab" ? await repo.getPublishedPackItems({ language, type: "level3" }) : [];
+  const sentencePackItems = contentMode === "vocab" ? await repo.getPublishedPackItems({ language, type: "sentence_words" }) : [];
 
-  const level2Words = packLevel2?.items?.length ? packLevel2.items : defaults.level2Words;
-  const level3Words = packLevel3?.items?.length ? packLevel3.items : defaults.level3Words;
-  const sentenceWords = packSentence?.items?.length ? packSentence.items : defaults.sentenceWords;
+  const level2Words = level2PackItems.length ? level2PackItems.map((row) => row.text) : defaults.level2Words;
+  const level3Words = level3PackItems.length ? level3PackItems.map((row) => row.text) : defaults.level3Words;
+  const sentenceWords = sentencePackItems.length ? sentencePackItems.map((row) => row.text) : defaults.sentenceWords;
 
   if (level === 1) {
     for (let i = 0; i < count; i++) {
@@ -292,6 +291,18 @@ async function callOpenAI({ apiKey, prompt }) {
   const data = await response.json();
   const output = data.output?.[0]?.content?.[0]?.text || data.output_text || "";
   return output;
+}
+
+async function verifyGoogleCredential(idToken) {
+  if (!GOOGLE_CLIENT_ID) throw new Error("Google auth is not configured");
+  // SECURITY: verify token signature and audience server-side before trusting claims.
+  const { OAuth2Client } = require("google-auth-library");
+  const client = new OAuth2Client(GOOGLE_CLIENT_ID);
+  const ticket = await client.verifyIdToken({
+    idToken,
+    audience: GOOGLE_CLIENT_ID
+  });
+  return ticket.getPayload();
 }
 
 function buildPrompt(packType, count) {
@@ -448,6 +459,78 @@ app.get("/api/public/session", (req, res) => {
   res.json({ ok: true, isAdmin: role === Roles.ADMIN || role === Roles.OWNER, role, actor: req.actor || null });
 });
 
+app.get("/api/auth/providers", (req, res) => {
+  res.json({
+    ok: true,
+    google: { enabled: Boolean(GOOGLE_CLIENT_ID), clientId: GOOGLE_CLIENT_ID || null },
+    magicLink: { enabled: true }
+  });
+});
+
+app.post("/api/auth/google", generationLimiter, withAsync(async (req, res) => {
+  const credential = asString(req.body?.credential || "", { min: 32, max: 8000, field: "credential" });
+  const payload = await verifyGoogleCredential(credential);
+  const email = payload.email;
+  if (!email) throw badRequest("Google account email is required");
+  const user = await getOrCreateUserByEmail(repo, email, Roles.USER);
+  await repo.updateUserProfile(user.id, { displayName: payload.name || user.displayName, avatarUrl: payload.picture || "" });
+  const session = await createAuthSession(repo, user, { userAgent: req.headers["user-agent"], ip: req.ip });
+  await audit(req, "auth.google.login", "user", String(user.id), { email });
+  res.json({
+    ok: true,
+    token: session.token,
+    expiresAt: session.expiresAt,
+    user: {
+      id: user.id,
+      email: user.email,
+      displayName: payload.name || user.displayName,
+      avatarUrl: payload.picture || "",
+      role: user.role
+    }
+  });
+}));
+
+app.post("/api/auth/magic-link/request", generationLimiter, withAsync(async (req, res) => {
+  const email = asString(req.body?.email || "", { min: 5, max: 255, field: "email" }).toLowerCase();
+  const link = await createMagicLink(repo, email, { ip: req.ip });
+  const url = `${APP_BASE_URL}/?magic_token=${encodeURIComponent(link.token)}`;
+  await smtpService.send({
+    to: email,
+    subject: "Your KTrain sign-in link",
+    text: `Use this sign-in link (expires in 15 minutes): ${url}`,
+    html: `<p>Use this sign-in link (expires in 15 minutes):</p><p><a href=\"${url}\">${url}</a></p>`
+  });
+  await audit(req, "auth.magic_link.request", "email", email);
+  res.json({ ok: true });
+}));
+
+app.post("/api/auth/magic-link/verify", generationLimiter, withAsync(async (req, res) => {
+  const token = asString(req.body?.token || "", { min: 20, max: 255, field: "token" });
+  const session = await consumeMagicLink(repo, token, { userAgent: req.headers["user-agent"], ip: req.ip });
+  if (!session) throw badRequest("Invalid or expired link");
+  await audit(req, "auth.magic_link.verify", "user", String(session.user.id), { email: session.user.email });
+  res.json({
+    ok: true,
+    token: session.token,
+    expiresAt: session.expiresAt,
+    user: {
+      id: session.user.id,
+      email: session.user.email,
+      displayName: session.user.displayName,
+      role: session.user.role
+    }
+  });
+}));
+
+app.post("/api/auth/logout", withAsync(async (req, res) => {
+  const authHeader = String(req.headers.authorization || "");
+  if (authHeader.startsWith("Bearer ")) {
+    const tokenHash = hashToken(authHeader.slice("Bearer ".length).trim());
+    await repo.revokeAuthSession(tokenHash);
+  }
+  res.json({ ok: true });
+}));
+
 app.get("/api/settings", requirePermission(Permissions.SETTINGS_READ), withAsync(async (req, res) => {
   const settings = await loadSettings(repo);
   res.json({ settings });
@@ -461,18 +544,79 @@ app.put("/api/settings", requirePermission(Permissions.SETTINGS_WRITE), withAsyn
   res.json({ settings });
 }));
 
+app.get("/api/user/profile", requirePermission(Permissions.SESSION_READ), withAsync(async (req, res) => {
+  if (!req.actor?.isAuthenticated) {
+    return res.json({ ok: true, profile: null });
+  }
+  const avatarCfg = await configStore.get("user.avatar", {
+    scope: "user",
+    scopeId: String(req.actor.id),
+    fallback: { avatarUrl: "" }
+  });
+  res.json({
+    ok: true,
+    profile: {
+      id: req.actor.id,
+      email: req.actor.email,
+      displayName: req.actor.displayName,
+      role: req.actor.role,
+      avatarUrl: avatarCfg.avatarUrl || ""
+    }
+  });
+}));
+
+app.put("/api/user/profile", requirePermission(Permissions.SESSION_READ), withAsync(async (req, res) => {
+  if (!req.actor?.isAuthenticated) throw new AppError("Authentication required", { status: 401, code: "UNAUTHORIZED", expose: true });
+  const displayName = asString(req.body?.displayName || "", { min: 1, max: 64, field: "displayName" });
+  const avatarUrl = String(req.body?.avatarUrl || "");
+  const user = await repo.updateUserProfile(req.actor.id, { displayName, avatarUrl });
+  await audit(req, "user.profile.update", "user", String(req.actor.id));
+  res.json({ ok: true, profile: user });
+}));
+
+app.get("/api/user/openai-key/status", requirePermission(Permissions.SESSION_READ), withAsync(async (req, res) => {
+  if (!req.actor?.isAuthenticated) return res.json({ ok: true, configured: false });
+  const existing = await repo.getUserSecret(req.actor.id, "openai_api_key");
+  res.json({ ok: true, configured: Boolean(existing) });
+}));
+
+app.put("/api/user/openai-key", requirePermission(Permissions.SESSION_READ), withAsync(async (req, res) => {
+  if (!req.actor?.isAuthenticated) throw new AppError("Authentication required", { status: 401, code: "UNAUTHORIZED", expose: true });
+  const apiKey = asString(req.body?.apiKey || "", { min: 20, max: 200, field: "apiKey" });
+  await storeOpenAIKeyForActor(req.actor, apiKey);
+  await audit(req, "user.openai_key.update", "user", String(req.actor.id));
+  res.json({ ok: true });
+}));
+
+app.get("/api/user/history", requirePermission(Permissions.SESSION_READ), withAsync(async (req, res) => {
+  if (!req.actor?.isAuthenticated) return res.json({ ok: true, entries: [] });
+  const entries = await repo.queryLeaderboard({ onlyAuthorized: true });
+  const own = entries.filter((row) => Number(row.userid || row.userId) === Number(req.actor.id));
+  res.json({ ok: true, entries: own });
+}));
+
 app.post("/api/tasks/generate", requirePermission(Permissions.TASKS_GENERATE), requireNotMaintenance, generationLimiter, withAsync(async (req, res) => {
   const body = requireObject(req.body || {}, "body");
-  const safeLevel = asNumber(body.level, { min: 1, max: 5, field: "level" });
+  const actorIsAuthorized = Boolean(req.actor?.isAuthenticated);
+  const maxLevel = actorIsAuthorized ? 5 : 3;
+  const safeLevel = asNumber(body.level, { min: 1, max: maxLevel, field: "level" });
   const safeCount = asNumber(body.count ?? 10, { min: 5, max: 100, field: "count" });
   const safeContentMode = body.contentMode === "vocab" ? "vocab" : "default";
-  const tasks = await generateTasks(safeLevel, safeCount, safeContentMode);
-  res.json({ tasks });
+  const requestedLanguage = String(body.language || "en").toLowerCase();
+  const fallbackLanguage = ["en", "ru"].includes(requestedLanguage) ? requestedLanguage : "en";
+  const languages = await repo.listPublishedLanguagesByType(safeLevel === 2 ? "level2" : safeLevel === 3 ? "level3" : "sentence_words");
+  const language = languages.includes(requestedLanguage) ? requestedLanguage : fallbackLanguage;
+  const tasks = await generateTasks(safeLevel, safeCount, safeContentMode, language);
+  res.json({ tasks, language, safeDefaultsApplied: !actorIsAuthorized });
 }));
 
 app.post("/api/results", requirePermission(Permissions.RESULTS_WRITE), requireNotMaintenance, resultsLimiter, withAsync(async (req, res) => {
   const body = requireObject(req.body || {}, "result");
   if (body.mode && body.mode !== "contest") return res.json({ ok: true, saved: false });
+  if (!req.actor?.isAuthenticated) {
+    // SECURITY: global leaderboard contains authorized players only.
+    return res.json({ ok: true, saved: false, reason: "auth_required_for_global_leaderboard" });
+  }
 
   const createdAt = new Date().toISOString();
   const contestType = body.contestType === "tasks" ? "tasks" : "time";
@@ -483,7 +627,7 @@ app.post("/api/results", requirePermission(Permissions.RESULTS_WRITE), requireNo
   const accuracy = clampNumber(body.accuracy, 0, 100, 0);
 
   await repo.insertLeaderboard({
-    playerName: cleanName(body.playerName),
+    playerName: cleanName(body.playerName || req.actor.displayName || "Player"),
     createdAt,
     contestType,
     level,
@@ -496,15 +640,142 @@ app.post("/api/results", requirePermission(Permissions.RESULTS_WRITE), requireNo
     mistakes: clampNumber(body.mistakes, 0, 100_000, 0),
     tasksCompleted: clampNumber(body.tasksCompleted, 0, 100_000, 0),
     timeSeconds: clampNumber(body.timeSeconds, 0, 100_000, 0),
-    maxStreak: clampNumber(body.maxStreak, 0, 100_000, 0)
+    maxStreak: clampNumber(body.maxStreak, 0, 100_000, 0),
+    userId: req.actor.id,
+    isGuest: 0,
+    language: String(body.language || "en").toLowerCase(),
+    displayName: req.actor.displayName || cleanName(body.playerName || "Player"),
+    avatarUrl: body.avatarUrl || null
   });
 
   res.json({ ok: true, saved: true });
 }));
 
 app.get("/api/leaderboard", requirePermission(Permissions.LEADERBOARD_READ), withAsync(async (req, res) => {
-  const entries = await repo.queryLeaderboard(req.query || {});
+  const entries = await repo.queryLeaderboard({ ...(req.query || {}), onlyAuthorized: true });
   res.json({ entries });
+}));
+
+app.get("/api/packs/languages", requirePermission(Permissions.TASKS_GENERATE), withAsync(async (req, res) => {
+  const level = asNumber(req.query.level || 2, { min: 1, max: 5, field: "level" });
+  const type = level === 2 ? "level2" : level === 3 ? "level3" : "sentence_words";
+  const languages = await repo.listPublishedLanguagesByType(type);
+  res.json({ ok: true, level, type, languages });
+}));
+
+app.get("/api/packs/items", requirePermission(Permissions.TASKS_GENERATE), withAsync(async (req, res) => {
+  const language = asString(req.query.language || "en", { min: 2, max: 10, field: "language" }).toLowerCase();
+  const type = asEnum(req.query.type || "level2", ["level2", "level3", "sentence_words"], "type");
+  const items = await repo.getPublishedPackItems({ language, type });
+  res.json({ ok: true, items });
+}));
+
+app.get("/api/admin/language-packs", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const filters = {
+    language: req.query.language ? String(req.query.language).toLowerCase() : undefined,
+    type: req.query.type ? String(req.query.type) : undefined,
+    status: req.query.status ? String(req.query.status).toUpperCase() : undefined
+  };
+  const packs = await repo.listLanguagePacks(filters);
+  const enriched = await Promise.all(packs.map(async (pack) => ({
+    ...pack,
+    items: await repo.getLanguagePackItems(pack.id)
+  })));
+  res.json({ ok: true, packs: enriched });
+}));
+
+app.post("/api/admin/language-packs", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const language = asString(req.body?.language || "en", { min: 2, max: 10, field: "language" }).toLowerCase();
+  const type = asEnum(req.body?.type || "level2", ["level2", "level3", "sentence_words"], "type");
+  const topic = String(req.body?.topic || "general");
+  const status = asEnum(String(req.body?.status || "DRAFT").toUpperCase(), ["DRAFT", "PUBLISHED", "ARCHIVED"], "status");
+  const items = parseJsonArrayOfStrings(req.body?.items || [], "items").map((text) => ({ text, difficulty: null, metadataJson: {} }));
+  const packId = await repo.createLanguagePack({ language, type, topic, status, createdBy: req.actor?.id || null });
+  await repo.replaceLanguagePackItems(packId, items);
+  await audit(req, "language_pack.create", "pack", String(packId), { language, type, status, count: items.length });
+  res.json({ ok: true, packId });
+}));
+
+app.put("/api/admin/language-packs/:id", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const id = asNumber(req.params.id, { min: 1, field: "id" });
+  const status = req.body?.status ? asEnum(String(req.body.status).toUpperCase(), ["DRAFT", "PUBLISHED", "ARCHIVED"], "status") : undefined;
+  const topic = req.body?.topic ? String(req.body.topic) : undefined;
+  await repo.updateLanguagePack(id, { topic, status });
+  if (Array.isArray(req.body?.items)) {
+    const items = parseJsonArrayOfStrings(req.body.items, "items").map((text) => ({ text, difficulty: null, metadataJson: {} }));
+    await repo.replaceLanguagePackItems(id, items);
+  }
+  await audit(req, "language_pack.update", "pack", String(id), { status, topic });
+  res.json({ ok: true });
+}));
+
+app.get("/api/admin/language-packs/export", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const packs = await repo.listLanguagePacks({});
+  const rows = await Promise.all(packs.map(async (pack) => ({
+    ...pack,
+    items: (await repo.getLanguagePackItems(pack.id)).map((item) => item.text)
+  })));
+  res.json({ ok: true, packs: rows });
+}));
+
+app.post("/api/admin/language-packs/import", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const packs = Array.isArray(req.body?.packs) ? req.body.packs : [];
+  for (const pack of packs) {
+    const language = asString(pack.language || "en", { min: 2, max: 10, field: "language" }).toLowerCase();
+    const type = asEnum(pack.type || "level2", ["level2", "level3", "sentence_words"], "type");
+    const topic = String(pack.topic || "imported");
+    const status = asEnum(String(pack.status || "DRAFT").toUpperCase(), ["DRAFT", "PUBLISHED", "ARCHIVED"], "status");
+    const items = parseJsonArrayOfStrings(pack.items || [], "items").map((text) => ({ text, difficulty: null, metadataJson: { source: "import" } }));
+    const packId = await repo.createLanguagePack({ language, type, topic, status, createdBy: req.actor?.id || null });
+    await repo.replaceLanguagePackItems(packId, items);
+  }
+  await audit(req, "language_pack.import", "pack", "bulk", { count: packs.length });
+  res.json({ ok: true, imported: packs.length });
+}));
+
+app.post("/api/admin/language-packs/generate", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, generationLimiter, withAsync(async (req, res) => {
+  if (!req.actor?.isAuthenticated) throw badRequest("Authentication required");
+  const existing = await repo.getUserSecret(req.actor.id, "openai_api_key");
+  if (!existing) throw badRequest("OpenAI key is required for generation");
+  const apiKey = await getOpenAIKeyForActor(req.actor);
+  const language = asString(req.body?.language || "en", { min: 2, max: 10, field: "language" }).toLowerCase();
+  const type = asEnum(req.body?.type || "level2", ["level2", "level3", "sentence_words"], "type");
+  const count = asNumber(req.body?.count || 30, { min: 5, max: 200, field: "count" });
+  const topic = String(req.body?.topic || "general toddler-safe learning");
+  const prompt = strictPrompt({ language, type, count, topic });
+  const output = await callOpenAI({ apiKey, prompt });
+  const parsed = JSON.parse(output);
+  const items = parseJsonArrayOfStrings(parsed.items || [], "items", 500);
+  const packId = await repo.createLanguagePack({ language, type, topic, status: "DRAFT", createdBy: req.actor.id });
+  await repo.replaceLanguagePackItems(packId, items.map((text) => ({ text, difficulty: null, metadataJson: { source: "openai" } })));
+  await audit(req, "language_pack.generate", "pack", String(packId), { language, type, count: items.length });
+  res.json({ ok: true, packId, status: "DRAFT", count: items.length });
+}));
+
+app.get("/api/live/stats", requirePermission(Permissions.TASKS_GENERATE), withAsync(async (req, res) => {
+  await repo.cleanupActiveSessions(120);
+  const stats = await repo.getActiveSessionStats(120);
+  res.json({ ok: true, stats });
+}));
+
+app.get("/api/admin/live/stats", requirePermission(Permissions.ADMIN_DIAGNOSTICS_READ), adminLimiter, withAsync(async (req, res) => {
+  await repo.cleanupActiveSessions(120);
+  const stats = await repo.getActiveSessionStats(120);
+  res.json({ ok: true, stats });
+}));
+
+app.post("/api/live/heartbeat", requirePermission(Permissions.TASKS_GENERATE), withAsync(async (req, res) => {
+  const sessionId = asString(req.body?.sessionId || "", { min: 8, max: 128, field: "sessionId" });
+  const mode = asEnum(req.body?.mode || "learning", ["learning", "contest"], "mode");
+  await repo.upsertActiveSession({
+    sessionId,
+    userId: req.actor?.isAuthenticated ? req.actor.id : null,
+    mode,
+    isAuthorized: Boolean(req.actor?.isAuthenticated)
+  });
+  await repo.cleanupActiveSessions(120);
+  const stats = await repo.getActiveSessionStats(120);
+  res.json({ ok: true, stats });
 }));
 
 app.get("/api/vocab/packs", requirePermission(Permissions.VOCAB_READ), withAsync(async (req, res) => {
@@ -588,41 +859,45 @@ app.post("/api/admin/reset", requirePermission(Permissions.ADMIN_RESET), adminLi
   res.json({ ok: true });
 }));
 
-app.get("/api/admin/pin/status", requirePermission(Permissions.ADMIN_PIN_MANAGE), adminLimiter, withAsync(async (req, res) => {
-  const current = getCurrentAdminPin();
+app.get("/api/admin/service-settings", requirePermission(Permissions.ADMIN_CONFIG_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const email = await smtpService.getEmailSettings();
   res.json({
     ok: true,
-    pinIsDefault: current === "change-me",
-    source: readRuntimeConfig().adminPin ? "runtime" : "env"
+    settings: {
+      email: {
+        host: email.host,
+        port: email.port,
+        secure: email.secure,
+        username: email.username,
+        fromAddress: email.fromAddress,
+        fromName: email.fromName,
+        hasPassword: Boolean(email.password)
+      },
+      db: {
+        activeDriver,
+        dbConfig: resolveDbConfig()
+      }
+    }
   });
 }));
 
-app.post("/api/admin/pin/change", requirePermission(Permissions.ADMIN_PIN_MANAGE), adminLimiter, withAsync(async (req, res) => {
-  const { currentPin, newPin } = req.body || {};
-  const activePin = getCurrentAdminPin();
-  const pinFromHeader = String(req.headers["x-admin-pin"] || "");
+app.post("/api/admin/service-settings/email", requirePermission(Permissions.ADMIN_CONFIG_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const payload = requireObject(req.body || {}, "email settings");
+  const saved = await smtpService.saveEmailSettings(payload, req.actor?.externalSubject || "admin");
+  await audit(req, "service_settings.email.update", "email", "smtp");
+  res.json({ ok: true, settings: { ...saved, hasPassword: Boolean(payload.password) } });
+}));
 
-  if (pinFromHeader && pinFromHeader !== activePin) {
-    throw new AppError("Invalid current admin pin", { status: 403, code: "FORBIDDEN", expose: true });
-  }
-  if (!pinFromHeader && currentPin && String(currentPin) !== activePin) {
-    throw new AppError("Current pin mismatch", { status: 403, code: "FORBIDDEN", expose: true });
-  }
-
-  const candidate = asString(newPin || "", { min: 6, max: 128, field: "newPin" });
-  if (candidate === "change-me") {
-    throw badRequest("New pin cannot be the default value");
-  }
-
-  const runtime = readRuntimeConfig();
-  writeRuntimeConfig({
-    ...runtime,
-    adminPin: candidate,
-    adminPinUpdatedAt: new Date().toISOString(),
-    adminPinUpdatedBy: req.actor?.externalSubject || "admin"
+app.post("/api/admin/service-settings/email/test", requirePermission(Permissions.ADMIN_CONFIG_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const to = asString(req.body?.to || req.actor?.email || "", { min: 5, max: 255, field: "to" });
+  await smtpService.send({
+    to,
+    subject: "KTrain SMTP test",
+    text: "SMTP test message from KTrain admin settings.",
+    html: "<p>SMTP test message from KTrain admin settings.</p>"
   });
-  await audit(req, "admin.pin.change", "runtime", "adminPin");
-  res.json({ ok: true, pinChanged: true });
+  await audit(req, "service_settings.email.test", "email", to);
+  res.json({ ok: true });
 }));
 
 app.post("/api/admin/seed-defaults", requirePermission(Permissions.ADMIN_SEED_DEFAULTS), adminLimiter, withAsync(async (req, res) => {
@@ -860,9 +1135,11 @@ async function start() {
     ttlMs: Number(process.env.CONFIG_CACHE_TTL_MS || 5000)
   });
   encryptionService = new EncryptionService(process.env.KTRAIN_MASTER_KEY || "");
+  smtpService = new SmtpService({ configStore, repo, encryptionService });
 
   await ensureOwnerBootstrap();
   await seedDefaultRuntimeConfig();
+  await seedBuiltinLanguagePacks(repo);
 
   startupSelfChecks = {
     configSchema: await checkConfigSchema(configStore),
@@ -871,6 +1148,13 @@ async function start() {
     encryption: checkEncryption(encryptionService)
   };
   logger.info("startup_self_checks", startupSelfChecks);
+
+  setInterval(() => {
+    Promise.all([
+      repo.cleanupActiveSessions(120),
+      repo.cleanupAuthSessions()
+    ]).catch((err) => logger.warn("background_cleanup_failed", { error: err }));
+  }, 60 * 1000);
 
   app.listen(PORT, () => {
     logger.info("server_started", { port: PORT, driver: activeDriver });

@@ -99,6 +99,7 @@ type GameSettings = {
   duration: 30 | 60 | 120;
   taskTarget: 10 | 20 | 50;
   contentMode: ContentMode;
+  language: string;
   playerName: string;
 };
 
@@ -171,6 +172,8 @@ type AppSettings = {
   protectFunctionKeys: boolean;
 };
 
+const SOUND_PREF_KEY = "ktrain_sound_enabled";
+
 const defaultSettings: GameSettings = {
   mode: "learning",
   level: 1,
@@ -178,6 +181,7 @@ const defaultSettings: GameSettings = {
   duration: 60,
   taskTarget: 20,
   contentMode: "default",
+  language: "en",
   playerName: ""
 };
 
@@ -346,21 +350,31 @@ const agePresets: Record<string, Partial<AppSettings> & { maxAllowedLevel: numbe
     maxAllowedLevel: 5
   }
 };
+let authToken = "";
+
+function setAuthToken(token: string) {
+  authToken = token || "";
+}
+
+function withAuthHeaders(base: Record<string, string> = {}) {
+  if (!authToken) return base;
+  return { ...base, Authorization: `Bearer ${authToken}` };
+}
+
 const API = {
-  async generateTasks(level: number, count: number, contentMode: ContentMode): Promise<Task[]> {
+  async generateTasks(level: number, count: number, contentMode: ContentMode, language = "en"): Promise<{ tasks: Task[]; language: string }> {
     const res = await fetch("/api/tasks/generate", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ level, count, contentMode })
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ level, count, contentMode, language })
     });
     if (!res.ok) throw new Error("Failed to generate tasks");
-    const data = await res.json();
-    return data.tasks as Task[];
+    return res.json();
   },
   async saveResult(payload: any) {
     const res = await fetch("/api/results", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
     if (!res.ok) throw new Error("Failed to save result");
@@ -368,151 +382,246 @@ const API = {
   },
   async getLeaderboard(filters: any): Promise<LeaderboardEntry[]> {
     const params = new URLSearchParams(filters).toString();
-    const res = await fetch(`/api/leaderboard?${params}`);
+    const res = await fetch(`/api/leaderboard?${params}`, { headers: withAuthHeaders() });
     if (!res.ok) throw new Error("Failed to load leaderboard");
     const data = await res.json();
     return data.entries as LeaderboardEntry[];
   },
-  async adminReset(scope: string, pin: string) {
+  async getPublicSession() {
+    const res = await fetch("/api/public/session", { headers: withAuthHeaders() });
+    if (!res.ok) throw new Error("Failed to load session");
+    return res.json();
+  },
+  async getAuthProviders() {
+    const res = await fetch("/api/auth/providers");
+    if (!res.ok) throw new Error("Failed to load providers");
+    return res.json();
+  },
+  async authWithGoogle(credential: string) {
+    const res = await fetch("/api/auth/google", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ credential })
+    });
+    if (!res.ok) throw new Error("Google sign-in failed");
+    return res.json();
+  },
+  async requestMagicLink(email: string) {
+    const res = await fetch("/api/auth/magic-link/request", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email })
+    });
+    if (!res.ok) throw new Error("Magic link request failed");
+    return res.json();
+  },
+  async verifyMagicLink(token: string) {
+    const res = await fetch("/api/auth/magic-link/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token })
+    });
+    if (!res.ok) throw new Error("Magic link verification failed");
+    return res.json();
+  },
+  async logout() {
+    const res = await fetch("/api/auth/logout", { method: "POST", headers: withAuthHeaders() });
+    if (!res.ok) throw new Error("Logout failed");
+    return res.json();
+  },
+  async getAvailableLanguages(level: number) {
+    const res = await fetch(`/api/packs/languages?level=${level}`, { headers: withAuthHeaders() });
+    if (!res.ok) throw new Error("Failed to load available languages");
+    return res.json();
+  },
+  async getLiveStats() {
+    const res = await fetch("/api/live/stats", { headers: withAuthHeaders() });
+    if (!res.ok) throw new Error("Failed to load live stats");
+    return res.json();
+  },
+  async heartbeat(sessionId: string, mode: Mode) {
+    const res = await fetch("/api/live/heartbeat", {
+      method: "POST",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ sessionId, mode })
+    });
+    if (!res.ok) throw new Error("Heartbeat failed");
+    return res.json();
+  },
+  async adminReset(scope: string, _pin?: string) {
     const res = await fetch("/api/admin/reset", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "x-admin-pin": pin },
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ scope })
     });
     if (!res.ok) throw new Error("Reset failed");
   },
-  async adminSeedDefaults(pin: string) {
+  async adminSeedDefaults(_pin?: string) {
     const res = await fetch("/api/admin/seed-defaults", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "x-admin-pin": pin }
+      headers: withAuthHeaders({ "Content-Type": "application/json" })
     });
     if (!res.ok) throw new Error("Seed failed");
   },
-  async getVocabPacks(): Promise<VocabPack[]> {
-    const res = await fetch("/api/vocab/packs");
-    if (!res.ok) throw new Error("Failed to load packs");
-    const data = await res.json();
-    return data.packs as VocabPack[];
-  },
-  async deleteVocabPack(id: number, pin: string) {
-    const res = await fetch(`/api/vocab/packs/${id}`, {
-      method: "DELETE",
-      headers: { "x-admin-pin": pin }
-    });
-    if (!res.ok) throw new Error("Delete failed");
-  },
-  async activateVocabPack(id: number, pin: string) {
-    const res = await fetch(`/api/vocab/packs/${id}/activate`, {
-      method: "POST",
-      headers: { "x-admin-pin": pin }
-    });
-    if (!res.ok) throw new Error("Activate failed");
-  },
-  async updateVocabPack(id: number, payload: any, pin: string) {
-    const res = await fetch(`/api/vocab/packs/${id}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json", "x-admin-pin": pin },
-      body: JSON.stringify(payload)
-    });
-    if (!res.ok) throw new Error("Update failed");
-  },
-  async generateVocab(payload: any, pin: string) {
-    const res = await fetch("/api/vocab/generate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-admin-pin": pin },
-      body: JSON.stringify(payload)
-    });
-    if (!res.ok) throw new Error("Generate failed");
+  async getLanguagePacks(filters: any = {}) {
+    const params = new URLSearchParams(filters).toString();
+    const res = await fetch(`/api/admin/language-packs?${params}`, { headers: withAuthHeaders() });
+    if (!res.ok) throw new Error("Failed to load language packs");
     return res.json();
   },
-  async testOpenAI(payload: any, pin: string) {
+  async getVocabPacks(): Promise<VocabPack[]> {
+    const data = await this.getLanguagePacks({});
+    const packs = Array.isArray(data.packs) ? data.packs : [];
+    return packs.map((pack: any) => ({
+      id: pack.id,
+      name: `${pack.language.toUpperCase()} ${pack.type} (${pack.status})`,
+      packType: pack.type,
+      items: Array.isArray(pack.items) ? pack.items.map((i: any) => i.text || i) : [],
+      active: pack.status === "PUBLISHED" ? 1 : 0,
+      createdAt: pack.createdAt || pack.createdat || new Date().toISOString()
+    }));
+  },
+  async deleteVocabPack(id: number, _pin?: string) {
+    return this.updateLanguagePack(id, { status: "ARCHIVED" });
+  },
+  async activateVocabPack(id: number, _pin?: string) {
+    return this.updateLanguagePack(id, { status: "PUBLISHED" });
+  },
+  async updateVocabPack(id: number, payload: any, _pin?: string) {
+    return this.updateLanguagePack(id, payload);
+  },
+  async generateVocab(payload: any, _pin?: string) {
+    return this.generateLanguagePack(payload);
+  },
+  async testOpenAI(payload: any, _pin?: string) {
     const res = await fetch("/api/admin/openai/test", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "x-admin-pin": pin },
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
     if (!res.ok) throw new Error("Test failed");
     return res.json();
   },
-  async getDbStatus(pin: string): Promise<DbAdminStatus> {
-    const res = await fetch("/api/admin/db/status", {
-      headers: { "x-admin-pin": pin }
+  async updateLanguagePack(id: number, payload: any) {
+    const res = await fetch(`/api/admin/language-packs/${id}`, {
+      method: "PUT",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload)
     });
+    if (!res.ok) throw new Error("Language pack update failed");
+    return res.json();
+  },
+  async generateLanguagePack(payload: any) {
+    const res = await fetch("/api/admin/language-packs/generate", {
+      method: "POST",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error("Language pack generation failed");
+    return res.json();
+  },
+  async exportLanguagePacks() {
+    const res = await fetch("/api/admin/language-packs/export", { headers: withAuthHeaders() });
+    if (!res.ok) throw new Error("Language pack export failed");
+    return res.json();
+  },
+  async importLanguagePacks(payload: any) {
+    const res = await fetch("/api/admin/language-packs/import", {
+      method: "POST",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error("Language pack import failed");
+    return res.json();
+  },
+  async getDbStatus(_pin?: string): Promise<DbAdminStatus> {
+    const res = await fetch("/api/admin/db/status", { headers: withAuthHeaders() });
     if (!res.ok) throw new Error("Failed to load DB status");
     return res.json();
   },
-  async getDbConfig(pin: string): Promise<{ dbConfig: DbAdminConfig; activeDriver: "sqlite" | "postgres" }> {
-    const res = await fetch("/api/admin/db/config", {
-      headers: { "x-admin-pin": pin }
-    });
+  async getDbConfig(_pin?: string): Promise<{ dbConfig: DbAdminConfig; activeDriver: "sqlite" | "postgres" }> {
+    const res = await fetch("/api/admin/db/config", { headers: withAuthHeaders() });
     if (!res.ok) throw new Error("Failed to load DB config");
     return res.json();
   },
-  async saveDbConfig(pin: string, payload: DbAdminConfig, verify = true) {
+  async saveDbConfig(_pinOrPayload: any, payloadOrVerify?: any, verify = true) {
+    const payload = typeof _pinOrPayload === "object" ? _pinOrPayload : payloadOrVerify;
+    const finalVerify = typeof payloadOrVerify === "boolean" ? payloadOrVerify : verify;
     const res = await fetch("/api/admin/db/config", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "x-admin-pin": pin },
-      body: JSON.stringify({ ...payload, verify })
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ ...payload, verify: finalVerify })
     });
     if (!res.ok) throw new Error("Failed to save DB config");
     return res.json();
   },
-  async switchDb(pin: string, target: "sqlite" | "postgres") {
+  async switchDb(pinOrTarget: any, maybeTarget?: "sqlite" | "postgres") {
+    const target = (maybeTarget || pinOrTarget) as "sqlite" | "postgres";
     const res = await fetch("/api/admin/db/switch", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "x-admin-pin": pin },
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ target, mode: "copy-then-switch", verify: true })
     });
     if (!res.ok) throw new Error("DB switch failed");
     return res.json();
   },
-  async rollbackDb(pin: string) {
+  async rollbackDb(_pin?: string) {
     const res = await fetch("/api/admin/db/rollback", {
       method: "POST",
-      headers: { "x-admin-pin": pin }
+      headers: withAuthHeaders()
     });
     if (!res.ok) throw new Error("DB rollback failed");
     return res.json();
   },
-  async getAdminPinStatus(pin: string): Promise<{ pinIsDefault: boolean; source: string }> {
-    const res = await fetch("/api/admin/pin/status", {
-      headers: { "x-admin-pin": pin }
-    });
-    if (!res.ok) throw new Error("Failed to load admin pin status");
-    return res.json();
-  },
-  async changeAdminPin(pin: string, currentPin: string, newPin: string) {
-    const res = await fetch("/api/admin/pin/change", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-admin-pin": pin },
-      body: JSON.stringify({ currentPin, newPin })
-    });
-    if (!res.ok) throw new Error("Failed to change admin pin");
-    return res.json();
-  },
-  async testDbConnection(pin: string, payload: { postgres: DbAdminConfig["postgres"] }) {
+  async testDbConnection(pinOrPayload: any, maybePayload?: { postgres: DbAdminConfig["postgres"] }) {
+    const payload = (maybePayload || pinOrPayload) as { postgres: DbAdminConfig["postgres"] };
     const res = await fetch("/api/admin/db/test", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "x-admin-pin": pin },
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
     if (!res.ok) throw new Error("Postgres test connection failed");
     return res.json();
   },
-  async getSettings(pin?: string): Promise<AppSettings> {
-    const headers: Record<string, string> = {};
-    if (pin) headers["x-admin-pin"] = pin;
-    const res = await fetch("/api/settings", { headers });
+  async getAdminPinStatus(_pin?: string): Promise<{ pinIsDefault: boolean; source: string }> {
+    return { pinIsDefault: false, source: "removed_use_rbac" };
+  },
+  async changeAdminPin(_pin: string, _currentPin: string, _newPin: string) {
+    throw new Error("Admin PIN has been removed. Use admin user authorization.");
+  },
+  async getServiceSettings() {
+    const res = await fetch("/api/admin/service-settings", { headers: withAuthHeaders() });
+    if (!res.ok) throw new Error("Failed to load service settings");
+    return res.json();
+  },
+  async saveEmailSettings(payload: any) {
+    const res = await fetch("/api/admin/service-settings/email", {
+      method: "POST",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error("Failed to save email settings");
+    return res.json();
+  },
+  async sendTestEmail(to: string) {
+    const res = await fetch("/api/admin/service-settings/email/test", {
+      method: "POST",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ to })
+    });
+    if (!res.ok) throw new Error("Failed to send test email");
+    return res.json();
+  },
+  async getSettings(_pin?: string): Promise<AppSettings> {
+    const res = await fetch("/api/settings", { headers: withAuthHeaders() });
     if (!res.ok) throw new Error("Failed to load settings");
     const data = await res.json();
     return data.settings as AppSettings;
   },
-  async saveSettings(payload: AppSettings, pin?: string): Promise<AppSettings> {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (pin) headers["x-admin-pin"] = pin;
+  async saveSettings(payload: AppSettings, _pin?: string): Promise<AppSettings> {
     const res = await fetch("/api/settings", {
       method: "PUT",
-      headers,
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
     if (!res.ok) throw new Error("Failed to save settings");
@@ -580,7 +689,7 @@ function calcCPM(correct: number, elapsedMs: number) {
 }
 
 function settingsKey(settings: GameSettings) {
-  return `run_${settings.mode}_${settings.level}_${settings.contestType}_${settings.duration}_${settings.taskTarget}_${settings.contentMode}`;
+  return `run_${settings.mode}_${settings.level}_${settings.contestType}_${settings.duration}_${settings.taskTarget}_${settings.contentMode}_${settings.language}`;
 }
 
 const TEXT_SCALE: Record<TextSize, number> = {
@@ -756,6 +865,8 @@ function buildParticles(count: number, seed: number, variation: Variation) {
   });
 }
 function App() {
+  const AUTH_TOKEN_KEY = "ktrain_auth_token_v2";
+  const PLAY_SESSION_KEY = "ktrain_play_session_id_v2";
   const [screen, setScreen] = useState<Screen>("home");
   const [settings, setSettings] = useState<GameSettings>(defaultSettings);
   const [appSettings, setAppSettings] = useState<AppSettings>(defaultAppSettings);
@@ -800,6 +911,20 @@ function App() {
   const [showStopModal, setShowStopModal] = useState(false);
   const [savePartial, setSavePartial] = useState(false);
   const [levelConverted, setLevelConverted] = useState(false);
+  const [authEmail, setAuthEmail] = useState("");
+  const [authMessage, setAuthMessage] = useState("");
+  const [sessionUser, setSessionUser] = useState<any>(null);
+  const [availableLanguages, setAvailableLanguages] = useState<string[]>(["en", "ru"]);
+  const [liveStats, setLiveStats] = useState<{ total: number; authorized: number; guests: number; modes?: Array<{ mode: string; count: number }> }>({
+    total: 0,
+    authorized: 0,
+    guests: 0,
+    modes: []
+  });
+  const [playSessionId, setPlaySessionId] = useState<string>("");
+  const [googleClientId, setGoogleClientId] = useState("");
+  const [languagePackModalOpen, setLanguagePackModalOpen] = useState(false);
+  const isAdminUser = Boolean(sessionUser && ["ADMIN", "OWNER"].includes(String(sessionUser.role || "").toUpperCase()));
   const baseTheme = computeTheme(appSettings);
   const contrastResult = useMemo(
     () => applyVisibilityGuard(
@@ -859,7 +984,9 @@ function App() {
 
   const trendDelta = Math.round(accuracy - prevAccuracy);
   const trendLabel = trendDelta === 0 ? "" : trendDelta > 0 ? `+${trendDelta}%` : `${trendDelta}%`;
-  const stars = "*".repeat(Math.min(5, Math.max(1, Math.floor(gameStats.streak / 3) + 1)));
+  const stars = gameStats.streak > 0
+    ? "*".repeat(Math.min(5, Math.max(1, Math.floor(gameStats.streak / 3) + 1)))
+    : "0";
   const allowedLevels = buildAllowedLevels(appSettings.maxAllowedLevel || 5);
   const themeVars = {
     "--bg": theme.background,
@@ -904,6 +1031,78 @@ function App() {
   };
 
   useEffect(() => {
+    const token = localStorage.getItem(AUTH_TOKEN_KEY) || "";
+    if (token) setAuthToken(token);
+    API.getPublicSession()
+      .then((session) => {
+        setSessionUser(session.actor?.isAuthenticated ? session.actor : null);
+      })
+      .catch(() => setSessionUser(null));
+
+    const params = new URLSearchParams(window.location.search);
+    const magicToken = params.get("magic_token");
+    if (magicToken) {
+      API.verifyMagicLink(magicToken)
+        .then((result) => {
+          setAuthToken(result.token);
+          localStorage.setItem(AUTH_TOKEN_KEY, result.token);
+          setSessionUser(result.user);
+          setAuthMessage("Signed in successfully.");
+          window.history.replaceState({}, "", window.location.pathname);
+        })
+        .catch(() => setAuthMessage("Magic link is invalid or expired."));
+    }
+  }, []);
+
+  useEffect(() => {
+    API.getAuthProviders()
+      .then((providers) => {
+        const cid = providers?.google?.enabled ? providers.google.clientId || "" : "";
+        setGoogleClientId(cid);
+      })
+      .catch(() => setGoogleClientId(""));
+  }, []);
+
+  useEffect(() => {
+    if (sessionUser) setAdminPin("rbac");
+    else setAdminPin("");
+  }, [sessionUser]);
+
+  useEffect(() => {
+    if (!googleClientId) return;
+    const scriptId = "google-identity-service";
+    const existing = document.getElementById(scriptId) as HTMLScriptElement | null;
+    const init = () => {
+      const w = window as any;
+      if (!w.google?.accounts?.id) return;
+      w.google.accounts.id.initialize({
+        client_id: googleClientId,
+        callback: (response: any) => {
+          if (response?.credential) void handleGoogleCredential(response.credential);
+        }
+      });
+      const target = document.getElementById("google-signin-button");
+      if (target) {
+        target.innerHTML = "";
+        w.google.accounts.id.renderButton(target, { theme: "outline", size: "medium", shape: "pill" });
+      }
+    };
+
+    if (existing) {
+      init();
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.id = scriptId;
+    script.src = "https://accounts.google.com/gsi/client";
+    script.async = true;
+    script.defer = true;
+    script.onload = init;
+    document.body.appendChild(script);
+  }, [googleClientId]);
+
+  useEffect(() => {
     if (!adminPin) {
       setSettingsLoaded(true);
       return;
@@ -944,6 +1143,21 @@ function App() {
   }, [screen, settings.mode, appSettings.warnOnExitContest]);
 
   useEffect(() => {
+    if (screen !== "game") return;
+    let sid = playSessionId;
+    if (!sid) {
+      sid = localStorage.getItem(PLAY_SESSION_KEY) || crypto.randomUUID();
+      localStorage.setItem(PLAY_SESSION_KEY, sid);
+      setPlaySessionId(sid);
+    }
+    API.heartbeat(sid, settings.mode).catch(() => null);
+    const id = window.setInterval(() => {
+      API.heartbeat(sid, settings.mode).catch(() => null);
+    }, 30000);
+    return () => window.clearInterval(id);
+  }, [screen, settings.mode, playSessionId]);
+
+  useEffect(() => {
     const update = () => {
       setCompactUI(window.innerHeight < 700 || window.innerWidth < 700);
     };
@@ -956,6 +1170,17 @@ function App() {
     const shown = localStorage.getItem("zero_hint_shown") === "1";
     setShowZeroHint(!shown);
   }, []);
+
+  useEffect(() => {
+    const stored = localStorage.getItem(SOUND_PREF_KEY);
+    if (stored === null) return;
+    const enabled = stored === "true";
+    setAppSettings((prev) => ({ ...prev, soundEnabled: enabled }));
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem(SOUND_PREF_KEY, String(appSettings.soundEnabled));
+  }, [appSettings.soundEnabled]);
 
   useEffect(() => {
     if (!functionKeyNotice) return;
@@ -1000,8 +1225,8 @@ function App() {
 
   const startGame = async () => {
     setStatusMessage("");
-    const batch = await API.generateTasks(settings.level, 40, settings.contentMode);
-    setTasks(batch);
+    const generated = await API.generateTasks(settings.level, 40, settings.contentMode, settings.language);
+    setTasks(generated.tasks);
     setCurrentIndex(0);
     setBuffer("");
     setCaretIndex(0);
@@ -1044,6 +1269,7 @@ function App() {
       contestType: settings.contestType,
       level: settings.level,
       contentMode: settings.contentMode,
+      language: settings.language,
       duration: settings.mode === "contest" && settings.contestType === "time" ? settings.duration : null,
       taskTarget: settings.mode === "contest" && settings.contestType === "tasks" ? settings.taskTarget : null,
       score,
@@ -1069,8 +1295,8 @@ function App() {
   };
 
   const loadMoreTasks = async () => {
-    const batch = await API.generateTasks(settings.level, 40, settings.contentMode);
-    setTasks((prev) => [...prev, ...batch]);
+    const generated = await API.generateTasks(settings.level, 40, settings.contentMode, settings.language);
+    setTasks((prev) => [...prev, ...generated.tasks]);
   };
 
   const handleCorrect = () => {
@@ -1342,6 +1568,43 @@ function App() {
     }
   };
 
+  async function signOut() {
+    try {
+      await API.logout();
+    } catch {
+      // ignore best-effort logout
+    }
+    setAuthToken("");
+    localStorage.removeItem(AUTH_TOKEN_KEY);
+    setSessionUser(null);
+    setAuthMessage("Signed out.");
+  }
+
+  async function requestMagicLink() {
+    if (!authEmail) {
+      setAuthMessage("Enter an email address first.");
+      return;
+    }
+    try {
+      await API.requestMagicLink(authEmail);
+      setAuthMessage("Magic link sent. Check your inbox.");
+    } catch (err: any) {
+      setAuthMessage(err?.message || "Could not send magic link.");
+    }
+  }
+
+  async function handleGoogleCredential(credential: string) {
+    try {
+      const result = await API.authWithGoogle(credential);
+      setAuthToken(result.token);
+      localStorage.setItem(AUTH_TOKEN_KEY, result.token);
+      setSessionUser(result.user);
+      setAuthMessage("Signed in with Google.");
+    } catch (err: any) {
+      setAuthMessage(err?.message || "Google sign-in failed.");
+    }
+  }
+
   const requestFullscreen = () => {
     if (document.fullscreenElement) {
       document.exitFullscreen();
@@ -1358,6 +1621,29 @@ function App() {
       loadPacks();
     }
   }, [screen]);
+
+  useEffect(() => {
+    API.getAvailableLanguages(settings.level)
+      .then((data) => {
+        const langs = Array.isArray(data.languages) && data.languages.length > 0 ? data.languages : ["en", "ru"];
+        setAvailableLanguages(langs);
+        if (!langs.includes(settings.language)) {
+          setSettings((prev) => ({ ...prev, language: langs[0] }));
+        }
+      })
+      .catch(() => setAvailableLanguages(["en", "ru"]));
+  }, [settings.level]);
+
+  useEffect(() => {
+    const poll = () => {
+      API.getLiveStats()
+        .then((data) => setLiveStats(data.stats || { total: 0, authorized: 0, guests: 0, modes: [] }))
+        .catch(() => null);
+    };
+    poll();
+    const id = window.setInterval(poll, 15000);
+    return () => window.clearInterval(id);
+  }, []);
 
   const path = window.location.pathname;
   const isTextFitDiagnostics = path === "/diagnostics/text-fit";
@@ -1458,6 +1744,29 @@ function App() {
                 onChange={(e) => setSettings({ ...settings, playerName: e.target.value })}
                 placeholder="Player"
               />
+              <Card withBorder radius="md" p="sm">
+                <Stack gap="xs">
+                  <Text fw={600}>Account</Text>
+                  {sessionUser ? (
+                    <>
+                      <Text size="sm">Signed in as {sessionUser.displayName || sessionUser.email}</Text>
+                      <Button variant="light" size="xs" onClick={signOut}>Sign out</Button>
+                    </>
+                  ) : (
+                    <>
+                      <TextInput
+                        label="Email magic link"
+                        value={authEmail}
+                        onChange={(e) => setAuthEmail(e.currentTarget.value)}
+                        placeholder="you@example.com"
+                      />
+                      <Button variant="light" size="xs" onClick={requestMagicLink}>Send magic link</Button>
+                      {googleClientId && <div id="google-signin-button" />}
+                      {authMessage && <Text size="xs" c="dimmed">{authMessage}</Text>}
+                    </>
+                  )}
+                </Stack>
+              </Card>
               <Stack gap="xs">
                 <Text fw={600}>Mode</Text>
                 <SegmentedControl
@@ -1532,6 +1841,19 @@ function App() {
                   ]}
                 />
               </Stack>
+              <Stack gap="xs">
+                <Text fw={600}>Language</Text>
+                <Select
+                  data={availableLanguages.map((lang) => ({ value: lang, label: lang.toUpperCase() }))}
+                  value={settings.language}
+                  onChange={(value) => setSettings({ ...settings, language: value || "en" })}
+                />
+              </Stack>
+              <Card withBorder radius="md" p="sm">
+                <Text fw={600}>Live Activity</Text>
+                <Text size="sm">Users playing now: {liveStats.total}</Text>
+                <Text size="xs" c="dimmed">Authorized: {liveStats.authorized} • Guests: {liveStats.guests}</Text>
+              </Card>
               <Button size="lg" onClick={startGame}>Start</Button>
             </Stack>
           </Card>
@@ -1649,6 +1971,7 @@ function App() {
 
       {screen === "settings" && (
         <SettingsScreen
+          isAdmin={isAdminUser}
           appSettings={appSettings}
           setAppSettings={setAppSettings}
           contrastReport={contrastReport}
@@ -1918,6 +2241,7 @@ function SettingSliderRow({
 }
 
 function SettingsScreen({
+  isAdmin,
   appSettings,
   setAppSettings,
   contrastReport,
@@ -1937,6 +2261,7 @@ function SettingsScreen({
   onTestKey,
   statusMessage
 }: {
+  isAdmin: boolean;
   appSettings: AppSettings;
   setAppSettings: (value: AppSettings | ((prev: AppSettings) => AppSettings)) => void;
   contrastReport: any;
@@ -1963,6 +2288,7 @@ function SettingsScreen({
   const [generateName, setGenerateName] = useState("New Pack");
   const [manualEdit, setManualEdit] = useState<Record<number, string>>({});
   const [openaiStatus, setOpenaiStatus] = useState("");
+  const [packJson, setPackJson] = useState("");
   const [dbStatus, setDbStatus] = useState<DbAdminStatus | null>(null);
   const [dbConfig, setDbConfig] = useState<DbAdminConfig>({
     sqlitePath: "/data/ktrain.sqlite",
@@ -1977,6 +2303,18 @@ function SettingsScreen({
   });
   const [dbMessage, setDbMessage] = useState("");
   const [dbBusy, setDbBusy] = useState(false);
+  const [emailSettings, setEmailSettings] = useState({
+    host: "",
+    port: 587,
+    secure: false,
+    username: "",
+    password: "",
+    fromAddress: "",
+    fromName: "KTrain",
+    hasPassword: false
+  });
+  const [emailTestTo, setEmailTestTo] = useState("");
+  const [emailMessage, setEmailMessage] = useState("");
   const [pinStatus, setPinStatus] = useState<{ pinIsDefault: boolean; source: string } | null>(null);
   const [newAdminPin, setNewAdminPin] = useState("");
   const [confirmAdminPin, setConfirmAdminPin] = useState("");
@@ -1986,7 +2324,7 @@ function SettingsScreen({
 
   const refreshDb = async () => {
     if (!adminPin) {
-      setDbMessage("Enter admin PIN first.");
+      setDbMessage("Sign in with an admin account first.");
       return;
     }
     setDbBusy(true);
@@ -1996,6 +2334,10 @@ function SettingsScreen({
         API.getDbStatus(adminPin),
         API.getDbConfig(adminPin)
       ]);
+      API.getServiceSettings().then((service) => {
+        const email = service?.settings?.email || {};
+        setEmailSettings((prev) => ({ ...prev, ...email, password: "" }));
+      }).catch(() => null);
       setDbStatus(status);
       setDbConfig(configRes.dbConfig);
       setDbMessage(`DB status loaded. Active: ${status.activeDriver}`);
@@ -2021,7 +2363,7 @@ function SettingsScreen({
 
   const rotateAdminPin = async () => {
     if (!adminPin) {
-      setPinMessage("Enter current admin PIN first.");
+      setPinMessage("Admin PIN is removed. Use admin account authorization.");
       return;
     }
     if (newAdminPin.length < 6) {
@@ -2039,10 +2381,10 @@ function SettingsScreen({
       setAdminPin(newAdminPin);
       setNewAdminPin("");
       setConfirmAdminPin("");
-      setPinMessage("Admin PIN updated.");
+      setPinMessage("Admin PIN is removed. Use admin account authorization.");
       await refreshPinStatus();
     } catch (err: any) {
-      setPinMessage(err?.message || "Failed to update admin PIN.");
+      setPinMessage(err?.message || "Admin authorization update failed.");
     } finally {
       setPinBusy(false);
     }
@@ -2050,7 +2392,7 @@ function SettingsScreen({
 
   const saveDbConfig = async () => {
     if (!adminPin) {
-      setDbMessage("Enter admin PIN first.");
+      setDbMessage("Sign in with an admin account first.");
       return;
     }
     setDbBusy(true);
@@ -2068,7 +2410,7 @@ function SettingsScreen({
 
   const switchDb = async (target: "sqlite" | "postgres") => {
     if (!adminPin) {
-      setDbMessage("Enter admin PIN first.");
+      setDbMessage("Sign in with an admin account first.");
       return;
     }
     setDbBusy(true);
@@ -2086,7 +2428,7 @@ function SettingsScreen({
 
   const rollbackDb = async () => {
     if (!adminPin) {
-      setDbMessage("Enter admin PIN first.");
+      setDbMessage("Sign in with an admin account first.");
       return;
     }
     setDbBusy(true);
@@ -2104,7 +2446,7 @@ function SettingsScreen({
 
   const testPostgresConnection = async () => {
     if (!adminPin) {
-      setDbMessage("Enter admin PIN first.");
+      setDbMessage("Sign in with an admin account first.");
       return;
     }
     setDbBusy(true);
@@ -2116,6 +2458,32 @@ function SettingsScreen({
       setDbMessage(err?.message || "Postgres connection failed");
     } finally {
       setDbBusy(false);
+    }
+  };
+
+  const saveEmailServiceSettings = async () => {
+    if (!adminPin) {
+      setEmailMessage("Sign in with an admin account first.");
+      return;
+    }
+    try {
+      await API.saveEmailSettings(emailSettings);
+      setEmailMessage("Email settings saved.");
+    } catch (err: any) {
+      setEmailMessage(err?.message || "Failed to save email settings.");
+    }
+  };
+
+  const sendEmailTest = async () => {
+    if (!adminPin) {
+      setEmailMessage("Sign in with an admin account first.");
+      return;
+    }
+    try {
+      await API.sendTestEmail(emailTestTo || "admin@example.com");
+      setEmailMessage("Test email sent.");
+    } catch (err: any) {
+      setEmailMessage(err?.message || "Failed to send test email.");
     }
   };
 
@@ -2199,7 +2567,11 @@ function SettingsScreen({
         <div className="settings-main">
           <div className="settings-hero">
             <Title order={2}>Settings & Admin</Title>
-            <Text size="sm" c="dimmed">All controls are safe to test and persist automatically.</Text>
+            <Text size="sm" c="dimmed">
+              {adminPin
+                ? "All controls are safe to test and persist automatically."
+                : "Changes apply immediately for authorized admin accounts."}
+            </Text>
           </div>
           <SettingsSection
             id="start"
@@ -2599,19 +2971,55 @@ function SettingsScreen({
             </SettingRow>
           </SettingsSection>
 
+          {isAdmin && (
           <SettingsSection
             id="content"
             title="Content & Randomness"
             description="Manage vocabulary packs and generation."
           >
             <div className="setting-row full">
+              <Button variant="light" onClick={() => setLanguagePackModalOpen(true)}>Open Language Packs</Button>
+            </div>
+            <Modal opened={languagePackModalOpen} onClose={() => setLanguagePackModalOpen(false)} title="Language Packs" size="xl" centered>
               <div className="vocab-manager">
+                <Group justify="space-between" mb="sm">
+                  <Button
+                    variant="light"
+                    onClick={async () => {
+                      const exported = await API.exportLanguagePacks();
+                      setPackJson(JSON.stringify(exported, null, 2));
+                    }}
+                  >
+                    Export JSON
+                  </Button>
+                  <Button
+                    variant="light"
+                    onClick={async () => {
+                      try {
+                        const parsed = JSON.parse(packJson || "{}");
+                        await API.importLanguagePacks(parsed);
+                        onReloadPacks();
+                        setOpenaiStatus("Pack JSON imported.");
+                      } catch {
+                        setOpenaiStatus("Invalid JSON for import.");
+                      }
+                    }}
+                  >
+                    Import JSON
+                  </Button>
+                </Group>
+                <Textarea
+                  label="Import / Export JSON"
+                  value={packJson}
+                  onChange={(e) => setPackJson(e.currentTarget.value)}
+                  minRows={4}
+                />
                 <Group align="flex-end" style={{ flexWrap: "wrap" }}>
                   <TextInput
-                    label="Pack name"
+                    label="Topic"
                     value={generateName}
                     onChange={(e) => setGenerateName(e.currentTarget.value)}
-                    placeholder="Pack name"
+                    placeholder="e.g. animals"
                   />
                   <Select
                     label="Pack type"
@@ -2632,11 +3040,11 @@ function SettingsScreen({
                   />
                   <Button
                     onClick={async () => {
-                      await onGenerate({ name: generateName, count: generateCount, packType: generateType, apiKey: openaiKey, storeKey });
+                      await onGenerate({ topic: generateName, count: generateCount, type: generateType, language: settings.language });
                       onReloadPacks();
                     }}
                   >
-                    Generate
+                    Generate Draft
                   </Button>
                 </Group>
 
@@ -2646,7 +3054,7 @@ function SettingsScreen({
                       <div className="pack-header">
                         <strong>{pack.name}</strong>
                         <span>{pack.packType}</span>
-                        <span>{pack.active ? "ACTIVE" : ""}</span>
+                        <span>{pack.active ? "PUBLISHED" : "DRAFT"}</span>
                       </div>
                       <Textarea
                         value={manualEdit[pack.id] ?? pack.items.join(", ")}
@@ -2654,7 +3062,7 @@ function SettingsScreen({
                         minRows={3}
                       />
                       <div className="row">
-                        <Button variant="light" onClick={() => onActivatePack(pack.id)}>Activate</Button>
+                        <Button variant="light" onClick={() => onActivatePack(pack.id)}>Publish</Button>
                         <Button
                           variant="light"
                           onClick={() => {
@@ -2664,14 +3072,15 @@ function SettingsScreen({
                         >
                           Save
                         </Button>
-                        <Button variant="light" onClick={() => onDeletePack(pack.id)}>Delete</Button>
+                        <Button variant="light" onClick={() => onDeletePack(pack.id)}>Unpublish</Button>
                       </div>
                     </div>
                   ))}
                 </div>
               </div>
-            </div>
+            </Modal>
           </SettingsSection>
+          )}
 
           <SettingsSection
             id="preview"
@@ -2707,26 +3116,27 @@ function SettingsScreen({
             </SettingRow>
           </SettingsSection>
 
+          {isAdmin && (
           <SettingsSection
             id="admin"
             title="Admin"
-            description="OpenAI, resets, and admin PIN."
+            description="OpenAI, resets, and admin authorization."
           >
-            <SettingRow label="Admin PIN" helper="Required for resets and vocab admin actions.">
+            <SettingRow label="Admin Authorization" helper="Sign in with OWNER/ADMIN account.">
               <Group>
                 <TextInput value={adminPin} onChange={(e) => setAdminPin(e.currentTarget.value)} placeholder="Current PIN" />
-                <Button variant="light" onClick={refreshPinStatus}>Check PIN status</Button>
+                <Button variant="light" onClick={refreshPinStatus}>Check authorization</Button>
                 {pinStatus && <Badge variant="light">Source: {pinStatus.source}</Badge>}
               </Group>
             </SettingRow>
             {pinStatus?.pinIsDefault && (
               <div className="setting-row full">
-                <Alert color="red" title="Default PIN in use">
-                  You are using the default admin PIN. Change it now before production use.
+                <Alert color="yellow" title="Admin PIN removed">
+                  Admin PIN is deprecated. Use authorized admin user accounts.
                 </Alert>
               </div>
             )}
-            <SettingRow label="New admin PIN" helper="Set this on first deploy. Minimum 6 characters.">
+            <SettingRow label="Legacy PIN Fields" helper="Deprecated in Iteration 2.">
               <Group>
                 <TextInput
                   type="password"
@@ -2740,12 +3150,12 @@ function SettingsScreen({
                   onChange={(e) => setConfirmAdminPin(e.currentTarget.value)}
                   placeholder="Confirm new PIN"
                 />
-                <Button loading={pinBusy} onClick={rotateAdminPin}>Update PIN</Button>
+                <Button loading={pinBusy} onClick={rotateAdminPin}>Legacy Action</Button>
               </Group>
             </SettingRow>
             {pinMessage && (
               <div className="setting-row full">
-                <Alert color="yellow" title="Admin PIN">
+                <Alert color="yellow" title="Admin Authorization">
                   {pinMessage}
                 </Alert>
               </div>
@@ -2758,6 +3168,39 @@ function SettingsScreen({
                 <Badge variant="light">Maintenance: {dbStatus?.maintenanceMode ? "ON" : "OFF"}</Badge>
               </Group>
             </SettingRow>
+            <Divider my="sm" />
+            <SettingRow label="SMTP host" helper="Used for magic-link sign-in and notifications.">
+              <TextInput value={emailSettings.host} onChange={(e) => setEmailSettings({ ...emailSettings, host: e.currentTarget.value })} placeholder="smtp.example.com" />
+            </SettingRow>
+            <SettingRow label="SMTP port" helper="Common: 587 (STARTTLS) or 465 (SSL).">
+              <NumberInput value={emailSettings.port} onChange={(value) => setEmailSettings({ ...emailSettings, port: Number(value) || 587 })} />
+            </SettingRow>
+            <SettingRow label="SMTP username" helper="Account username for SMTP auth.">
+              <TextInput value={emailSettings.username} onChange={(e) => setEmailSettings({ ...emailSettings, username: e.currentTarget.value })} />
+            </SettingRow>
+            <SettingRow label="SMTP password" helper={emailSettings.hasPassword ? "Stored securely. Leave blank to keep current." : "Stored securely (encrypted at rest)."}>
+              <TextInput type="password" value={emailSettings.password} onChange={(e) => setEmailSettings({ ...emailSettings, password: e.currentTarget.value })} />
+            </SettingRow>
+            <SettingRow label="From address" helper="Sender mailbox address.">
+              <TextInput value={emailSettings.fromAddress} onChange={(e) => setEmailSettings({ ...emailSettings, fromAddress: e.currentTarget.value })} />
+            </SettingRow>
+            <SettingRow label="From name" helper="Sender display name.">
+              <TextInput value={emailSettings.fromName} onChange={(e) => setEmailSettings({ ...emailSettings, fromName: e.currentTarget.value })} />
+            </SettingRow>
+            <SettingRow label="Email service actions" helper="Save settings and send a test email.">
+              <Group>
+                <TextInput value={emailTestTo} onChange={(e) => setEmailTestTo(e.currentTarget.value)} placeholder="test@domain.com" />
+                <Button variant="light" onClick={saveEmailServiceSettings}>Save email settings</Button>
+                <Button variant="light" onClick={sendEmailTest}>Send test email</Button>
+              </Group>
+            </SettingRow>
+            {emailMessage && (
+              <div className="setting-row full">
+                <Alert color="yellow" title="Email Service">
+                  {emailMessage}
+                </Alert>
+              </div>
+            )}
             <SettingRow label="SQLite path" helper="Used when driver is sqlite.">
               <TextInput
                 value={dbConfig.sqlitePath}
@@ -2884,6 +3327,7 @@ function SettingsScreen({
               </Group>
             </SettingRow>
           </SettingsSection>
+          )}
 
           {statusMessage && <div className="status">{statusMessage}</div>}
         </div>

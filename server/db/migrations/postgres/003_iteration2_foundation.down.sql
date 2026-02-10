@@ -1,0 +1,13 @@
+DROP INDEX IF EXISTS idx_leaderboard_user;
+DROP INDEX IF EXISTS idx_active_sessions_seen;
+DROP INDEX IF EXISTS idx_pack_items_pack;
+DROP INDEX IF EXISTS idx_packs_lookup;
+DROP INDEX IF EXISTS idx_auth_sessions_user;
+DROP INDEX IF EXISTS idx_auth_magic_links_email;
+DROP TABLE IF EXISTS active_sessions;
+DROP TABLE IF EXISTS pack_items;
+DROP TABLE IF EXISTS packs;
+DROP TABLE IF EXISTS system_secrets;
+DROP TABLE IF EXISTS auth_sessions;
+DROP TABLE IF EXISTS auth_magic_links;
+DELETE FROM schema_migrations WHERE id = '003_iteration2_foundation.sql';

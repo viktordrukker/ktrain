@@ -7,44 +7,44 @@ docker compose up --build -d
 ./scripts/bootstrap.sh
 ```
 
-## Required Production Env
-- `ADMIN_PIN` (must not be default)
+## Iteration 2 Required Env
 - `OWNER_EMAIL`
 - `KTRAIN_MASTER_KEY` (32-byte hex/base64)
+- `APP_BASE_URL` (used for magic links)
 - `AUTH_TRUST_PROXY=true`
-- `AUTH_TRUSTED_PROXY_IPS=<comma-separated proxy IPs>`
+- `AUTH_TRUSTED_PROXY_IPS=<reverse-proxy-ip-list>`
 
-## Database Driver
-- `DB_DRIVER=sqlite|postgres`
-- Runtime selection and DB switch metadata are stored in `/data/runtime-db.json`.
+Optional auth:
+- `GOOGLE_CLIENT_ID` (enables Google sign-in)
 
-## Verification
+## Email (Magic Link) Setup
+Configure SMTP from Admin Service Settings in app UI:
+- host, port, username, password
+- from address and from name
+
+Notes:
+- SMTP password is encrypted at rest.
+- Test email endpoint is admin-only.
+
+## Language Packs
+- Default EN + RU published packs are auto-seeded on first run.
+- If OpenAI key is configured for an admin user, draft pack generation is available.
+- Only published packs are playable.
+
+## Health + Diagnostics
 ```bash
 ./scripts/healthcheck.sh
 curl -fsS http://127.0.0.1:3000/api/health
 ```
-
-## Migrations
-```bash
-./scripts/db_migrate.sh
-./scripts/migrate_status.sh
-```
-
-## Backups
-```bash
-./scripts/backup_sqlite.sh
-./scripts/backup_postgres.sh
-```
-
-## Diagnostics
-Admin endpoints:
+Admin diagnostics:
 - `/api/diagnostics/rbac`
 - `/api/diagnostics/db`
 - `/api/diagnostics/config`
 - `/api/diagnostics/encryption`
 - `/api/diagnostics/startup`
 
-## Notes
-- Admin authorization is always enforced on the backend.
-- Use Postgres for multi-user production scale.
-- Keep `.env`, backups, and runtime config files private.
+## Migrations
+```bash
+./scripts/db_migrate.sh
+./scripts/migrate_status.sh
+```

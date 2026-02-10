@@ -1,4 +1,5 @@
 const { Roles, normalizeRole, compareRoles } = require("../domain/rbac");
+const { hashToken } = require("./auth");
 
 function normalizeIp(ip) {
   if (!ip) return "";
@@ -39,18 +40,26 @@ function inferRoleFromGroups(groups, options) {
   return Roles.USER;
 }
 
-async function resolveActor({ req, repo, options, getAdminPin }) {
-  const pin = req.headers["x-admin-pin"];
-  if (pin && String(pin) === String(getAdminPin())) {
-    return {
-      isAuthenticated: true,
-      authType: "admin_pin",
-      externalSubject: "local-pin-admin",
-      email: null,
-      displayName: "Local Admin",
-      role: Roles.OWNER,
-      groups: []
-    };
+async function resolveActor({ req, repo, options }) {
+  const authHeader = String(req.headers.authorization || "");
+  if (authHeader.startsWith("Bearer ")) {
+    const rawToken = authHeader.slice("Bearer ".length).trim();
+    if (rawToken) {
+      const session = await repo.getAuthSessionByTokenHash(hashToken(rawToken));
+      if (session) {
+        await repo.touchAuthSession(hashToken(rawToken));
+        return {
+          id: session.userid || session.useridreal || session.id,
+          isAuthenticated: true,
+          authType: "session",
+          externalSubject: session.externalsubject || session.externalSubject || session.email,
+          email: session.email,
+          displayName: session.displayname || session.displayName || session.email?.split("@")[0] || "User",
+          role: normalizeRole(session.role),
+          groups: []
+        };
+      }
+    }
   }
 
   if (!canTrustProxyHeaders(req, options)) {

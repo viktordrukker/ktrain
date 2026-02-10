@@ -19,7 +19,7 @@ Policy source of truth: `server/src/domain/rbac.js`.
 - Header trust guard:
   - `AUTH_TRUST_PROXY=true`
   - `AUTH_TRUSTED_PROXY_IPS` allowlist (recommended) or private-network fallback.
-- Local fallback: `x-admin-pin` for break-glass operations.
+- Session auth mode: Google token exchange or email magic link, then bearer token.
 
 ## Owner Bootstrap
 - Preferred: `OWNER_EMAIL` environment variable.
@@ -39,7 +39,6 @@ Policy source of truth: `server/src/domain/rbac.js`.
 - Audit logging for privileged actions.
 
 ## Operational Security Checklist
-- [ ] Set non-default `ADMIN_PIN`.
 - [ ] Set `OWNER_EMAIL`.
 - [ ] Set `KTRAIN_MASTER_KEY`.
 - [ ] Set `AUTH_TRUSTED_PROXY_IPS` to your reverse proxy IP(s).

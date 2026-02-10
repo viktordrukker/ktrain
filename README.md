@@ -1,59 +1,26 @@
 # K-Train
 
-Toddler keyboard trainer webapp (React + Node) with Docker-first deployment, production hardening, and dual database backend support:
-- `sqlite` (default, file-based)
-- `postgres` (optional)
+Toddler keyboard trainer web app (React + Node) with Docker-first deployment and production-safe backend controls.
 
-## Highlights
-- Learning and contest modes with leaderboard persistence
-- Policy-based RBAC (`OWNER`, `ADMIN`, `MODERATOR`, `USER`, `GUEST`)
-- Reverse-proxy identity integration with trusted proxy checks
-- Encrypted per-user secret storage (AES-256-GCM)
-- DB adapter model with SQLite and Postgres
-- Deterministic migrations with status and rollback support
-- Runtime config store in DB (`app_config`) with safe-key controls
-- Diagnostics endpoints for no-test confidence (`/api/diagnostics/*`)
-- Docker + GitHub Actions CI/CD + Hetzner deploy script
+## Iteration 2 Highlights
+- Multi-language packs with publish workflow (`DRAFT` -> `PUBLISHED`)
+- Built-in EN + RU packs seeded automatically
+- Auth foundation: Google sign-in + email magic links
+- Admin PIN removed; RBAC-only admin authorization
+- Global leaderboard for authorized players
+- Guest-safe server defaults and separate guest behavior
+- Admin service settings (DB + SMTP)
+- Live "users playing now" dashboards via heartbeat sessions
 
-## Quick Start (Docker)
+## Quick Start
 ```bash
 cp .env.example .env
 docker compose up --build -d
+./scripts/bootstrap.sh
 ```
-Open `http://localhost:3000`.
 
-## DB Backend Selection
-- Default: `DB_DRIVER=sqlite`
-- Optional: `DB_DRIVER=postgres` with `ktrain_postgres` container
-- Runtime active driver is read from `DB_RUNTIME_CONFIG_PATH` (default `/data/runtime-db.json`)
-
-Admin-only endpoints:
-- `GET /api/admin/db/status`
-- `POST /api/admin/db/switch`
-- `POST /api/admin/db/rollback`
-
-## Authentication Model
-- Public: gameplay routes
-- Admin: `/admin*`, `/settings-admin*`, `/api/admin/*`, `/api/settings`
-- Admin authorization uses reverse-proxy identity headers (`x-forwarded-user`, `x-forwarded-groups`) and `AUTH_ADMIN_GROUPS`
-- Local fallback: `x-admin-pin` header
-
-## Core Scripts
-- `scripts/db_migrate.sh`
-- `scripts/migrate_status.sh`
-- `scripts/migrate_rollback.sh`
-- `scripts/bootstrap.sh`
-- `scripts/healthcheck.sh`
-- `scripts/switch_db.sh`
-- `scripts/backup_sqlite.sh`
-- `scripts/restore_sqlite.sh`
-- `scripts/backup_postgres.sh`
-- `scripts/restore_postgres.sh`
-- `scripts/deploy_remote.sh`
-
-## Docs
-- `INSTALL.md`: install + runtime troubleshooting
-- `DEPLOY.md`: CI/CD and Hetzner deployment flow
-- `ADMIN.md`: admin auth, DB switching, rollback, maintenance
-- `SECURITY.md`: RBAC, auth trust model, encryption and OWASP controls
-- `RUNBOOK.md`: incident, backup/restore, diagnostics, rollback
+## Core Docs
+- `INSTALL.md`
+- `ADMIN.md`
+- `SECURITY.md`
+- `RUNBOOK.md`

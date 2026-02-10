@@ -12,17 +12,17 @@ if [[ "$TARGET" != "sqlite" && "$TARGET" != "postgres" ]]; then
 fi
 
 API_BASE="${KTRAIN_API_BASE:-http://127.0.0.1:3000}"
-ADMIN_PIN="${ADMIN_PIN:-}"
+ADMIN_BEARER_TOKEN="${ADMIN_BEARER_TOKEN:-}"
 
-if [[ -z "$ADMIN_PIN" ]]; then
-  echo "ADMIN_PIN env var is required"
+if [[ -z "$ADMIN_BEARER_TOKEN" ]]; then
+  echo "ADMIN_BEARER_TOKEN env var is required"
   exit 1
 fi
 
 echo "Requesting DB switch to $TARGET"
 curl -fsS -X POST "$API_BASE/api/admin/db/switch" \
   -H "content-type: application/json" \
-  -H "x-admin-pin: $ADMIN_PIN" \
+  -H "Authorization: Bearer $ADMIN_BEARER_TOKEN" \
   -d "{\"target\":\"$TARGET\",\"mode\":\"copy-then-switch\",\"verify\":true}" >/tmp/ktrain-switch-result.json
 
 cat /tmp/ktrain-switch-result.json

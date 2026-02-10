@@ -86,9 +86,9 @@ class SqliteAdapter {
   async insertLeaderboard(payload) {
     this.db.prepare(`
       INSERT INTO leaderboard
-      (playerName, createdAt, contestType, level, contentMode, duration, taskTarget, score, accuracy, cpm, mistakes, tasksCompleted, timeSeconds, maxStreak)
+      (playerName, createdAt, contestType, level, contentMode, duration, taskTarget, score, accuracy, cpm, mistakes, tasksCompleted, timeSeconds, maxStreak, userId, isGuest, language, displayName, avatarUrl)
       VALUES
-      (@playerName, @createdAt, @contestType, @level, @contentMode, @duration, @taskTarget, @score, @accuracy, @cpm, @mistakes, @tasksCompleted, @timeSeconds, @maxStreak)
+      (@playerName, @createdAt, @contestType, @level, @contentMode, @duration, @taskTarget, @score, @accuracy, @cpm, @mistakes, @tasksCompleted, @timeSeconds, @maxStreak, @userId, @isGuest, @language, @displayName, @avatarUrl)
     `).run(payload);
   }
 
@@ -100,6 +100,8 @@ class SqliteAdapter {
     if (filters.contentMode) { where += " AND contentMode = ?"; params.push(filters.contentMode); }
     if (filters.duration && filters.contestType === "time") { where += " AND duration = ?"; params.push(Number(filters.duration)); }
     if (filters.taskTarget && filters.contestType === "tasks") { where += " AND taskTarget = ?"; params.push(Number(filters.taskTarget)); }
+    if (filters.onlyAuthorized) { where += " AND isGuest = 0"; }
+    if (filters.language) { where += " AND language = ?"; params.push(filters.language); }
     return this.db.prepare(`SELECT * FROM leaderboard ${where} ORDER BY score DESC, accuracy DESC LIMIT 20`).all(...params);
   }
 
@@ -143,6 +145,10 @@ class SqliteAdapter {
     return this.db.prepare("SELECT * FROM users WHERE lower(email) = lower(?) LIMIT 1").get(email) || null;
   }
 
+  async findUserById(id) {
+    return this.db.prepare("SELECT * FROM users WHERE id = ? LIMIT 1").get(id) || null;
+  }
+
   async getOwnerUser() {
     return this.db.prepare("SELECT * FROM users WHERE role = 'OWNER' ORDER BY id ASC LIMIT 1").get() || null;
   }
@@ -170,6 +176,14 @@ class SqliteAdapter {
     this.db.prepare("UPDATE users SET lastLoginAt = ?, updatedAt = ? WHERE id = ?").run(nowIso(), nowIso(), id);
   }
 
+  async updateUserProfile(id, { displayName, avatarUrl }) {
+    this.db.prepare("UPDATE users SET displayName = COALESCE(?, displayName), updatedAt = ? WHERE id = ?").run(displayName || null, nowIso(), id);
+    if (avatarUrl !== undefined) {
+      await this.setConfig("user.avatar", "user", String(id), { avatarUrl: avatarUrl || "" }, `user:${id}`);
+    }
+    return this.findUserById(id);
+  }
+
   async getUserSecret(userId, secretKey) {
     return this.db
       .prepare("SELECT * FROM user_secrets WHERE userId = ? AND secretKey = ? LIMIT 1")
@@ -187,6 +201,23 @@ class SqliteAdapter {
       authTag = excluded.authTag,
       updatedAt = excluded.updatedAt
     `).run(userId, secretKey, encrypted.ciphertext, encrypted.iv, encrypted.authTag, now, now);
+  }
+
+  async setSystemSecret(secretKey, encrypted, updatedBy) {
+    this.db.prepare(`
+      INSERT INTO system_secrets (secretKey, ciphertext, iv, authTag, updatedAt, updatedBy)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(secretKey) DO UPDATE SET
+      ciphertext = excluded.ciphertext,
+      iv = excluded.iv,
+      authTag = excluded.authTag,
+      updatedAt = excluded.updatedAt,
+      updatedBy = excluded.updatedBy
+    `).run(secretKey, encrypted.ciphertext, encrypted.iv, encrypted.authTag, nowIso(), updatedBy || null);
+  }
+
+  async getSystemSecret(secretKey) {
+    return this.db.prepare("SELECT * FROM system_secrets WHERE secretKey = ? LIMIT 1").get(secretKey) || null;
   }
 
   async setConfig(key, scope, scopeId, valueJson, updatedBy) {
@@ -242,6 +273,155 @@ class SqliteAdapter {
       .map((row) => ({ ...row, metadata: row.metadata ? JSON.parse(row.metadata) : null }));
   }
 
+  async createMagicLink({ email, tokenHash, expiresAt, requestedIp }) {
+    this.db.prepare(`
+      INSERT INTO auth_magic_links (email, tokenHash, expiresAt, createdAt, requestedIp)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(email, tokenHash, expiresAt, nowIso(), requestedIp || null);
+  }
+
+  async consumeMagicLink(tokenHash) {
+    const row = this.db.prepare("SELECT * FROM auth_magic_links WHERE tokenHash = ? LIMIT 1").get(tokenHash);
+    if (!row || row.usedAt) return null;
+    if (Date.parse(row.expiresAt) < Date.now()) return null;
+    this.db.prepare("UPDATE auth_magic_links SET usedAt = ? WHERE id = ?").run(nowIso(), row.id);
+    return row;
+  }
+
+  async createAuthSession({ userId, tokenHash, expiresAt, userAgent, ip }) {
+    const now = nowIso();
+    this.db.prepare(`
+      INSERT INTO auth_sessions (userId, tokenHash, createdAt, expiresAt, lastSeenAt, userAgent, ip)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(userId, tokenHash, now, expiresAt, now, userAgent || null, ip || null);
+  }
+
+  async getAuthSessionByTokenHash(tokenHash) {
+    const row = this.db.prepare(`
+      SELECT s.*, u.id as userIdReal, u.externalSubject, u.email, u.displayName, u.role, u.isActive
+      FROM auth_sessions s
+      JOIN users u ON u.id = s.userId
+      WHERE s.tokenHash = ? AND s.revokedAt IS NULL
+      LIMIT 1
+    `).get(tokenHash);
+    if (!row) return null;
+    if (Date.parse(row.expiresAt) < Date.now()) return null;
+    return row;
+  }
+
+  async touchAuthSession(tokenHash) {
+    this.db.prepare("UPDATE auth_sessions SET lastSeenAt = ? WHERE tokenHash = ?").run(nowIso(), tokenHash);
+  }
+
+  async revokeAuthSession(tokenHash) {
+    this.db.prepare("UPDATE auth_sessions SET revokedAt = ? WHERE tokenHash = ?").run(nowIso(), tokenHash);
+  }
+
+  async cleanupAuthSessions() {
+    this.db.prepare("DELETE FROM auth_sessions WHERE revokedAt IS NOT NULL OR expiresAt < ?").run(nowIso());
+  }
+
+  async createLanguagePack({ language, type, topic, status, createdBy }) {
+    const now = nowIso();
+    const result = this.db.prepare(`
+      INSERT INTO packs (language, type, topic, status, createdBy, createdAt, updatedAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(language, type, topic || null, status || "DRAFT", createdBy || null, now, now);
+    return result.lastInsertRowid;
+  }
+
+  async replaceLanguagePackItems(packId, items = []) {
+    const tx = this.db.transaction(() => {
+      this.db.prepare("DELETE FROM pack_items WHERE packId = ?").run(packId);
+      const stmt = this.db.prepare("INSERT INTO pack_items (packId, text, difficulty, metadataJson) VALUES (?, ?, ?, ?)");
+      for (const item of items) {
+        stmt.run(packId, item.text, item.difficulty || null, item.metadataJson ? JSON.stringify(item.metadataJson) : null);
+      }
+      this.db.prepare("UPDATE packs SET updatedAt = ? WHERE id = ?").run(nowIso(), packId);
+    });
+    tx();
+  }
+
+  async updateLanguagePack(packId, { topic, status }) {
+    this.db.prepare("UPDATE packs SET topic = COALESCE(?, topic), status = COALESCE(?, status), updatedAt = ? WHERE id = ?")
+      .run(topic || null, status || null, nowIso(), packId);
+  }
+
+  async listLanguagePacks(filters = {}) {
+    const params = [];
+    let where = "WHERE 1=1";
+    if (filters.language) { where += " AND language = ?"; params.push(filters.language); }
+    if (filters.type) { where += " AND type = ?"; params.push(filters.type); }
+    if (filters.status) { where += " AND status = ?"; params.push(filters.status); }
+    return this.db.prepare(`SELECT * FROM packs ${where} ORDER BY updatedAt DESC`).all(...params);
+  }
+
+  async getLanguagePackById(id) {
+    return this.db.prepare("SELECT * FROM packs WHERE id = ? LIMIT 1").get(id) || null;
+  }
+
+  async getLanguagePackItems(packId) {
+    return this.db.prepare("SELECT * FROM pack_items WHERE packId = ? ORDER BY id ASC").all(packId)
+      .map((row) => ({ ...row, metadataJson: row.metadataJson ? JSON.parse(row.metadataJson) : null }));
+  }
+
+  async listPublishedLanguagesByType(type) {
+    return this.db.prepare("SELECT DISTINCT language FROM packs WHERE type = ? AND status = 'PUBLISHED' ORDER BY language ASC").all(type)
+      .map((row) => row.language);
+  }
+
+  async getPublishedPackItems({ language, type }) {
+    return this.db.prepare(`
+      SELECT i.* FROM pack_items i
+      JOIN packs p ON p.id = i.packId
+      WHERE p.language = ? AND p.type = ? AND p.status = 'PUBLISHED'
+      ORDER BY i.id ASC
+    `).all(language, type).map((row) => ({ ...row, metadataJson: row.metadataJson ? JSON.parse(row.metadataJson) : null }));
+  }
+
+  async upsertActiveSession({ sessionId, userId, mode, isAuthorized }) {
+    const now = nowIso();
+    this.db.prepare(`
+      INSERT INTO active_sessions (sessionId, userId, startedAt, lastSeenAt, mode, isAuthorized)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(sessionId) DO UPDATE SET
+      userId = excluded.userId,
+      lastSeenAt = excluded.lastSeenAt,
+      mode = excluded.mode,
+      isAuthorized = excluded.isAuthorized
+    `).run(sessionId, userId || null, now, now, mode, isAuthorized ? 1 : 0);
+  }
+
+  async cleanupActiveSessions(maxAgeSeconds = 120) {
+    const threshold = new Date(Date.now() - maxAgeSeconds * 1000).toISOString();
+    this.db.prepare("DELETE FROM active_sessions WHERE lastSeenAt < ?").run(threshold);
+  }
+
+  async getActiveSessionStats(maxAgeSeconds = 120) {
+    const threshold = new Date(Date.now() - maxAgeSeconds * 1000).toISOString();
+    const row = this.db.prepare(`
+      SELECT
+        COUNT(*) as total,
+        SUM(CASE WHEN isAuthorized = 1 THEN 1 ELSE 0 END) as authorized,
+        SUM(CASE WHEN isAuthorized = 0 THEN 1 ELSE 0 END) as guests
+      FROM active_sessions
+      WHERE lastSeenAt >= ?
+    `).get(threshold);
+    const modes = this.db.prepare(`
+      SELECT mode, COUNT(*) as count
+      FROM active_sessions
+      WHERE lastSeenAt >= ?
+      GROUP BY mode
+      ORDER BY count DESC
+    `).all(threshold);
+    return {
+      total: Number(row?.total || 0),
+      authorized: Number(row?.authorized || 0),
+      guests: Number(row?.guests || 0),
+      modes
+    };
+  }
+
   async reset(scope) {
     if (scope === "all") {
       this.db.prepare("DELETE FROM leaderboard").run();
@@ -267,7 +447,10 @@ class SqliteAdapter {
       vocab_packs: this.db.prepare("SELECT * FROM vocab_packs ORDER BY id ASC").all(),
       users: this.db.prepare("SELECT * FROM users ORDER BY id ASC").all(),
       user_secrets: this.db.prepare("SELECT * FROM user_secrets ORDER BY id ASC").all(),
-      app_config: this.db.prepare("SELECT * FROM app_config ORDER BY id ASC").all()
+      app_config: this.db.prepare("SELECT * FROM app_config ORDER BY id ASC").all(),
+      system_secrets: this.db.prepare("SELECT * FROM system_secrets ORDER BY secretKey ASC").all(),
+      packs: this.db.prepare("SELECT * FROM packs ORDER BY id ASC").all(),
+      pack_items: this.db.prepare("SELECT * FROM pack_items ORDER BY id ASC").all()
     };
   }
 
@@ -279,6 +462,9 @@ class SqliteAdapter {
       this.db.prepare("DELETE FROM user_secrets").run();
       this.db.prepare("DELETE FROM users").run();
       this.db.prepare("DELETE FROM app_config").run();
+      this.db.prepare("DELETE FROM system_secrets").run();
+      this.db.prepare("DELETE FROM pack_items").run();
+      this.db.prepare("DELETE FROM packs").run();
 
       for (const row of dump.settings || []) {
         this.db.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run(row.key, row.value);
@@ -303,8 +489,20 @@ class SqliteAdapter {
         this.db.prepare("INSERT INTO app_config (id, key, scope, scopeId, valueJson, updatedAt, updatedBy) VALUES (?, ?, ?, ?, ?, ?, ?)")
           .run(row.id, row.key, row.scope, row.scopeId || row.scopeid, row.valueJson || row.valuejson, row.updatedAt || row.updatedat, row.updatedBy || row.updatedby || null);
       }
+      for (const row of dump.system_secrets || []) {
+        this.db.prepare("INSERT INTO system_secrets (secretKey, ciphertext, iv, authTag, updatedAt, updatedBy) VALUES (?, ?, ?, ?, ?, ?)")
+          .run(row.secretKey || row.secretkey, row.ciphertext, row.iv, row.authTag || row.authtag, row.updatedAt || row.updatedat, row.updatedBy || row.updatedby || null);
+      }
+      for (const row of dump.packs || []) {
+        this.db.prepare("INSERT INTO packs (id, language, type, topic, status, createdBy, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+          .run(row.id, row.language, row.type, row.topic || null, row.status, row.createdBy || row.createdby || null, row.createdAt || row.createdat, row.updatedAt || row.updatedat);
+      }
+      for (const row of dump.pack_items || []) {
+        this.db.prepare("INSERT INTO pack_items (id, packId, text, difficulty, metadataJson) VALUES (?, ?, ?, ?, ?)")
+          .run(row.id, row.packId || row.packid, row.text, row.difficulty || null, row.metadataJson || row.metadatajson || null);
+      }
 
-      this.db.prepare("DELETE FROM sqlite_sequence WHERE name IN ('leaderboard', 'vocab_packs', 'users', 'user_secrets', 'app_config', 'audit_log')").run();
+      this.db.prepare("DELETE FROM sqlite_sequence WHERE name IN ('leaderboard', 'vocab_packs', 'users', 'user_secrets', 'app_config', 'audit_log', 'packs', 'pack_items', 'auth_magic_links', 'auth_sessions')").run();
     });
     tx();
   }
@@ -315,7 +513,8 @@ class SqliteAdapter {
     const vocab_packs = this.db.prepare("SELECT COUNT(*) as c FROM vocab_packs").get().c;
     const users = this.db.prepare("SELECT COUNT(*) as c FROM users").get().c;
     const app_config = this.db.prepare("SELECT COUNT(*) as c FROM app_config").get().c;
-    return { settings, leaderboard, vocab_packs, users, app_config };
+    const packs = this.db.prepare("SELECT COUNT(*) as c FROM packs").get().c;
+    return { settings, leaderboard, vocab_packs, users, app_config, packs };
   }
 }
 
