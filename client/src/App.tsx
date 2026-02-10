@@ -90,6 +90,24 @@ type DbAdminStatus = {
   runtime?: any;
 };
 
+type CrashEvent = {
+  id: number;
+  occurredAt: string;
+  appVersion?: string;
+  appBuild?: string;
+  appCommit?: string;
+  appMode?: string;
+  crashType: string;
+  startupPhase?: string;
+  errorName?: string;
+  errorMessage?: string;
+  stackTrace?: string;
+  resolved?: number;
+  acknowledgedAt?: string | null;
+  acknowledgedBy?: string | null;
+  metadataJson?: any;
+};
+
 type Screen = "home" | "game" | "results" | "leaderboard" | "settings";
 
 type GameSettings = {
@@ -170,6 +188,17 @@ type AppSettings = {
   differentiateZero: boolean;
   zeroStyle: "dot" | "slashed" | "dotted";
   protectFunctionKeys: boolean;
+};
+
+type PublicVersion = {
+  version: string;
+  build: string;
+  commit: string;
+  buildTime?: string | null;
+  githubUrl?: string;
+  website?: string;
+  contact?: string;
+  appMode?: string;
 };
 
 const SOUND_PREF_KEY = "ktrain_sound_enabled";
@@ -350,19 +379,12 @@ const agePresets: Record<string, Partial<AppSettings> & { maxAllowedLevel: numbe
     maxAllowedLevel: 5
   }
 };
-let authToken = "";
-
-function setAuthToken(token: string) {
-  authToken = token || "";
-}
-
 function withAuthHeaders(base: Record<string, string> = {}) {
-  if (!authToken) return base;
-  return { ...base, Authorization: `Bearer ${authToken}` };
+  return base;
 }
 
 const API = {
-  async generateTasks(level: number, count: number, contentMode: ContentMode, language = "en"): Promise<{ tasks: Task[]; language: string }> {
+  async generateTasks(level: number, count: number, contentMode: ContentMode, language = "en"): Promise<{ tasks: Task[]; language: string; fallbackNotice?: string | null }> {
     const res = await fetch("/api/tasks/generate", {
       method: "POST",
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
@@ -380,16 +402,29 @@ const API = {
     if (!res.ok) throw new Error("Failed to save result");
     return res.json();
   },
-  async getLeaderboard(filters: any): Promise<LeaderboardEntry[]> {
+  async getLeaderboard(filters: any): Promise<{ entries: LeaderboardEntry[]; myRank: number | null }> {
     const params = new URLSearchParams(filters).toString();
     const res = await fetch(`/api/leaderboard?${params}`, { headers: withAuthHeaders() });
     if (!res.ok) throw new Error("Failed to load leaderboard");
     const data = await res.json();
-    return data.entries as LeaderboardEntry[];
+    return {
+      entries: data.entries as LeaderboardEntry[],
+      myRank: typeof data.myRank === "number" ? data.myRank : null
+    };
   },
   async getPublicSession() {
     const res = await fetch("/api/public/session", { headers: withAuthHeaders() });
     if (!res.ok) throw new Error("Failed to load session");
+    return res.json();
+  },
+  async getHealth() {
+    const res = await fetch("/api/health");
+    if (!res.ok) throw new Error("Failed to load health");
+    return res.json();
+  },
+  async getPublicVersion() {
+    const res = await fetch("/api/public/version");
+    if (!res.ok) throw new Error("Failed to load public version");
     return res.json();
   },
   async getAuthProviders() {
@@ -400,32 +435,55 @@ const API = {
   async authWithGoogle(credential: string) {
     const res = await fetch("/api/auth/google", {
       method: "POST",
+      credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ credential })
     });
     if (!res.ok) throw new Error("Google sign-in failed");
     return res.json();
   },
-  async requestMagicLink(email: string) {
-    const res = await fetch("/api/auth/magic-link/request", {
+  async registerWithPassword(payload: { email: string; displayName: string; password: string }) {
+    const res = await fetch("/api/auth/register", {
       method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error("Registration failed");
+    return res.json();
+  },
+  async loginWithPassword(payload: { email: string; password: string }) {
+    const res = await fetch("/api/auth/login", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error("Invalid email or password");
+    return res.json();
+  },
+  async requestPasswordReset(email: string) {
+    const res = await fetch("/api/auth/password-reset/request", {
+      method: "POST",
+      credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email })
     });
-    if (!res.ok) throw new Error("Magic link request failed");
+    if (!res.ok) throw new Error("Password reset request failed");
     return res.json();
   },
-  async verifyMagicLink(token: string) {
-    const res = await fetch("/api/auth/magic-link/verify", {
+  async confirmPasswordReset(payload: { token: string; password: string }) {
+    const res = await fetch("/api/auth/password-reset/confirm", {
       method: "POST",
+      credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token })
+      body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error("Magic link verification failed");
+    if (!res.ok) throw new Error("Password reset failed");
     return res.json();
   },
   async logout() {
-    const res = await fetch("/api/auth/logout", { method: "POST", headers: withAuthHeaders() });
+    const res = await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin", headers: withAuthHeaders() });
     if (!res.ok) throw new Error("Logout failed");
     return res.json();
   },
@@ -610,6 +668,23 @@ const API = {
       body: JSON.stringify({ to })
     });
     if (!res.ok) throw new Error("Failed to send test email");
+    return res.json();
+  },
+  async listCrashEvents(limit = 50, unresolvedOnly = false) {
+    const res = await fetch(`/api/admin/crashes?limit=${limit}&unresolvedOnly=${unresolvedOnly ? "true" : "false"}`, {
+      headers: withAuthHeaders()
+    });
+    if (!res.ok) throw new Error("Failed to load crashes");
+    return res.json();
+  },
+  async getCrashEvent(id: number) {
+    const res = await fetch(`/api/admin/crashes/${id}`, { headers: withAuthHeaders() });
+    if (!res.ok) throw new Error("Failed to load crash details");
+    return res.json();
+  },
+  async acknowledgeCrashEvent(id: number) {
+    const res = await fetch(`/api/admin/crashes/${id}/ack`, { method: "POST", headers: withAuthHeaders() });
+    if (!res.ok) throw new Error("Failed to acknowledge crash");
     return res.json();
   },
   async getSettings(_pin?: string): Promise<AppSettings> {
@@ -865,11 +940,12 @@ function buildParticles(count: number, seed: number, variation: Variation) {
   });
 }
 function App() {
-  const AUTH_TOKEN_KEY = "ktrain_auth_token_v2";
   const PLAY_SESSION_KEY = "ktrain_play_session_id_v2";
   const [screen, setScreen] = useState<Screen>("home");
   const [settings, setSettings] = useState<GameSettings>(defaultSettings);
   const [appSettings, setAppSettings] = useState<AppSettings>(defaultAppSettings);
+  const [savedAppSettings, setSavedAppSettings] = useState<AppSettings>(defaultAppSettings);
+  const [lastSettingsAppliedAt, setLastSettingsAppliedAt] = useState<string>("");
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -909,10 +985,17 @@ function App() {
   const [lastFunctionKeyTime, setLastFunctionKeyTime] = useState(0);
   const [showZeroHint, setShowZeroHint] = useState(false);
   const [showStopModal, setShowStopModal] = useState(false);
+  const [showUnsavedSettingsModal, setShowUnsavedSettingsModal] = useState(false);
+  const [pendingScreen, setPendingScreen] = useState<Screen | null>(null);
   const [savePartial, setSavePartial] = useState(false);
   const [levelConverted, setLevelConverted] = useState(false);
   const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authDisplayName, setAuthDisplayName] = useState("");
+  const [authMode, setAuthMode] = useState<"login" | "register" | "forgot">("login");
   const [authMessage, setAuthMessage] = useState("");
+  const [passwordResetToken, setPasswordResetToken] = useState("");
+  const [passwordResetPassword, setPasswordResetPassword] = useState("");
   const [sessionUser, setSessionUser] = useState<any>(null);
   const [availableLanguages, setAvailableLanguages] = useState<string[]>(["en", "ru"]);
   const [liveStats, setLiveStats] = useState<{ total: number; authorized: number; guests: number; modes?: Array<{ mode: string; count: number }> }>({
@@ -923,7 +1006,11 @@ function App() {
   });
   const [playSessionId, setPlaySessionId] = useState<string>("");
   const [googleClientId, setGoogleClientId] = useState("");
+  const [passwordResetEnabled, setPasswordResetEnabled] = useState(false);
   const [languagePackModalOpen, setLanguagePackModalOpen] = useState(false);
+  const [myRank, setMyRank] = useState<number | null>(null);
+  const [appMode, setAppMode] = useState<string>("info");
+  const [publicVersion, setPublicVersion] = useState<PublicVersion | null>(null);
   const isAdminUser = Boolean(sessionUser && ["ADMIN", "OWNER"].includes(String(sessionUser.role || "").toUpperCase()));
   const baseTheme = computeTheme(appSettings);
   const contrastResult = useMemo(
@@ -988,6 +1075,10 @@ function App() {
     ? "*".repeat(Math.min(5, Math.max(1, Math.floor(gameStats.streak / 3) + 1)))
     : "0";
   const allowedLevels = buildAllowedLevels(appSettings.maxAllowedLevel || 5);
+  const hasUnsavedSettings = useMemo(
+    () => JSON.stringify(appSettings) !== JSON.stringify(savedAppSettings),
+    [appSettings, savedAppSettings]
+  );
   const themeVars = {
     "--bg": theme.background,
     "--bg-alt": theme.backgroundAlt,
@@ -1019,6 +1110,35 @@ function App() {
     });
   }, [themeVars]);
 
+  const applySettings = useCallback(async () => {
+    if (!adminPin) return false;
+    try {
+      const saved = await API.saveSettings(appSettings, adminPin);
+      setSavedAppSettings(saved);
+      setAppSettings(saved);
+      setLastSettingsAppliedAt(new Date().toISOString());
+      setStatusMessage("Settings applied.");
+      return true;
+    } catch {
+      setStatusMessage("Failed to apply settings.");
+      return false;
+    }
+  }, [adminPin, appSettings]);
+
+  const resetSettingsDraft = useCallback(() => {
+    setAppSettings(savedAppSettings);
+    setStatusMessage("Unsaved changes discarded.");
+  }, [savedAppSettings]);
+
+  const navigateFromSettings = useCallback((next: Screen) => {
+    if (screen === "settings" && hasUnsavedSettings) {
+      setPendingScreen(next);
+      setShowUnsavedSettingsModal(true);
+      return;
+    }
+    setScreen(next);
+  }, [screen, hasUnsavedSettings]);
+
   const handleBrandClick = () => {
     if (screen === "game") {
       setSavePartial(false);
@@ -1026,13 +1146,11 @@ function App() {
       return;
     }
     if (screen !== "home") {
-      setScreen("home");
+      navigateFromSettings("home");
     }
   };
 
   useEffect(() => {
-    const token = localStorage.getItem(AUTH_TOKEN_KEY) || "";
-    if (token) setAuthToken(token);
     API.getPublicSession()
       .then((session) => {
         setSessionUser(session.actor?.isAuthenticated ? session.actor : null);
@@ -1040,17 +1158,11 @@ function App() {
       .catch(() => setSessionUser(null));
 
     const params = new URLSearchParams(window.location.search);
-    const magicToken = params.get("magic_token");
-    if (magicToken) {
-      API.verifyMagicLink(magicToken)
-        .then((result) => {
-          setAuthToken(result.token);
-          localStorage.setItem(AUTH_TOKEN_KEY, result.token);
-          setSessionUser(result.user);
-          setAuthMessage("Signed in successfully.");
-          window.history.replaceState({}, "", window.location.pathname);
-        })
-        .catch(() => setAuthMessage("Magic link is invalid or expired."));
+    const resetToken = params.get("reset_token");
+    if (resetToken) {
+      setPasswordResetToken(resetToken);
+      setAuthMode("forgot");
+      window.history.replaceState({}, "", window.location.pathname);
     }
   }, []);
 
@@ -1059,14 +1171,39 @@ function App() {
       .then((providers) => {
         const cid = providers?.google?.enabled ? providers.google.clientId || "" : "";
         setGoogleClientId(cid);
+        setPasswordResetEnabled(Boolean(providers?.password?.resetEnabled));
       })
-      .catch(() => setGoogleClientId(""));
+      .catch(() => {
+        setGoogleClientId("");
+        setPasswordResetEnabled(false);
+      });
   }, []);
 
   useEffect(() => {
-    if (sessionUser) setAdminPin("rbac");
+    API.getHealth()
+      .then((health) => setAppMode(String(health?.appMode || "info")))
+      .catch(() => setAppMode("info"));
+  }, []);
+
+  useEffect(() => {
+    API.getPublicVersion()
+      .then((data) => setPublicVersion({
+        version: String(data?.version || "0.0.0"),
+        build: String(data?.build || "0"),
+        commit: String(data?.commit || "unknown"),
+        buildTime: data?.buildTime || null,
+        githubUrl: data?.githubUrl,
+        website: data?.website,
+        contact: data?.contact,
+        appMode: data?.appMode
+      }))
+      .catch(() => setPublicVersion(null));
+  }, []);
+
+  useEffect(() => {
+    if (isAdminUser) setAdminPin("rbac");
     else setAdminPin("");
-  }, [sessionUser]);
+  }, [isAdminUser]);
 
   useEffect(() => {
     if (!googleClientId) return;
@@ -1125,22 +1262,32 @@ function App() {
           customTheme: { ...defaultAppSettings.customTheme, ...(loaded.customTheme || {}) },
           correctEffects: { ...defaultAppSettings.correctEffects, ...(loaded.correctEffects || {}) }
         });
+        setSavedAppSettings({
+          ...defaultAppSettings,
+          ...loaded,
+          maxAllowedLevel: maxAllowed,
+          allowedLevels: buildAllowedLevels(maxAllowed),
+          customTheme: { ...defaultAppSettings.customTheme, ...(loaded.customTheme || {}) },
+          correctEffects: { ...defaultAppSettings.correctEffects, ...(loaded.correctEffects || {}) }
+        });
+        setLastSettingsAppliedAt(new Date().toISOString());
         setSettingsLoaded(true);
       })
       .catch(() => setSettingsLoaded(true));
   }, [adminPin]);
 
   useEffect(() => {
-    if (screen !== "game") return;
-    if (settings.mode !== "contest") return;
-    if (!appSettings.warnOnExitContest) return;
     const handler = (event: BeforeUnloadEvent) => {
-      event.preventDefault();
-      event.returnValue = "";
+      const contestGuard = screen === "game" && settings.mode === "contest" && appSettings.warnOnExitContest;
+      const settingsGuard = screen === "settings" && hasUnsavedSettings;
+      if (contestGuard || settingsGuard) {
+        event.preventDefault();
+        event.returnValue = "";
+      }
     };
     window.addEventListener("beforeunload", handler);
     return () => window.removeEventListener("beforeunload", handler);
-  }, [screen, settings.mode, appSettings.warnOnExitContest]);
+  }, [screen, settings.mode, appSettings.warnOnExitContest, hasUnsavedSettings]);
 
   useEffect(() => {
     if (screen !== "game") return;
@@ -1188,15 +1335,6 @@ function App() {
     return () => window.clearTimeout(id);
   }, [functionKeyNotice]);
 
-  useEffect(() => {
-    if (!settingsLoaded) return;
-    if (!adminPin) return;
-    const id = window.setTimeout(() => {
-      API.saveSettings(appSettings, adminPin).catch(() => null);
-    }, 500);
-    return () => window.clearTimeout(id);
-  }, [appSettings, settingsLoaded, adminPin]);
-
   const resetSessionState = () => {
     setTasks([]);
     setCurrentIndex(0);
@@ -1226,6 +1364,12 @@ function App() {
   const startGame = async () => {
     setStatusMessage("");
     const generated = await API.generateTasks(settings.level, 40, settings.contentMode, settings.language);
+    if (generated.language !== settings.language) {
+      setSettings((prev) => ({ ...prev, language: generated.language || prev.language }));
+    }
+    if (generated.fallbackNotice) {
+      setStatusMessage(generated.fallbackNotice);
+    }
     setTasks(generated.tasks);
     setCurrentIndex(0);
     setBuffer("");
@@ -1296,6 +1440,9 @@ function App() {
 
   const loadMoreTasks = async () => {
     const generated = await API.generateTasks(settings.level, 40, settings.contentMode, settings.language);
+    if (generated.fallbackNotice) {
+      setStatusMessage(generated.fallbackNotice);
+    }
     setTasks((prev) => [...prev, ...generated.tasks]);
   };
 
@@ -1552,8 +1699,9 @@ function App() {
   const loadLeaderboard = async (filters: any) => {
     setStatusMessage("");
     try {
-      const entries = await API.getLeaderboard(filters);
-      setLeaderboard(entries);
+      const data = await API.getLeaderboard(filters);
+      setLeaderboard(data.entries);
+      setMyRank(data.myRank);
     } catch (err) {
       setStatusMessage("Could not load leaderboard.");
     }
@@ -1574,31 +1722,67 @@ function App() {
     } catch {
       // ignore best-effort logout
     }
-    setAuthToken("");
-    localStorage.removeItem(AUTH_TOKEN_KEY);
     setSessionUser(null);
     setAuthMessage("Signed out.");
   }
 
-  async function requestMagicLink() {
+  async function submitEmailAuth() {
     if (!authEmail) {
       setAuthMessage("Enter an email address first.");
       return;
     }
     try {
-      await API.requestMagicLink(authEmail);
-      setAuthMessage("Magic link sent. Check your inbox.");
+      if (authMode === "register") {
+        if (!authPassword) {
+          setAuthMessage("Enter a password.");
+          return;
+        }
+        const result = await API.registerWithPassword({
+          email: authEmail,
+          displayName: authDisplayName || authEmail.split("@")[0],
+          password: authPassword
+        });
+        setSessionUser(result.user || null);
+        setAuthMessage("Account created and signed in.");
+      } else if (authMode === "forgot") {
+        if (!passwordResetEnabled) {
+          setAuthMessage("Password reset email is unavailable. Ask an admin to configure SMTP.");
+          return;
+        }
+        if (passwordResetToken) {
+          if (!passwordResetPassword) {
+            setAuthMessage("Enter a new password.");
+            return;
+          }
+          await API.confirmPasswordReset({ token: passwordResetToken, password: passwordResetPassword });
+          const session = await API.getPublicSession();
+          setSessionUser(session.actor?.isAuthenticated ? session.actor : null);
+          setPasswordResetToken("");
+          setPasswordResetPassword("");
+          setAuthMode("login");
+          setAuthMessage("Password updated.");
+        } else {
+          const data = await API.requestPasswordReset(authEmail);
+          setAuthMessage(data?.message || "If the account exists, a reset email was sent.");
+        }
+      } else {
+        if (!authPassword) {
+          setAuthMessage("Enter your password.");
+          return;
+        }
+        const result = await API.loginWithPassword({ email: authEmail, password: authPassword });
+        setSessionUser(result.user || null);
+        setAuthMessage("Signed in.");
+      }
     } catch (err: any) {
-      setAuthMessage(err?.message || "Could not send magic link.");
+      setAuthMessage(err?.message || "Authentication failed.");
     }
   }
 
   async function handleGoogleCredential(credential: string) {
     try {
       const result = await API.authWithGoogle(credential);
-      setAuthToken(result.token);
-      localStorage.setItem(AUTH_TOKEN_KEY, result.token);
-      setSessionUser(result.user);
+      setSessionUser(result.user || null);
       setAuthMessage("Signed in with Google.");
     } catch (err: any) {
       setAuthMessage(err?.message || "Google sign-in failed.");
@@ -1718,6 +1902,53 @@ function App() {
           </Button>
         </Group>
       </Modal>
+      <Modal
+        opened={showUnsavedSettingsModal}
+        onClose={() => {
+          setShowUnsavedSettingsModal(false);
+          setPendingScreen(null);
+        }}
+        title="Unsaved changes"
+        centered
+      >
+        <Text size="sm">You have unsaved settings changes.</Text>
+        <Group justify="flex-end" mt="md">
+          <Button
+            variant="light"
+            onClick={() => {
+              setShowUnsavedSettingsModal(false);
+              setPendingScreen(null);
+            }}
+          >
+            Cancel
+          </Button>
+          <Button
+            color="red"
+            variant="light"
+            onClick={() => {
+              resetSettingsDraft();
+              const next = pendingScreen;
+              setShowUnsavedSettingsModal(false);
+              setPendingScreen(null);
+              if (next) setScreen(next);
+            }}
+          >
+            Discard
+          </Button>
+          <Button
+            onClick={async () => {
+              const ok = await applySettings();
+              if (!ok) return;
+              const next = pendingScreen;
+              setShowUnsavedSettingsModal(false);
+              setPendingScreen(null);
+              if (next) setScreen(next);
+            }}
+          >
+            Apply
+          </Button>
+        </Group>
+      </Modal>
       <header className="topbar">
         <UnstyledButton className="brand" onClick={handleBrandClick} aria-label="Go to main menu">K-TRAIN</UnstyledButton>
         <div className="topbar-actions">
@@ -1731,6 +1962,11 @@ function App() {
           <Button variant="light" size="xs" onClick={requestFullscreen}>Fullscreen</Button>
         </div>
       </header>
+      {appMode === "advanced-debug" && (
+        <Alert color="orange" title="ADVANCED DEBUG ACTIVE">
+          Advanced debug mode is enabled and should be temporary.
+        </Alert>
+      )}
 
       {screen === "home" && (
         <div className="screen home">
@@ -1754,13 +1990,62 @@ function App() {
                     </>
                   ) : (
                     <>
+                      <SegmentedControl
+                        value={authMode}
+                        onChange={(value) => setAuthMode(value as "login" | "register" | "forgot")}
+                        data={[
+                          { value: "login", label: "Email login" },
+                          { value: "register", label: "Sign up" },
+                          { value: "forgot", label: "Forgot password" }
+                        ]}
+                      />
                       <TextInput
-                        label="Email magic link"
+                        label="Email"
                         value={authEmail}
                         onChange={(e) => setAuthEmail(e.currentTarget.value)}
                         placeholder="you@example.com"
                       />
-                      <Button variant="light" size="xs" onClick={requestMagicLink}>Send magic link</Button>
+                      {authMode === "register" && (
+                        <TextInput
+                          label="Display name"
+                          value={authDisplayName}
+                          onChange={(e) => setAuthDisplayName(e.currentTarget.value)}
+                          placeholder="Player"
+                        />
+                      )}
+                      {(authMode === "login" || authMode === "register") && (
+                        <TextInput
+                          type="password"
+                          label="Password"
+                          value={authPassword}
+                          onChange={(e) => setAuthPassword(e.currentTarget.value)}
+                          placeholder="At least 10 characters"
+                        />
+                      )}
+                      {authMode === "forgot" && passwordResetToken && (
+                        <TextInput
+                          type="password"
+                          label="New password"
+                          value={passwordResetPassword}
+                          onChange={(e) => setPasswordResetPassword(e.currentTarget.value)}
+                          placeholder="Enter a new password"
+                        />
+                      )}
+                      <Button
+                        variant="light"
+                        size="xs"
+                        disabled={authMode === "forgot" && !passwordResetEnabled}
+                        onClick={submitEmailAuth}
+                      >
+                        {authMode === "register"
+                          ? "Create account"
+                          : authMode === "forgot"
+                            ? (passwordResetToken ? "Set new password" : "Send reset email")
+                            : "Sign in"}
+                      </Button>
+                      {authMode === "forgot" && !passwordResetEnabled && (
+                        <Text size="xs" c="dimmed">Password reset requires SMTP settings from an admin.</Text>
+                      )}
                       {googleClientId && <div id="google-signin-button" />}
                       {authMessage && <Text size="xs" c="dimmed">{authMessage}</Text>}
                     </>
@@ -1954,17 +2239,18 @@ function App() {
           </div>
           {statusMessage && <div className="status">{statusMessage}</div>}
           <Group className="actions">
-            <Button onClick={() => setScreen("home")}>Home</Button>
-            <Button variant="light" onClick={() => setScreen("leaderboard")}>Leaderboard</Button>
+            <Button onClick={() => navigateFromSettings("home")}>Home</Button>
+            <Button variant="light" onClick={() => navigateFromSettings("leaderboard")}>Leaderboard</Button>
           </Group>
         </div>
       )}
 
       {screen === "leaderboard" && (
         <LeaderboardScreen
-          onBack={() => setScreen("home")}
+          onBack={() => navigateFromSettings("home")}
           onLoad={loadLeaderboard}
           entries={leaderboard}
+          myRank={myRank}
           statusMessage={statusMessage}
         />
       )}
@@ -1997,7 +2283,12 @@ function App() {
           adminPin={adminPin}
           setAdminPin={setAdminPin}
           packs={packs}
-          onBack={() => setScreen("home")}
+          onBack={() => navigateFromSettings("home")}
+          onApplySettings={applySettings}
+          onResetSettingsDraft={resetSettingsDraft}
+          hasUnsavedSettings={hasUnsavedSettings}
+          lastSettingsAppliedAt={lastSettingsAppliedAt}
+          publicVersion={publicVersion}
           onReloadPacks={loadPacks}
           onReset={async (scope) => {
             try {
@@ -2045,11 +2336,13 @@ function LeaderboardScreen({
   onBack,
   onLoad,
   entries,
+  myRank,
   statusMessage
 }: {
   onBack: () => void;
   onLoad: (filters: any) => void;
   entries: LeaderboardEntry[];
+  myRank: number | null;
   statusMessage: string;
 }) {
   const [filters, setFilters] = useState({
@@ -2073,6 +2366,7 @@ function LeaderboardScreen({
   return (
     <div className="screen leaderboard">
       <h2>Leaderboard</h2>
+      {typeof myRank === "number" && <Text size="sm">My rank: #{myRank}</Text>}
       <div className="card">
         <div className="filters">
           <Select
@@ -2259,7 +2553,12 @@ function SettingsScreen({
   onUpdatePack,
   onGenerate,
   onTestKey,
-  statusMessage
+  statusMessage,
+  onApplySettings,
+  onResetSettingsDraft,
+  hasUnsavedSettings,
+  lastSettingsAppliedAt,
+  publicVersion
 }: {
   isAdmin: boolean;
   appSettings: AppSettings;
@@ -2280,6 +2579,11 @@ function SettingsScreen({
   onGenerate: (payload: any) => Promise<any>;
   onTestKey: (payload: any) => Promise<any>;
   statusMessage: string;
+  onApplySettings: () => Promise<boolean>;
+  onResetSettingsDraft: () => void;
+  hasUnsavedSettings: boolean;
+  lastSettingsAppliedAt: string;
+  publicVersion: PublicVersion | null;
 }) {
   const [openaiKey, setOpenaiKey] = useState("");
   const [storeKey, setStoreKey] = useState(false);
@@ -2320,6 +2624,11 @@ function SettingsScreen({
   const [confirmAdminPin, setConfirmAdminPin] = useState("");
   const [pinBusy, setPinBusy] = useState(false);
   const [pinMessage, setPinMessage] = useState("");
+  const [crashEvents, setCrashEvents] = useState<CrashEvent[]>([]);
+  const [crashUnresolvedCount, setCrashUnresolvedCount] = useState(0);
+  const [selectedCrash, setSelectedCrash] = useState<CrashEvent | null>(null);
+  const [crashBusy, setCrashBusy] = useState(false);
+  const [crashMessage, setCrashMessage] = useState("");
   const themePreview = applyVisibilityGuard(computeTheme(appSettings), appSettings.visibilityGuard).theme;
 
   const refreshDb = async () => {
@@ -2345,6 +2654,38 @@ function SettingsScreen({
       setDbMessage(err?.message || "Failed to load DB status");
     } finally {
       setDbBusy(false);
+    }
+  };
+
+  const refreshCrashes = async () => {
+    if (!adminPin) return;
+    setCrashBusy(true);
+    setCrashMessage("");
+    try {
+      const data = await API.listCrashEvents(100, false);
+      const list = Array.isArray(data?.crashes) ? data.crashes : [];
+      setCrashEvents(list);
+      setCrashUnresolvedCount(Number(data?.unresolvedCount || 0));
+      if (list.length > 0 && !selectedCrash) setSelectedCrash(list[0]);
+    } catch (err: any) {
+      setCrashMessage(err?.message || "Failed to load crash events.");
+    } finally {
+      setCrashBusy(false);
+    }
+  };
+
+  const acknowledgeCrash = async (id: number) => {
+    if (!adminPin) return;
+    setCrashBusy(true);
+    setCrashMessage("");
+    try {
+      await API.acknowledgeCrashEvent(id);
+      await refreshCrashes();
+      setCrashMessage("Crash acknowledged.");
+    } catch (err: any) {
+      setCrashMessage(err?.message || "Failed to acknowledge crash.");
+    } finally {
+      setCrashBusy(false);
     }
   };
 
@@ -2490,6 +2831,7 @@ function SettingsScreen({
   useEffect(() => {
     if (!adminPin) return;
     refreshPinStatus().catch(() => null);
+    refreshCrashes().catch(() => null);
   }, [adminPin]);
 
   const updateSettings = (patch: Partial<AppSettings>) => {
@@ -2545,6 +2887,7 @@ function SettingsScreen({
             { id: "content", label: "Content & Randomness" },
             { id: "preview", label: "Preview & Test" },
             { id: "diagnostics", label: "Diagnostics" },
+            { id: "about", label: "About" },
             { id: "admin", label: "Admin" }
           ].map((item) => (
             <Button
@@ -2569,9 +2912,21 @@ function SettingsScreen({
             <Title order={2}>Settings & Admin</Title>
             <Text size="sm" c="dimmed">
               {adminPin
-                ? "All controls are safe to test and persist automatically."
+                ? "Settings are staged locally. Apply commits to backend."
                 : "Changes apply immediately for authorized admin accounts."}
             </Text>
+            <Group>
+              <Button variant="light" disabled={!hasUnsavedSettings} onClick={onResetSettingsDraft}>Reset</Button>
+              <Button disabled={!hasUnsavedSettings || !adminPin} onClick={() => void onApplySettings()}>Apply</Button>
+              <Text size="xs" c="dimmed">
+                {lastSettingsAppliedAt ? `Last applied: ${new Date(lastSettingsAppliedAt).toLocaleString()}` : "Not applied yet"}
+              </Text>
+            </Group>
+            {isAdmin && crashUnresolvedCount > 0 && (
+              <Alert color="red" title="Unresolved crash events">
+                {crashUnresolvedCount} crash event(s) require acknowledgment in Admin Diagnostics.
+              </Alert>
+            )}
           </div>
           <SettingsSection
             id="start"
@@ -3116,50 +3471,60 @@ function SettingsScreen({
             </SettingRow>
           </SettingsSection>
 
+          <SettingsSection
+            id="about"
+            title="About"
+            description="Build and release metadata."
+          >
+            <SettingRow label="Version" helper="Semantic version with build metadata.">
+              <Text>{publicVersion ? `${publicVersion.version} (build ${publicVersion.build})` : "unknown"}</Text>
+            </SettingRow>
+            <SettingRow label="Commit" helper="Source commit currently running.">
+              <Text>{publicVersion?.commit || "unknown"}</Text>
+            </SettingRow>
+            <SettingRow label="Build time" helper="UTC build timestamp, if available.">
+              <Text>{publicVersion?.buildTime || "n/a"}</Text>
+            </SettingRow>
+            <SettingRow label="Project links" helper="Repository and support contacts.">
+              <Group>
+                <Button
+                  variant="light"
+                  component="a"
+                  href={publicVersion?.githubUrl || "https://github.com/viktordrukker/ktrain"}
+                  target="_blank"
+                >
+                  GitHub
+                </Button>
+                <Button
+                  variant="light"
+                  component="a"
+                  href={publicVersion?.website || "https://thedrukkers.com"}
+                  target="_blank"
+                >
+                  thedrukkers.com
+                </Button>
+                <Button
+                  variant="light"
+                  component="a"
+                  href={publicVersion?.contact || "mailto:vdrukker@thedrukkers.com"}
+                >
+                  Contact
+                </Button>
+              </Group>
+            </SettingRow>
+          </SettingsSection>
+
           {isAdmin && (
           <SettingsSection
             id="admin"
             title="Admin"
             description="OpenAI, resets, and admin authorization."
           >
-            <SettingRow label="Admin Authorization" helper="Sign in with OWNER/ADMIN account.">
-              <Group>
-                <TextInput value={adminPin} onChange={(e) => setAdminPin(e.currentTarget.value)} placeholder="Current PIN" />
-                <Button variant="light" onClick={refreshPinStatus}>Check authorization</Button>
-                {pinStatus && <Badge variant="light">Source: {pinStatus.source}</Badge>}
-              </Group>
-            </SettingRow>
-            {pinStatus?.pinIsDefault && (
-              <div className="setting-row full">
-                <Alert color="yellow" title="Admin PIN removed">
-                  Admin PIN is deprecated. Use authorized admin user accounts.
-                </Alert>
-              </div>
-            )}
-            <SettingRow label="Legacy PIN Fields" helper="Deprecated in Iteration 2.">
-              <Group>
-                <TextInput
-                  type="password"
-                  value={newAdminPin}
-                  onChange={(e) => setNewAdminPin(e.currentTarget.value)}
-                  placeholder="New PIN"
-                />
-                <TextInput
-                  type="password"
-                  value={confirmAdminPin}
-                  onChange={(e) => setConfirmAdminPin(e.currentTarget.value)}
-                  placeholder="Confirm new PIN"
-                />
-                <Button loading={pinBusy} onClick={rotateAdminPin}>Legacy Action</Button>
-              </Group>
-            </SettingRow>
-            {pinMessage && (
-              <div className="setting-row full">
-                <Alert color="yellow" title="Admin Authorization">
-                  {pinMessage}
-                </Alert>
-              </div>
-            )}
+            <div className="setting-row full">
+              <Alert color="blue" title="Admin Authorization">
+                Access is controlled by OWNER/ADMIN role. Admin PIN is fully removed.
+              </Alert>
+            </div>
             <Divider my="sm" />
             <SettingRow label="Database status" helper="Current backend and runtime status.">
               <Group>
@@ -3169,7 +3534,7 @@ function SettingsScreen({
               </Group>
             </SettingRow>
             <Divider my="sm" />
-            <SettingRow label="SMTP host" helper="Used for magic-link sign-in and notifications.">
+            <SettingRow label="SMTP host" helper="Used for password reset emails and notifications.">
               <TextInput value={emailSettings.host} onChange={(e) => setEmailSettings({ ...emailSettings, host: e.currentTarget.value })} placeholder="smtp.example.com" />
             </SettingRow>
             <SettingRow label="SMTP port" helper="Common: 587 (STARTTLS) or 465 (SSL).">
@@ -3268,6 +3633,59 @@ function SettingsScreen({
               <div className="setting-row full">
                 <Alert color="yellow" title="Database backend">
                   {dbMessage}
+                </Alert>
+              </div>
+            )}
+            <Divider my="sm" />
+            <SettingRow label="Crash diagnostics" helper="Recent fatal/startup crashes and acknowledgment state.">
+              <Group>
+                <Button variant="light" loading={crashBusy} onClick={refreshCrashes}>Refresh crashes</Button>
+                <Badge variant="light">Unresolved: {crashUnresolvedCount}</Badge>
+              </Group>
+            </SettingRow>
+            {crashEvents.length > 0 && (
+              <SettingRow label="Recent crash events" helper="Newest first. Select one to inspect details.">
+                <Select
+                  value={selectedCrash ? String(selectedCrash.id) : ""}
+                  onChange={(value) => {
+                    const found = crashEvents.find((row) => String(row.id) === String(value || ""));
+                    setSelectedCrash(found || null);
+                  }}
+                  data={crashEvents.map((row) => ({
+                    value: String(row.id),
+                    label: `${new Date(row.occurredAt).toLocaleString()} | ${row.crashType} | ${row.resolved ? "resolved" : "unresolved"}`
+                  }))}
+                />
+              </SettingRow>
+            )}
+            {selectedCrash && (
+              <div className="setting-row full">
+                <Alert color={selectedCrash.resolved ? "blue" : "red"} title={`Crash #${selectedCrash.id}`}>
+                  <div><strong>When:</strong> {new Date(selectedCrash.occurredAt).toLocaleString()}</div>
+                  <div><strong>Type:</strong> {selectedCrash.crashType}</div>
+                  <div><strong>Version:</strong> {selectedCrash.appVersion || "n/a"} build {selectedCrash.appBuild || "n/a"}</div>
+                  <div><strong>Phase:</strong> {selectedCrash.startupPhase || "n/a"}</div>
+                  <div><strong>Error:</strong> {selectedCrash.errorName || "Error"}: {selectedCrash.errorMessage || "n/a"}</div>
+                  <div><strong>Acknowledged:</strong> {selectedCrash.acknowledgedAt ? `${selectedCrash.acknowledgedAt} by ${selectedCrash.acknowledgedBy || "admin"}` : "no"}</div>
+                  <Textarea
+                    mt="sm"
+                    minRows={4}
+                    value={selectedCrash.stackTrace || ""}
+                    readOnly
+                    autosize
+                  />
+                  {!selectedCrash.resolved && (
+                    <Button mt="sm" variant="light" color="orange" onClick={() => acknowledgeCrash(Number(selectedCrash.id))}>
+                      Mark acknowledged
+                    </Button>
+                  )}
+                </Alert>
+              </div>
+            )}
+            {crashMessage && (
+              <div className="setting-row full">
+                <Alert color="yellow" title="Crash diagnostics">
+                  {crashMessage}
                 </Alert>
               </div>
             )}

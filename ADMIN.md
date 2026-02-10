@@ -2,7 +2,7 @@
 
 ## Authorization Model
 - Admin PIN is removed.
-- Admin access requires authenticated user role (`ADMIN` or `OWNER`).
+- Admin access requires authenticated user role (`ADMIN` or `OWNER`) from Google sign-in or email/password sign-in.
 - Owner-only operations remain protected by RBAC.
 
 ## Language Packs (Modal Workflow)
@@ -26,6 +26,7 @@ Pack status:
 - DB runtime controls
 - SMTP settings
 - Send test email
+- Password reset email flow depends on SMTP health.
 
 Secrets policy:
 - SMTP password encrypted at rest.
@@ -38,3 +39,18 @@ Start screen shows live activity:
 
 Admin endpoints include mode breakdown for activity:
 - `GET /api/admin/live/stats`
+
+## Crash Diagnostics
+- Open Settings -> Admin -> Crash diagnostics.
+- Review recent crash events with version, phase, error summary, and stack.
+- Acknowledge resolved incidents to clear unresolved warning banners.
+- API equivalents:
+  - `GET /api/admin/crashes`
+  - `GET /api/admin/crashes/:id`
+  - `POST /api/admin/crashes/:id/ack`
+
+## Russian Pack Troubleshooting
+- If Russian does not appear in Start settings, open Language Packs modal and confirm `ru` packs are `PUBLISHED` for `level2`, `level3`, and `sentence_words`.
+- Use `POST /api/admin/seed-defaults` or restart app to trigger built-in EN/RU re-seeding for missing published packs.
+- Verify pipeline with admin diagnostics endpoint:
+  - `GET /api/admin/language/diagnostics?language=ru&level=2`

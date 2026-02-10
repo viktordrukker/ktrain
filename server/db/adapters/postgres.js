@@ -210,19 +210,19 @@ class PostgresAdapter {
     return mapUserRow(rows[0]);
   }
 
-  async createUser({ externalSubject, email, displayName, role }) {
+  async createUser({ externalSubject, email, displayName, role, avatarUrl }) {
     const now = nowIso();
     const { rows } = await this.pool.query(
-      `INSERT INTO users (externalSubject, email, displayName, role, isActive, createdAt, updatedAt, lastLoginAt)
-       VALUES ($1, $2, $3, $4, 1, $5, $5, $5)
+      `INSERT INTO users (externalSubject, email, displayName, avatarUrl, role, isActive, createdAt, updatedAt, lastLoginAt)
+       VALUES ($1, $2, $3, $4, $5, 1, $6, $6, $6)
        RETURNING *`,
-      [externalSubject, email || null, displayName || null, role, now]
+      [externalSubject, email || null, displayName || null, avatarUrl || null, role, now]
     );
     return mapUserRow(rows[0]);
   }
 
   async listUsers() {
-    const { rows } = await this.pool.query("SELECT id, externalSubject, email, displayName, role, isActive, createdAt, updatedAt, lastLoginAt FROM users ORDER BY id ASC");
+    const { rows } = await this.pool.query("SELECT id, externalSubject, email, displayName, avatarUrl, role, isActive, createdAt, updatedAt, lastLoginAt FROM users ORDER BY id ASC");
     return rows.map(mapUserRow);
   }
 
@@ -236,11 +236,57 @@ class PostgresAdapter {
   }
 
   async updateUserProfile(id, { displayName, avatarUrl }) {
-    await this.pool.query("UPDATE users SET displayName = COALESCE($1, displayName), updatedAt = $2 WHERE id = $3", [displayName || null, nowIso(), id]);
+    await this.pool.query("UPDATE users SET displayName = COALESCE($1, displayName), avatarUrl = COALESCE($2, avatarUrl), updatedAt = $3 WHERE id = $4", [displayName || null, avatarUrl || null, nowIso(), id]);
     if (avatarUrl !== undefined) {
       await this.setConfig("user.avatar", "user", String(id), { avatarUrl: avatarUrl || "" }, `user:${id}`);
     }
     return this.findUserById(id);
+  }
+
+  async findAuthIdentity({ provider, providerSubject }) {
+    const { rows } = await this.pool.query("SELECT * FROM auth_identities WHERE provider = $1 AND providerSubject = $2 LIMIT 1", [provider, providerSubject]);
+    return rows[0] || null;
+  }
+
+  async findPasswordIdentityByEmail(email) {
+    const { rows } = await this.pool.query(
+      `SELECT ai.*, u.email, u.displayName, u.avatarUrl, u.role, u.isActive, u.id as userId
+       FROM auth_identities ai
+       JOIN users u ON u.id = ai.userId
+       WHERE ai.provider = 'password' AND lower(u.email) = lower($1)
+       LIMIT 1`,
+      [email]
+    );
+    return rows[0] || null;
+  }
+
+  async upsertAuthIdentity({ userId, provider, providerSubject, passwordHash }) {
+    const now = nowIso();
+    await this.pool.query(
+      `INSERT INTO auth_identities (userId, provider, providerSubject, passwordHash, createdAt, updatedAt)
+       VALUES ($1,$2,$3,$4,$5,$5)
+       ON CONFLICT(userId, provider) DO UPDATE SET
+       providerSubject = EXCLUDED.providerSubject,
+       passwordHash = COALESCE(EXCLUDED.passwordHash, auth_identities.passwordHash),
+       updatedAt = EXCLUDED.updatedAt`,
+      [userId, provider, providerSubject || null, passwordHash || null, now]
+    );
+  }
+
+  async createPasswordReset({ userId, tokenHash, expiresAt, requestedIp }) {
+    await this.pool.query(
+      "INSERT INTO password_resets (userId, tokenHash, expiresAt, usedAt, createdAt, requestedIp) VALUES ($1,$2,$3,NULL,$4,$5)",
+      [userId, tokenHash, expiresAt, nowIso(), requestedIp || null]
+    );
+  }
+
+  async consumePasswordReset(tokenHash) {
+    const { rows } = await this.pool.query("SELECT * FROM password_resets WHERE tokenHash = $1 LIMIT 1", [tokenHash]);
+    const row = rows[0];
+    if (!row || row.usedat) return null;
+    if (Date.parse(row.expiresat) < Date.now()) return null;
+    await this.pool.query("UPDATE password_resets SET usedAt = $1 WHERE id = $2", [nowIso(), row.id]);
+    return row;
   }
 
   async getUserSecret(userId, secretKey) {
@@ -317,6 +363,82 @@ class PostgresAdapter {
     return rows.map((row) => ({ ...row, actorUserId: row.actoruserid, actorRole: row.actorrole, targetType: row.targettype, targetId: row.targetid, requestId: row.requestid, createdAt: row.createdat, metadata: row.metadata ? JSON.parse(row.metadata) : null }));
   }
 
+  async insertCrashEvent(payload) {
+    await this.pool.query(
+      `INSERT INTO crash_events
+      (occurredAt, appVersion, appBuild, appCommit, appMode, crashType, startupPhase, errorName, errorMessage, stackTrace, hostname, uptimeSeconds, metadataJson, acknowledgedAt, acknowledgedBy, resolved)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+      [
+        payload.occurredAt,
+        payload.appVersion || null,
+        payload.appBuild || null,
+        payload.appCommit || null,
+        payload.appMode || null,
+        payload.crashType,
+        payload.startupPhase || null,
+        payload.errorName || null,
+        payload.errorMessage || null,
+        payload.stackTrace || null,
+        payload.hostname || null,
+        payload.uptimeSeconds || null,
+        payload.metadataJson ? JSON.stringify(payload.metadataJson) : null,
+        payload.acknowledgedAt || null,
+        payload.acknowledgedBy || null,
+        payload.resolved ? 1 : 0
+      ]
+    );
+  }
+
+  async listCrashEvents(limit = 50, unresolvedOnly = false) {
+    const where = unresolvedOnly ? "WHERE resolved = 0" : "";
+    const { rows } = await this.pool.query(`SELECT * FROM crash_events ${where} ORDER BY occurredAt DESC LIMIT $1`, [Number(limit)]);
+    return rows.map((row) => ({
+      ...row,
+      occurredAt: row.occurredat,
+      appVersion: row.appversion,
+      appBuild: row.appbuild,
+      appCommit: row.appcommit,
+      appMode: row.appmode,
+      crashType: row.crashtype,
+      startupPhase: row.startupphase,
+      errorName: row.errorname,
+      errorMessage: row.errormessage,
+      stackTrace: row.stacktrace,
+      uptimeSeconds: row.uptimeseconds,
+      metadataJson: row.metadatajson ? JSON.parse(row.metadatajson) : null,
+      acknowledgedAt: row.acknowledgedat,
+      acknowledgedBy: row.acknowledgedby
+    }));
+  }
+
+  async getCrashEventById(id) {
+    const { rows } = await this.pool.query("SELECT * FROM crash_events WHERE id = $1 LIMIT 1", [id]);
+    const row = rows[0];
+    if (!row) return null;
+    return {
+      ...row,
+      occurredAt: row.occurredat,
+      appVersion: row.appversion,
+      appBuild: row.appbuild,
+      appCommit: row.appcommit,
+      appMode: row.appmode,
+      crashType: row.crashtype,
+      startupPhase: row.startupphase,
+      errorName: row.errorname,
+      errorMessage: row.errormessage,
+      stackTrace: row.stacktrace,
+      uptimeSeconds: row.uptimeseconds,
+      metadataJson: row.metadatajson ? JSON.parse(row.metadatajson) : null,
+      acknowledgedAt: row.acknowledgedat,
+      acknowledgedBy: row.acknowledgedby
+    };
+  }
+
+  async acknowledgeCrashEvent(id, by) {
+    await this.pool.query("UPDATE crash_events SET resolved = 1, acknowledgedAt = $1, acknowledgedBy = $2 WHERE id = $3", [nowIso(), by || null, id]);
+    return this.getCrashEventById(id);
+  }
+
   async createMagicLink({ email, tokenHash, expiresAt, requestedIp }) {
     await this.pool.query("INSERT INTO auth_magic_links (email, tokenHash, expiresAt, createdAt, requestedIp) VALUES ($1,$2,$3,$4,$5)", [email, tokenHash, expiresAt, nowIso(), requestedIp || null]);
   }
@@ -356,8 +478,13 @@ class PostgresAdapter {
     await this.pool.query("UPDATE auth_sessions SET revokedAt = $1 WHERE tokenHash = $2", [nowIso(), tokenHash]);
   }
 
+  async revokeAuthSessionsForUser(userId) {
+    await this.pool.query("UPDATE auth_sessions SET revokedAt = $1 WHERE userId = $2 AND revokedAt IS NULL", [nowIso(), userId]);
+  }
+
   async cleanupAuthSessions() {
     await this.pool.query("DELETE FROM auth_sessions WHERE revokedAt IS NOT NULL OR expiresAt < $1", [nowIso()]);
+    await this.pool.query("DELETE FROM password_resets WHERE usedAt IS NOT NULL OR expiresAt < $1", [nowIso()]);
   }
 
   async createLanguagePack({ language, type, topic, status, createdBy }) {
@@ -480,7 +607,7 @@ class PostgresAdapter {
   }
 
   async dumpAll() {
-    const [settings, leaderboard, vocab_packs, users, user_secrets, app_config, system_secrets, packs, pack_items] = await Promise.all([
+    const [settings, leaderboard, vocab_packs, users, user_secrets, app_config, system_secrets, packs, pack_items, auth_identities, password_resets, crash_events] = await Promise.all([
       this.pool.query("SELECT key, value FROM settings ORDER BY key ASC"),
       this.pool.query("SELECT * FROM leaderboard ORDER BY id ASC"),
       this.pool.query("SELECT * FROM vocab_packs ORDER BY id ASC"),
@@ -489,16 +616,19 @@ class PostgresAdapter {
       this.pool.query("SELECT * FROM app_config ORDER BY id ASC"),
       this.pool.query("SELECT * FROM system_secrets ORDER BY secretKey ASC"),
       this.pool.query("SELECT * FROM packs ORDER BY id ASC"),
-      this.pool.query("SELECT * FROM pack_items ORDER BY id ASC")
+      this.pool.query("SELECT * FROM pack_items ORDER BY id ASC"),
+      this.pool.query("SELECT * FROM auth_identities ORDER BY id ASC"),
+      this.pool.query("SELECT * FROM password_resets ORDER BY id ASC"),
+      this.pool.query("SELECT * FROM crash_events ORDER BY id ASC")
     ]);
-    return { settings: settings.rows, leaderboard: leaderboard.rows, vocab_packs: vocab_packs.rows, users: users.rows, user_secrets: user_secrets.rows, app_config: app_config.rows, system_secrets: system_secrets.rows, packs: packs.rows, pack_items: pack_items.rows };
+    return { settings: settings.rows, leaderboard: leaderboard.rows, vocab_packs: vocab_packs.rows, users: users.rows, user_secrets: user_secrets.rows, app_config: app_config.rows, system_secrets: system_secrets.rows, packs: packs.rows, pack_items: pack_items.rows, auth_identities: auth_identities.rows, password_resets: password_resets.rows, crash_events: crash_events.rows };
   }
 
   async restoreAll(dump) {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      await client.query("TRUNCATE TABLE leaderboard, vocab_packs, settings, user_secrets, users, app_config, system_secrets, pack_items, packs RESTART IDENTITY CASCADE");
+      await client.query("TRUNCATE TABLE leaderboard, vocab_packs, settings, user_secrets, users, app_config, system_secrets, pack_items, packs, auth_identities, password_resets, crash_events RESTART IDENTITY CASCADE");
       for (const row of dump.settings || []) await client.query("INSERT INTO settings (key, value) VALUES ($1, $2)", [row.key, row.value]);
       for (const row of dump.vocab_packs || []) await client.query("INSERT INTO vocab_packs (id, name, packType, items, active, createdAt) VALUES ($1, $2, $3, $4, $5, $6)", [row.id, row.name, row.packType || row.packtype, row.items, row.active, row.createdat || row.createdAt]);
       for (const row of dump.leaderboard || []) {
@@ -507,12 +637,15 @@ class PostgresAdapter {
           [row.id, row.playername || row.playerName, row.createdat || row.createdAt, row.contesttype || row.contestType, row.level, row.contentmode || row.contentMode, row.duration, row.tasktarget || row.taskTarget, row.score, row.accuracy, row.cpm, row.mistakes, row.taskscompleted || row.tasksCompleted, row.timeseconds || row.timeSeconds, row.maxstreak || row.maxStreak, row.userid || row.userId || null, row.isguest || row.isGuest || 1, row.language || "en", row.displayname || row.displayName || null, row.avatarurl || row.avatarUrl || null]
         );
       }
-      for (const row of dump.users || []) await client.query("INSERT INTO users (id, externalSubject, email, displayName, role, isActive, createdAt, updatedAt, lastLoginAt) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)", [row.id, row.externalsubject || row.externalSubject, row.email, row.displayname || row.displayName, row.role, row.isactive || row.isActive || 1, row.createdat || row.createdAt, row.updatedat || row.updatedAt, row.lastloginat || row.lastLoginAt]);
+      for (const row of dump.users || []) await client.query("INSERT INTO users (id, externalSubject, email, displayName, avatarUrl, role, isActive, createdAt, updatedAt, lastLoginAt) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)", [row.id, row.externalsubject || row.externalSubject, row.email, row.displayname || row.displayName, row.avatarurl || row.avatarUrl || null, row.role, row.isactive || row.isActive || 1, row.createdat || row.createdAt, row.updatedat || row.updatedAt, row.lastloginat || row.lastLoginAt]);
       for (const row of dump.user_secrets || []) await client.query("INSERT INTO user_secrets (id, userId, secretKey, ciphertext, iv, authTag, createdAt, updatedAt) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)", [row.id, row.userid || row.userId, row.secretkey || row.secretKey, row.ciphertext, row.iv, row.authtag || row.authTag, row.createdat || row.createdAt, row.updatedat || row.updatedAt]);
       for (const row of dump.app_config || []) await client.query("INSERT INTO app_config (id, key, scope, scopeId, valueJson, updatedAt, updatedBy) VALUES ($1,$2,$3,$4,$5,$6,$7)", [row.id, row.key, row.scope, row.scopeid || row.scopeId, row.valuejson || row.valueJson, row.updatedat || row.updatedAt, row.updatedby || row.updatedBy || null]);
       for (const row of dump.system_secrets || []) await client.query("INSERT INTO system_secrets (secretKey, ciphertext, iv, authTag, updatedAt, updatedBy) VALUES ($1,$2,$3,$4,$5,$6)", [row.secretkey || row.secretKey, row.ciphertext, row.iv, row.authtag || row.authTag, row.updatedat || row.updatedAt, row.updatedby || row.updatedBy || null]);
       for (const row of dump.packs || []) await client.query("INSERT INTO packs (id, language, type, topic, status, createdBy, createdAt, updatedAt) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)", [row.id, row.language, row.type, row.topic || null, row.status, row.createdby || row.createdBy || null, row.createdat || row.createdAt, row.updatedat || row.updatedAt]);
       for (const row of dump.pack_items || []) await client.query("INSERT INTO pack_items (id, packId, text, difficulty, metadataJson) VALUES ($1,$2,$3,$4,$5)", [row.id, row.packid || row.packId, row.text, row.difficulty || null, row.metadatajson || row.metadataJson || null]);
+      for (const row of dump.auth_identities || []) await client.query("INSERT INTO auth_identities (id, userId, provider, providerSubject, passwordHash, createdAt, updatedAt) VALUES ($1,$2,$3,$4,$5,$6,$7)", [row.id, row.userid || row.userId, row.provider, row.providersubject || row.providerSubject || null, row.passwordhash || row.passwordHash || null, row.createdat || row.createdAt, row.updatedat || row.updatedAt]);
+      for (const row of dump.password_resets || []) await client.query("INSERT INTO password_resets (id, userId, tokenHash, expiresAt, usedAt, createdAt, requestedIp) VALUES ($1,$2,$3,$4,$5,$6,$7)", [row.id, row.userid || row.userId, row.tokenhash || row.tokenHash, row.expiresat || row.expiresAt, row.usedat || row.usedAt || null, row.createdat || row.createdAt, row.requestedip || row.requestedIp || null]);
+      for (const row of dump.crash_events || []) await client.query("INSERT INTO crash_events (id, occurredAt, appVersion, appBuild, appCommit, appMode, crashType, startupPhase, errorName, errorMessage, stackTrace, hostname, uptimeSeconds, metadataJson, acknowledgedAt, acknowledgedBy, resolved) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)", [row.id, row.occurredat || row.occurredAt, row.appversion || row.appVersion || null, row.appbuild || row.appBuild || null, row.appcommit || row.appCommit || null, row.appmode || row.appMode || null, row.crashtype || row.crashType, row.startupphase || row.startupPhase || null, row.errorname || row.errorName || null, row.errormessage || row.errorMessage || null, row.stacktrace || row.stackTrace || null, row.hostname || null, row.uptimeseconds || row.uptimeSeconds || null, row.metadatajson || row.metadataJson || null, row.acknowledgedat || row.acknowledgedAt || null, row.acknowledgedby || row.acknowledgedBy || null, row.resolved || 0]);
 
       await client.query("SELECT setval('leaderboard_id_seq', COALESCE((SELECT MAX(id) FROM leaderboard), 1), true)");
       await client.query("SELECT setval('vocab_packs_id_seq', COALESCE((SELECT MAX(id) FROM vocab_packs), 1), true)");
@@ -521,6 +654,9 @@ class PostgresAdapter {
       await client.query("SELECT setval('app_config_id_seq', COALESCE((SELECT MAX(id) FROM app_config), 1), true)");
       await client.query("SELECT setval('packs_id_seq', COALESCE((SELECT MAX(id) FROM packs), 1), true)");
       await client.query("SELECT setval('pack_items_id_seq', COALESCE((SELECT MAX(id) FROM pack_items), 1), true)");
+      await client.query("SELECT setval('auth_identities_id_seq', COALESCE((SELECT MAX(id) FROM auth_identities), 1), true)");
+      await client.query("SELECT setval('password_resets_id_seq', COALESCE((SELECT MAX(id) FROM password_resets), 1), true)");
+      await client.query("SELECT setval('crash_events_id_seq', COALESCE((SELECT MAX(id) FROM crash_events), 1), true)");
       await client.query("COMMIT");
     } catch (err) {
       await client.query("ROLLBACK");
@@ -531,15 +667,16 @@ class PostgresAdapter {
   }
 
   async counts() {
-    const [settings, leaderboard, vocab_packs, users, app_config, packs] = await Promise.all([
+    const [settings, leaderboard, vocab_packs, users, app_config, packs, crashes] = await Promise.all([
       this.pool.query("SELECT COUNT(*)::int as c FROM settings"),
       this.pool.query("SELECT COUNT(*)::int as c FROM leaderboard"),
       this.pool.query("SELECT COUNT(*)::int as c FROM vocab_packs"),
       this.pool.query("SELECT COUNT(*)::int as c FROM users"),
       this.pool.query("SELECT COUNT(*)::int as c FROM app_config"),
-      this.pool.query("SELECT COUNT(*)::int as c FROM packs")
+      this.pool.query("SELECT COUNT(*)::int as c FROM packs"),
+      this.pool.query("SELECT COUNT(*)::int as c FROM crash_events")
     ]);
-    return { settings: settings.rows[0].c, leaderboard: leaderboard.rows[0].c, vocab_packs: vocab_packs.rows[0].c, users: users.rows[0].c, app_config: app_config.rows[0].c, packs: packs.rows[0].c };
+    return { settings: settings.rows[0].c, leaderboard: leaderboard.rows[0].c, vocab_packs: vocab_packs.rows[0].c, users: users.rows[0].c, app_config: app_config.rows[0].c, packs: packs.rows[0].c, crashes: crashes.rows[0].c };
   }
 }
 
