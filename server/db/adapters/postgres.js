@@ -200,6 +200,14 @@ class PostgresAdapter {
     return mapUserRow(rows[0]);
   }
 
+  async findUserByDisplayName(displayName) {
+    const { rows } = await this.pool.query(
+      "SELECT * FROM users WHERE lower(trim(displayName)) = lower(trim($1)) LIMIT 1",
+      [displayName]
+    );
+    return mapUserRow(rows[0]);
+  }
+
   async findUserById(id) {
     const { rows } = await this.pool.query("SELECT * FROM users WHERE id = $1 LIMIT 1", [id]);
     return mapUserRow(rows[0]);
