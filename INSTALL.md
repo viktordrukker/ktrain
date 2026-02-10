@@ -7,6 +7,11 @@ docker compose up --build -d
 ./scripts/bootstrap.sh
 ```
 
+Optional manual Postgres service (not auto-deployed):
+```bash
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d ktrain_postgres
+```
+
 ## Bootstrap Runtime Env (Minimal)
 Required:
 - `KTRAIN_MASTER_KEY` (32-byte hex/base64)
