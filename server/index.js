@@ -620,6 +620,19 @@ app.post("/api/setup/complete", requirePermission(Permissions.ADMIN_CONFIG_MANAG
   res.json({ ok: true });
 }));
 
+app.post("/api/setup/bootstrap-owner", requirePermission(Permissions.SESSION_READ), withAsync(async (req, res) => {
+  if (!req.actor?.isAuthenticated || !req.actor?.id) {
+    throw new AppError("Authentication required", { status: 401, code: "UNAUTHORIZED", expose: true });
+  }
+  const existingOwner = await repo.getOwnerUser();
+  if (existingOwner) {
+    throw new AppError("Owner already exists", { status: 409, code: "OWNER_EXISTS", expose: true });
+  }
+  const updated = await repo.updateUserRole(req.actor.id, Roles.OWNER);
+  await audit(req, "setup.bootstrap_owner", "user", String(req.actor.id));
+  res.json({ ok: true, owner: updated });
+}));
+
 async function issueSessionForUser(req, res, user, auditAction) {
   // SECURITY: rotate existing sessions so stolen old cookies stop working after login.
   await repo.revokeAuthSessionsForUser(user.id);

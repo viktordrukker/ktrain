@@ -46,7 +46,7 @@ for i in {1..20}; do
     docker logs --tail 200 ktrain || true
     exit 1
   fi
-  if curl -fsS http://127.0.0.1:3000/readyz >/dev/null; then
+  if docker compose exec -T ktrain sh -lc 'wget -qO- http://127.0.0.1:3000/readyz >/dev/null' >/dev/null 2>&1; then
     echo "Ready"; exit 0
   fi
   sleep 2

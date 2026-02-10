@@ -427,6 +427,21 @@ const API = {
     if (!res.ok) throw new Error("Failed to load public version");
     return res.json();
   },
+  async getSetupStatus() {
+    const res = await fetch("/api/setup/status", { headers: withAuthHeaders() });
+    if (!res.ok) throw new Error("Failed to load setup status");
+    return res.json();
+  },
+  async completeSetup() {
+    const res = await fetch("/api/setup/complete", { method: "POST", headers: withAuthHeaders() });
+    if (!res.ok) throw new Error("Failed to complete setup");
+    return res.json();
+  },
+  async bootstrapOwner() {
+    const res = await fetch("/api/setup/bootstrap-owner", { method: "POST", headers: withAuthHeaders() });
+    if (!res.ok) throw new Error("Failed to bootstrap owner");
+    return res.json();
+  },
   async getAuthProviders() {
     const res = await fetch("/api/auth/providers");
     if (!res.ok) throw new Error("Failed to load providers");
@@ -987,6 +1002,9 @@ function App() {
   const [showStopModal, setShowStopModal] = useState(false);
   const [showUnsavedSettingsModal, setShowUnsavedSettingsModal] = useState(false);
   const [pendingScreen, setPendingScreen] = useState<Screen | null>(null);
+  const [setupStatus, setSetupStatus] = useState<any>(null);
+  const [setupWizardOpen, setSetupWizardOpen] = useState(false);
+  const [setupMessage, setSetupMessage] = useState("");
   const [savePartial, setSavePartial] = useState(false);
   const [levelConverted, setLevelConverted] = useState(false);
   const [authEmail, setAuthEmail] = useState("");
@@ -1178,6 +1196,20 @@ function App() {
         setPasswordResetEnabled(false);
       });
   }, []);
+
+  const refreshSetupStatus = useCallback(async () => {
+    try {
+      const data = await API.getSetupStatus();
+      setSetupStatus(data);
+      setSetupWizardOpen(!Boolean(data?.wizardCompleted));
+    } catch {
+      setSetupStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshSetupStatus().catch(() => null);
+  }, [refreshSetupStatus, sessionUser]);
 
   useEffect(() => {
     API.getHealth()
@@ -1948,6 +1980,61 @@ function App() {
             Apply
           </Button>
         </Group>
+      </Modal>
+      <Modal
+        opened={setupWizardOpen}
+        onClose={() => {
+          if (setupStatus?.wizardCompleted) setSetupWizardOpen(false);
+        }}
+        title="Installation Wizard"
+        centered
+        closeOnClickOutside={Boolean(setupStatus?.wizardCompleted)}
+        closeOnEscape={Boolean(setupStatus?.wizardCompleted)}
+      >
+        <Stack gap="sm">
+          <Text size="sm">Complete required setup steps to enable full admin functionality.</Text>
+          <Text size="sm">1. Database: {setupStatus?.steps?.database?.ready ? "Ready" : "Missing"}</Text>
+          <Text size="sm">2. SMTP: {setupStatus?.steps?.smtp?.ready ? "Ready" : "Missing"}</Text>
+          <Text size="sm">3. Admin user: {setupStatus?.steps?.adminUser?.ready ? "Ready" : "Missing"}</Text>
+          <Text size="sm">4. Google auth: {setupStatus?.steps?.googleAuth?.ready ? "Ready" : "Optional / Missing"}</Text>
+          {setupMessage && <Alert color="yellow">{setupMessage}</Alert>}
+          <Group justify="space-between">
+            <Button variant="light" onClick={() => refreshSetupStatus().catch(() => null)}>Refresh</Button>
+            <Group>
+              {!setupStatus?.steps?.adminUser?.ready && sessionUser && (
+                <Button
+                  variant="light"
+                  onClick={async () => {
+                    try {
+                      await API.bootstrapOwner();
+                      setSetupMessage("Owner bootstrap complete.");
+                      await API.getPublicSession().then((s) => setSessionUser(s.actor?.isAuthenticated ? s.actor : null));
+                      await refreshSetupStatus();
+                    } catch (err: any) {
+                      setSetupMessage(err?.message || "Owner bootstrap failed.");
+                    }
+                  }}
+                >
+                  Make me owner
+                </Button>
+              )}
+              <Button
+                disabled={!isAdminUser}
+                onClick={async () => {
+                  try {
+                    await API.completeSetup();
+                    setSetupMessage("Setup completed.");
+                    await refreshSetupStatus();
+                  } catch (err: any) {
+                    setSetupMessage(err?.message || "Failed to complete setup.");
+                  }
+                }}
+              >
+                Complete setup
+              </Button>
+            </Group>
+          </Group>
+        </Stack>
       </Modal>
       <header className="topbar">
         <UnstyledButton className="brand" onClick={handleBrandClick} aria-label="Go to main menu">K-TRAIN</UnstyledButton>
@@ -3326,116 +3413,124 @@ function SettingsScreen({
             </SettingRow>
           </SettingsSection>
 
-          {isAdmin && (
           <SettingsSection
             id="content"
             title="Content & Randomness"
             description="Manage vocabulary packs and generation."
           >
-            <div className="setting-row full">
-              <Button variant="light" onClick={() => setLanguagePackModalOpen(true)}>Open Language Packs</Button>
-            </div>
-            <Modal opened={languagePackModalOpen} onClose={() => setLanguagePackModalOpen(false)} title="Language Packs" size="xl" centered>
-              <div className="vocab-manager">
-                <Group justify="space-between" mb="sm">
-                  <Button
-                    variant="light"
-                    onClick={async () => {
-                      const exported = await API.exportLanguagePacks();
-                      setPackJson(JSON.stringify(exported, null, 2));
-                    }}
-                  >
-                    Export JSON
-                  </Button>
-                  <Button
-                    variant="light"
-                    onClick={async () => {
-                      try {
-                        const parsed = JSON.parse(packJson || "{}");
-                        await API.importLanguagePacks(parsed);
-                        onReloadPacks();
-                        setOpenaiStatus("Pack JSON imported.");
-                      } catch {
-                        setOpenaiStatus("Invalid JSON for import.");
-                      }
-                    }}
-                  >
-                    Import JSON
-                  </Button>
-                </Group>
-                <Textarea
-                  label="Import / Export JSON"
-                  value={packJson}
-                  onChange={(e) => setPackJson(e.currentTarget.value)}
-                  minRows={4}
-                />
-                <Group align="flex-end" style={{ flexWrap: "wrap" }}>
-                  <TextInput
-                    label="Topic"
-                    value={generateName}
-                    onChange={(e) => setGenerateName(e.currentTarget.value)}
-                    placeholder="e.g. animals"
-                  />
-                  <Select
-                    label="Pack type"
-                    value={generateType}
-                    onChange={(value) => setGenerateType((value || "level2") as any)}
-                    data={[
-                      { value: "level2", label: "Level 2 words" },
-                      { value: "level3", label: "Level 3 words" },
-                      { value: "sentence_words", label: "Sentence words" }
-                    ]}
-                  />
-                  <NumberInput
-                    label="Count"
-                    min={10}
-                    max={200}
-                    value={generateCount}
-                    onChange={(value) => setGenerateCount(Number(value) || 10)}
-                  />
-                  <Button
-                    onClick={async () => {
-                      await onGenerate({ topic: generateName, count: generateCount, type: generateType, language: settings.language });
-                      onReloadPacks();
-                    }}
-                  >
-                    Generate Draft
-                  </Button>
-                </Group>
-
-                <div className="pack-list">
-                  {packs.map((pack) => (
-                    <div className="pack" key={pack.id}>
-                      <div className="pack-header">
-                        <strong>{pack.name}</strong>
-                        <span>{pack.packType}</span>
-                        <span>{pack.active ? "PUBLISHED" : "DRAFT"}</span>
-                      </div>
-                      <Textarea
-                        value={manualEdit[pack.id] ?? pack.items.join(", ")}
-                        onChange={(e) => setManualEdit({ ...manualEdit, [pack.id]: e.currentTarget.value })}
-                        minRows={3}
-                      />
-                      <div className="row">
-                        <Button variant="light" onClick={() => onActivatePack(pack.id)}>Publish</Button>
-                        <Button
-                          variant="light"
-                          onClick={() => {
-                            const raw = manualEdit[pack.id] ?? pack.items.join(", ");
-                            onUpdatePack(pack.id, { items: raw.split(/\s*,\s*/).filter(Boolean) });
-                          }}
-                        >
-                          Save
-                        </Button>
-                        <Button variant="light" onClick={() => onDeletePack(pack.id)}>Unpublish</Button>
-                      </div>
-                    </div>
-                  ))}
+            {isAdmin ? (
+              <>
+                <div className="setting-row full">
+                  <Button variant="light" onClick={() => setLanguagePackModalOpen(true)}>Open Language Packs</Button>
                 </div>
+                <Modal opened={languagePackModalOpen} onClose={() => setLanguagePackModalOpen(false)} title="Language Packs" size="xl" centered>
+                  <div className="vocab-manager">
+                    <Group justify="space-between" mb="sm">
+                      <Button
+                        variant="light"
+                        onClick={async () => {
+                          const exported = await API.exportLanguagePacks();
+                          setPackJson(JSON.stringify(exported, null, 2));
+                        }}
+                      >
+                        Export JSON
+                      </Button>
+                      <Button
+                        variant="light"
+                        onClick={async () => {
+                          try {
+                            const parsed = JSON.parse(packJson || "{}");
+                            await API.importLanguagePacks(parsed);
+                            onReloadPacks();
+                            setOpenaiStatus("Pack JSON imported.");
+                          } catch {
+                            setOpenaiStatus("Invalid JSON for import.");
+                          }
+                        }}
+                      >
+                        Import JSON
+                      </Button>
+                    </Group>
+                    <Textarea
+                      label="Import / Export JSON"
+                      value={packJson}
+                      onChange={(e) => setPackJson(e.currentTarget.value)}
+                      minRows={4}
+                    />
+                    <Group align="flex-end" style={{ flexWrap: "wrap" }}>
+                      <TextInput
+                        label="Topic"
+                        value={generateName}
+                        onChange={(e) => setGenerateName(e.currentTarget.value)}
+                        placeholder="e.g. animals"
+                      />
+                      <Select
+                        label="Pack type"
+                        value={generateType}
+                        onChange={(value) => setGenerateType((value || "level2") as any)}
+                        data={[
+                          { value: "level2", label: "Level 2 words" },
+                          { value: "level3", label: "Level 3 words" },
+                          { value: "sentence_words", label: "Sentence words" }
+                        ]}
+                      />
+                      <NumberInput
+                        label="Count"
+                        min={10}
+                        max={200}
+                        value={generateCount}
+                        onChange={(value) => setGenerateCount(Number(value) || 10)}
+                      />
+                      <Button
+                        onClick={async () => {
+                          await onGenerate({ topic: generateName, count: generateCount, type: generateType, language: settings.language });
+                          onReloadPacks();
+                        }}
+                      >
+                        Generate Draft
+                      </Button>
+                    </Group>
+
+                    <div className="pack-list">
+                      {packs.map((pack) => (
+                        <div className="pack" key={pack.id}>
+                          <div className="pack-header">
+                            <strong>{pack.name}</strong>
+                            <span>{pack.packType}</span>
+                            <span>{pack.active ? "PUBLISHED" : "DRAFT"}</span>
+                          </div>
+                          <Textarea
+                            value={manualEdit[pack.id] ?? pack.items.join(", ")}
+                            onChange={(e) => setManualEdit({ ...manualEdit, [pack.id]: e.currentTarget.value })}
+                            minRows={3}
+                          />
+                          <div className="row">
+                            <Button variant="light" onClick={() => onActivatePack(pack.id)}>Publish</Button>
+                            <Button
+                              variant="light"
+                              onClick={() => {
+                                const raw = manualEdit[pack.id] ?? pack.items.join(", ");
+                                onUpdatePack(pack.id, { items: raw.split(/\s*,\s*/).filter(Boolean) });
+                              }}
+                            >
+                              Save
+                            </Button>
+                            <Button variant="light" onClick={() => onDeletePack(pack.id)}>Unpublish</Button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </Modal>
+              </>
+            ) : (
+              <div className="setting-row full">
+                <Alert color="yellow" title="Admin access required">
+                  Sign in as OWNER or ADMIN to manage language packs.
+                </Alert>
               </div>
-            </Modal>
+            )}
           </SettingsSection>
-          )}
 
           <SettingsSection
             id="preview"
@@ -3514,17 +3609,18 @@ function SettingsScreen({
             </SettingRow>
           </SettingsSection>
 
-          {isAdmin && (
           <SettingsSection
             id="admin"
             title="Admin"
             description="OpenAI, resets, and admin authorization."
           >
-            <div className="setting-row full">
-              <Alert color="blue" title="Admin Authorization">
-                Access is controlled by OWNER/ADMIN role. Admin PIN is fully removed.
-              </Alert>
-            </div>
+            {isAdmin ? (
+              <>
+                <div className="setting-row full">
+                  <Alert color="blue" title="Admin Authorization">
+                    Access is controlled by OWNER/ADMIN role. Admin PIN is fully removed.
+                  </Alert>
+                </div>
             <Divider my="sm" />
             <SettingRow label="Database status" helper="Current backend and runtime status.">
               <Group>
@@ -3744,8 +3840,15 @@ function SettingsScreen({
                 </Button>
               </Group>
             </SettingRow>
+              </>
+            ) : (
+              <div className="setting-row full">
+                <Alert color="red" title="Not authorized">
+                  Admin settings are restricted to OWNER/ADMIN accounts.
+                </Alert>
+              </div>
+            )}
           </SettingsSection>
-          )}
 
           {statusMessage && <div className="status">{statusMessage}</div>}
         </div>
