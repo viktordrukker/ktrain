@@ -159,6 +159,9 @@ class CrashHandler {
     app.get("/healthz", (req, res) => {
       res.status(503).json({ ok: false, recoveryMode: true });
     });
+    app.get("/", (req, res) => {
+      res.redirect("/crash");
+    });
     app.get("/crash", (req, res) => {
       const report = getSummary();
       const mode = String(this.getAppMode() || "info");
@@ -173,6 +176,9 @@ class CrashHandler {
         message: "Fix DB/configuration and restart service to exit recovery mode.",
         version: this.getBuildInfo()
       });
+    });
+    app.get("*", (req, res) => {
+      res.redirect("/crash");
     });
 
     this.recoveryServer = app.listen(this.recoveryPort, () => {

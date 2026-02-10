@@ -110,6 +110,7 @@ jobs:
           script: |
             set -euo pipefail
             DEPLOY_PATH="${{ secrets.DEPLOY_PATH }}"
+            KTRAIN_MASTER_KEY_SECRET="${{ secrets.KTRAIN_MASTER_KEY }}"
             mkdir -p "$DEPLOY_PATH"
             cd "$DEPLOY_PATH"
             echo "Deploy path: $DEPLOY_PATH"
@@ -148,6 +149,8 @@ jobs:
                 printf '%s\n' \
                   'PORT=3000' \
                   'NODE_ENV=production' \
+                  'APP_ENV=production' \
+                  'KTRAIN_BOOTSTRAP_DB=/data/ktrain.sqlite' \
                   'DB_DRIVER=sqlite' \
                   'DB_RUNTIME_CONFIG_PATH=/data/runtime-db.json' \
                   'DB_SWITCH_DUMP_DIR=/data/db-switch' \
@@ -166,6 +169,21 @@ jobs:
                   'AUTH_ADMIN_GROUPS=admins,ldap-admins' > .env
               fi
               chmod 600 .env
+            fi
+
+            if [ -z "$KTRAIN_MASTER_KEY_SECRET" ]; then
+              echo "Missing required GitHub secret: KTRAIN_MASTER_KEY"
+              exit 1
+            fi
+
+            if grep -q '^KTRAIN_MASTER_KEY=' .env; then
+              sed -i "s|^KTRAIN_MASTER_KEY=.*$|KTRAIN_MASTER_KEY=$KTRAIN_MASTER_KEY_SECRET|" .env
+            else
+              printf '\nKTRAIN_MASTER_KEY=%s\n' "$KTRAIN_MASTER_KEY_SECRET" >> .env
+            fi
+
+            if ! grep -q '^KTRAIN_BOOTSTRAP_DB=' .env; then
+              printf 'KTRAIN_BOOTSTRAP_DB=/data/ktrain.sqlite\n' >> .env
             fi
 
             if [ -d ./scripts ]; then
