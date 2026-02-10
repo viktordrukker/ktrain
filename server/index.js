@@ -215,6 +215,11 @@ function isSetupPathAllowed(req) {
   if (p === "/healthz" || p === "/readyz" || p === "/setup") return true;
   if (p.startsWith("/api/public/config/status")) return true;
   if (p.startsWith("/api/setup/")) return true;
+  // WHY: setup UI is served by the same SPA bundle; static assets must remain reachable
+  // while functional app APIs/routes stay gated.
+  if (p.startsWith("/assets/")) return true;
+  if (p === "/icon.svg" || p === "/favicon.ico" || p === "/manifest.webmanifest") return true;
+  if (/\.(css|js|mjs|map|png|jpg|jpeg|svg|ico|webp|woff|woff2|ttf|eot)$/i.test(p)) return true;
   return false;
 }
 
