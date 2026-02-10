@@ -1,4 +1,5 @@
 const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
+const lettersRu = "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ".split("");
 const digits = "0123456789".split("");
 
 const level2Words = [
@@ -33,11 +34,30 @@ const sentenceTemplates = [
   ["the", "red", "car", "goes", "fast"]
 ];
 
+const level2WordsRu = [
+  "дом", "кот", "мяч", "мир", "сад", "нос", "лес", "еда", "сон", "дед",
+  "лук", "сыр", "чай", "сок", "шар", "кот", "мох", "дым", "жук", "рак"
+];
+
+const level3WordsRu = [
+  "машина", "яблоко", "дружба", "школа", "солнышко", "дерево", "книга", "улыбка", "семья", "дорожка",
+  "котенок", "девочка", "мальчик", "карандаш", "игрушка", "облако", "мороженое", "радуга", "цветочек", "ветерок"
+];
+
+const sentenceWordsRu = [
+  "я", "мы", "ты", "мама", "папа", "кот", "пес", "дом", "сад", "школа",
+  "играем", "читаем", "любим", "бежим", "рисуем", "в", "на", "и", "с", "рядом"
+];
+
 module.exports = {
   letters,
+  lettersRu,
   digits,
   level2Words,
   level3Words,
   sentenceWords,
-  sentenceTemplates
+  sentenceTemplates,
+  level2WordsRu,
+  level3WordsRu,
+  sentenceWordsRu
 };

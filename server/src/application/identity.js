@@ -1,6 +1,17 @@
 const { Roles, normalizeRole, compareRoles } = require("../domain/rbac");
 const { hashToken } = require("./auth");
 
+function parseCookies(req) {
+  const header = String(req.headers.cookie || "");
+  const out = {};
+  header.split(";").forEach((part) => {
+    const [k, ...v] = part.trim().split("=");
+    if (!k) return;
+    out[k] = decodeURIComponent(v.join("="));
+  });
+  return out;
+}
+
 function normalizeIp(ip) {
   if (!ip) return "";
   return String(ip).replace(/^::ffff:/, "");
@@ -42,23 +53,26 @@ function inferRoleFromGroups(groups, options) {
 
 async function resolveActor({ req, repo, options }) {
   const authHeader = String(req.headers.authorization || "");
-  if (authHeader.startsWith("Bearer ")) {
-    const rawToken = authHeader.slice("Bearer ".length).trim();
-    if (rawToken) {
-      const session = await repo.getAuthSessionByTokenHash(hashToken(rawToken));
-      if (session) {
-        await repo.touchAuthSession(hashToken(rawToken));
-        return {
-          id: session.userid || session.useridreal || session.id,
-          isAuthenticated: true,
-          authType: "session",
-          externalSubject: session.externalsubject || session.externalSubject || session.email,
-          email: session.email,
-          displayName: session.displayname || session.displayName || session.email?.split("@")[0] || "User",
-          role: normalizeRole(session.role),
-          groups: []
-        };
-      }
+  const cookies = parseCookies(req);
+  const cookieToken = String(cookies.ktrain_session || "").trim();
+  const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.slice("Bearer ".length).trim() : "";
+  const rawToken = bearerToken || cookieToken;
+  if (rawToken) {
+    const tokenHash = hashToken(rawToken);
+    const session = await repo.getAuthSessionByTokenHash(tokenHash);
+    if (session) {
+      await repo.touchAuthSession(tokenHash);
+      return {
+        id: session.userid || session.useridreal || session.id,
+        isAuthenticated: true,
+        authType: "session",
+        externalSubject: session.externalsubject || session.externalSubject || session.email,
+        email: session.email,
+        displayName: session.displayname || session.displayName || session.email?.split("@")[0] || "User",
+        avatarUrl: session.avatarurl || session.avatarUrl || "",
+        role: normalizeRole(session.role),
+        groups: []
+      };
     }
   }
 
@@ -115,6 +129,7 @@ async function resolveActor({ req, repo, options }) {
 
 module.exports = {
   resolveActor,
+  parseCookies,
   parseGroups,
   canTrustProxyHeaders,
   inferRoleFromGroups

@@ -61,8 +61,14 @@ function strictPrompt({ language, type, count, topic }) {
 
 async function seedBuiltinLanguagePacks(repo) {
   const current = await repo.listLanguagePacks({});
-  if (current.length > 0) return;
+  const currentKeys = new Set(
+    current
+      .filter((row) => String(row.status || "").toUpperCase() === "PUBLISHED")
+      .map((row) => `${String(row.language || "").toLowerCase()}:${row.type}`)
+  );
   for (const pack of BUILTIN_PACKS) {
+    const key = `${pack.language}:${pack.type}`;
+    if (currentKeys.has(key)) continue;
     const packId = await repo.createLanguagePack({
       language: pack.language,
       type: pack.type,

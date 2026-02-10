@@ -11,6 +11,14 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function mapUserRow(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    avatarUrl: row.avatarurl || row.avatarUrl || null
+  };
+}
+
 class SqliteAdapter {
   constructor({ sqlitePath, migrationSql }) {
     this.driver = "sqlite";
@@ -138,33 +146,36 @@ class SqliteAdapter {
   }
 
   async findUserByExternalSubject(externalSubject) {
-    return this.db.prepare("SELECT * FROM users WHERE externalSubject = ? LIMIT 1").get(externalSubject) || null;
+    const row = this.db.prepare("SELECT * FROM users WHERE externalSubject = ? LIMIT 1").get(externalSubject);
+    return mapUserRow(row);
   }
 
   async findUserByEmail(email) {
-    return this.db.prepare("SELECT * FROM users WHERE lower(email) = lower(?) LIMIT 1").get(email) || null;
+    const row = this.db.prepare("SELECT * FROM users WHERE lower(email) = lower(?) LIMIT 1").get(email);
+    return mapUserRow(row);
   }
 
   async findUserById(id) {
-    return this.db.prepare("SELECT * FROM users WHERE id = ? LIMIT 1").get(id) || null;
+    const row = this.db.prepare("SELECT * FROM users WHERE id = ? LIMIT 1").get(id);
+    return mapUserRow(row);
   }
 
   async getOwnerUser() {
-    return this.db.prepare("SELECT * FROM users WHERE role = 'OWNER' ORDER BY id ASC LIMIT 1").get() || null;
+    return mapUserRow(this.db.prepare("SELECT * FROM users WHERE role = 'OWNER' ORDER BY id ASC LIMIT 1").get());
   }
 
-  async createUser({ externalSubject, email, displayName, role }) {
+  async createUser({ externalSubject, email, displayName, role, avatarUrl }) {
     const now = nowIso();
     const result = this.db
       .prepare(
-        "INSERT INTO users (externalSubject, email, displayName, role, isActive, createdAt, updatedAt, lastLoginAt) VALUES (?, ?, ?, ?, 1, ?, ?, ?)"
+        "INSERT INTO users (externalSubject, email, displayName, avatarUrl, role, isActive, createdAt, updatedAt, lastLoginAt) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)"
       )
-      .run(externalSubject, email || null, displayName || null, role, now, now, now);
+      .run(externalSubject, email || null, displayName || null, avatarUrl || null, role, now, now, now);
     return this.db.prepare("SELECT * FROM users WHERE id = ?").get(result.lastInsertRowid);
   }
 
   async listUsers() {
-    return this.db.prepare("SELECT id, externalSubject, email, displayName, role, isActive, createdAt, updatedAt, lastLoginAt FROM users ORDER BY id ASC").all();
+    return this.db.prepare("SELECT id, externalSubject, email, displayName, avatarUrl, role, isActive, createdAt, updatedAt, lastLoginAt FROM users ORDER BY id ASC").all();
   }
 
   async updateUserRole(id, role) {
@@ -177,11 +188,54 @@ class SqliteAdapter {
   }
 
   async updateUserProfile(id, { displayName, avatarUrl }) {
-    this.db.prepare("UPDATE users SET displayName = COALESCE(?, displayName), updatedAt = ? WHERE id = ?").run(displayName || null, nowIso(), id);
+    this.db.prepare("UPDATE users SET displayName = COALESCE(?, displayName), avatarUrl = COALESCE(?, avatarUrl), updatedAt = ? WHERE id = ?").run(displayName || null, avatarUrl || null, nowIso(), id);
     if (avatarUrl !== undefined) {
       await this.setConfig("user.avatar", "user", String(id), { avatarUrl: avatarUrl || "" }, `user:${id}`);
     }
     return this.findUserById(id);
+  }
+
+  async findAuthIdentity({ provider, providerSubject }) {
+    const row = this.db.prepare("SELECT * FROM auth_identities WHERE provider = ? AND providerSubject = ? LIMIT 1").get(provider, providerSubject);
+    return row || null;
+  }
+
+  async findPasswordIdentityByEmail(email) {
+    const row = this.db.prepare(`
+      SELECT ai.*, u.email, u.displayName, u.avatarUrl, u.role, u.isActive, u.id as userId
+      FROM auth_identities ai
+      JOIN users u ON u.id = ai.userId
+      WHERE ai.provider = 'password' AND lower(u.email) = lower(?)
+      LIMIT 1
+    `).get(email);
+    return row || null;
+  }
+
+  async upsertAuthIdentity({ userId, provider, providerSubject, passwordHash }) {
+    const now = nowIso();
+    this.db.prepare(`
+      INSERT INTO auth_identities (userId, provider, providerSubject, passwordHash, createdAt, updatedAt)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(userId, provider) DO UPDATE SET
+      providerSubject = excluded.providerSubject,
+      passwordHash = COALESCE(excluded.passwordHash, auth_identities.passwordHash),
+      updatedAt = excluded.updatedAt
+    `).run(userId, provider, providerSubject || null, passwordHash || null, now, now);
+  }
+
+  async createPasswordReset({ userId, tokenHash, expiresAt, requestedIp }) {
+    this.db.prepare(`
+      INSERT INTO password_resets (userId, tokenHash, expiresAt, usedAt, createdAt, requestedIp)
+      VALUES (?, ?, ?, NULL, ?, ?)
+    `).run(userId, tokenHash, expiresAt, nowIso(), requestedIp || null);
+  }
+
+  async consumePasswordReset(tokenHash) {
+    const row = this.db.prepare("SELECT * FROM password_resets WHERE tokenHash = ? LIMIT 1").get(tokenHash);
+    if (!row || row.usedAt) return null;
+    if (Date.parse(row.expiresAt) < Date.now()) return null;
+    this.db.prepare("UPDATE password_resets SET usedAt = ? WHERE id = ?").run(nowIso(), row.id);
+    return row;
   }
 
   async getUserSecret(userId, secretKey) {
@@ -273,6 +327,56 @@ class SqliteAdapter {
       .map((row) => ({ ...row, metadata: row.metadata ? JSON.parse(row.metadata) : null }));
   }
 
+  async insertCrashEvent(payload) {
+    this.db.prepare(`
+      INSERT INTO crash_events
+      (occurredAt, appVersion, appBuild, appCommit, appMode, crashType, startupPhase, errorName, errorMessage, stackTrace, hostname, uptimeSeconds, metadataJson, acknowledgedAt, acknowledgedBy, resolved)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      payload.occurredAt,
+      payload.appVersion || null,
+      payload.appBuild || null,
+      payload.appCommit || null,
+      payload.appMode || null,
+      payload.crashType,
+      payload.startupPhase || null,
+      payload.errorName || null,
+      payload.errorMessage || null,
+      payload.stackTrace || null,
+      payload.hostname || null,
+      payload.uptimeSeconds || null,
+      payload.metadataJson ? JSON.stringify(payload.metadataJson) : null,
+      payload.acknowledgedAt || null,
+      payload.acknowledgedBy || null,
+      payload.resolved ? 1 : 0
+    );
+  }
+
+  async listCrashEvents(limit = 50, unresolvedOnly = false) {
+    const where = unresolvedOnly ? "WHERE resolved = 0" : "";
+    return this.db
+      .prepare(`SELECT * FROM crash_events ${where} ORDER BY occurredAt DESC LIMIT ?`)
+      .all(Number(limit))
+      .map((row) => ({
+        ...row,
+        metadataJson: row.metadataJson ? JSON.parse(row.metadataJson) : null
+      }));
+  }
+
+  async getCrashEventById(id) {
+    const row = this.db.prepare("SELECT * FROM crash_events WHERE id = ? LIMIT 1").get(id);
+    if (!row) return null;
+    return {
+      ...row,
+      metadataJson: row.metadataJson ? JSON.parse(row.metadataJson) : null
+    };
+  }
+
+  async acknowledgeCrashEvent(id, by) {
+    this.db.prepare("UPDATE crash_events SET resolved = 1, acknowledgedAt = ?, acknowledgedBy = ? WHERE id = ?").run(nowIso(), by || null, id);
+    return this.getCrashEventById(id);
+  }
+
   async createMagicLink({ email, tokenHash, expiresAt, requestedIp }) {
     this.db.prepare(`
       INSERT INTO auth_magic_links (email, tokenHash, expiresAt, createdAt, requestedIp)
@@ -298,7 +402,7 @@ class SqliteAdapter {
 
   async getAuthSessionByTokenHash(tokenHash) {
     const row = this.db.prepare(`
-      SELECT s.*, u.id as userIdReal, u.externalSubject, u.email, u.displayName, u.role, u.isActive
+      SELECT s.*, u.id as userIdReal, u.externalSubject, u.email, u.displayName, u.avatarUrl, u.role, u.isActive
       FROM auth_sessions s
       JOIN users u ON u.id = s.userId
       WHERE s.tokenHash = ? AND s.revokedAt IS NULL
@@ -317,8 +421,13 @@ class SqliteAdapter {
     this.db.prepare("UPDATE auth_sessions SET revokedAt = ? WHERE tokenHash = ?").run(nowIso(), tokenHash);
   }
 
+  async revokeAuthSessionsForUser(userId) {
+    this.db.prepare("UPDATE auth_sessions SET revokedAt = ? WHERE userId = ? AND revokedAt IS NULL").run(nowIso(), userId);
+  }
+
   async cleanupAuthSessions() {
     this.db.prepare("DELETE FROM auth_sessions WHERE revokedAt IS NOT NULL OR expiresAt < ?").run(nowIso());
+    this.db.prepare("DELETE FROM password_resets WHERE usedAt IS NOT NULL OR expiresAt < ?").run(nowIso());
   }
 
   async createLanguagePack({ language, type, topic, status, createdBy }) {
@@ -450,7 +559,10 @@ class SqliteAdapter {
       app_config: this.db.prepare("SELECT * FROM app_config ORDER BY id ASC").all(),
       system_secrets: this.db.prepare("SELECT * FROM system_secrets ORDER BY secretKey ASC").all(),
       packs: this.db.prepare("SELECT * FROM packs ORDER BY id ASC").all(),
-      pack_items: this.db.prepare("SELECT * FROM pack_items ORDER BY id ASC").all()
+      pack_items: this.db.prepare("SELECT * FROM pack_items ORDER BY id ASC").all(),
+      auth_identities: this.db.prepare("SELECT * FROM auth_identities ORDER BY id ASC").all(),
+      password_resets: this.db.prepare("SELECT * FROM password_resets ORDER BY id ASC").all(),
+      crash_events: this.db.prepare("SELECT * FROM crash_events ORDER BY id ASC").all()
     };
   }
 
@@ -465,6 +577,9 @@ class SqliteAdapter {
       this.db.prepare("DELETE FROM system_secrets").run();
       this.db.prepare("DELETE FROM pack_items").run();
       this.db.prepare("DELETE FROM packs").run();
+      this.db.prepare("DELETE FROM password_resets").run();
+      this.db.prepare("DELETE FROM auth_identities").run();
+      this.db.prepare("DELETE FROM crash_events").run();
 
       for (const row of dump.settings || []) {
         this.db.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run(row.key, row.value);
@@ -478,8 +593,8 @@ class SqliteAdapter {
           .run(row.id, row.playerName || row.playername, row.createdAt || row.createdat, row.contestType || row.contesttype, row.level, row.contentMode || row.contentmode, row.duration, row.taskTarget || row.tasktarget, row.score, row.accuracy, row.cpm, row.mistakes, row.tasksCompleted || row.taskscompleted, row.timeSeconds || row.timeseconds, row.maxStreak || row.maxstreak);
       }
       for (const row of dump.users || []) {
-        this.db.prepare("INSERT INTO users (id, externalSubject, email, displayName, role, isActive, createdAt, updatedAt, lastLoginAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
-          .run(row.id, row.externalSubject || row.externalsubject, row.email, row.displayName || row.displayname, row.role, row.isActive || row.isactive || 1, row.createdAt || row.createdat, row.updatedAt || row.updatedat, row.lastLoginAt || row.lastloginat || null);
+        this.db.prepare("INSERT INTO users (id, externalSubject, email, displayName, avatarUrl, role, isActive, createdAt, updatedAt, lastLoginAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+          .run(row.id, row.externalSubject || row.externalsubject, row.email, row.displayName || row.displayname, row.avatarUrl || row.avatarurl || null, row.role, row.isActive || row.isactive || 1, row.createdAt || row.createdat, row.updatedAt || row.updatedat, row.lastLoginAt || row.lastloginat || null);
       }
       for (const row of dump.user_secrets || []) {
         this.db.prepare("INSERT INTO user_secrets (id, userId, secretKey, ciphertext, iv, authTag, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
@@ -501,8 +616,38 @@ class SqliteAdapter {
         this.db.prepare("INSERT INTO pack_items (id, packId, text, difficulty, metadataJson) VALUES (?, ?, ?, ?, ?)")
           .run(row.id, row.packId || row.packid, row.text, row.difficulty || null, row.metadataJson || row.metadatajson || null);
       }
+      for (const row of dump.auth_identities || []) {
+        this.db.prepare("INSERT INTO auth_identities (id, userId, provider, providerSubject, passwordHash, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?)")
+          .run(row.id, row.userId || row.userid, row.provider, row.providerSubject || row.providersubject || null, row.passwordHash || row.passwordhash || null, row.createdAt || row.createdat, row.updatedAt || row.updatedat);
+      }
+      for (const row of dump.password_resets || []) {
+        this.db.prepare("INSERT INTO password_resets (id, userId, tokenHash, expiresAt, usedAt, createdAt, requestedIp) VALUES (?, ?, ?, ?, ?, ?, ?)")
+          .run(row.id, row.userId || row.userid, row.tokenHash || row.tokenhash, row.expiresAt || row.expiresat, row.usedAt || row.usedat || null, row.createdAt || row.createdat, row.requestedIp || row.requestedip || null);
+      }
+      for (const row of dump.crash_events || []) {
+        this.db.prepare("INSERT INTO crash_events (id, occurredAt, appVersion, appBuild, appCommit, appMode, crashType, startupPhase, errorName, errorMessage, stackTrace, hostname, uptimeSeconds, metadataJson, acknowledgedAt, acknowledgedBy, resolved) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+          .run(
+            row.id,
+            row.occurredAt || row.occurredat,
+            row.appVersion || row.appversion || null,
+            row.appBuild || row.appbuild || null,
+            row.appCommit || row.appcommit || null,
+            row.appMode || row.appmode || null,
+            row.crashType || row.crashtype,
+            row.startupPhase || row.startupphase || null,
+            row.errorName || row.errorname || null,
+            row.errorMessage || row.errormessage || null,
+            row.stackTrace || row.stacktrace || null,
+            row.hostname || null,
+            row.uptimeSeconds || row.uptimeseconds || null,
+            row.metadataJson || row.metadatajson || null,
+            row.acknowledgedAt || row.acknowledgedat || null,
+            row.acknowledgedBy || row.acknowledgedby || null,
+            row.resolved || 0
+          );
+      }
 
-      this.db.prepare("DELETE FROM sqlite_sequence WHERE name IN ('leaderboard', 'vocab_packs', 'users', 'user_secrets', 'app_config', 'audit_log', 'packs', 'pack_items', 'auth_magic_links', 'auth_sessions')").run();
+      this.db.prepare("DELETE FROM sqlite_sequence WHERE name IN ('leaderboard', 'vocab_packs', 'users', 'user_secrets', 'app_config', 'audit_log', 'packs', 'pack_items', 'auth_magic_links', 'auth_sessions', 'auth_identities', 'password_resets', 'crash_events')").run();
     });
     tx();
   }
@@ -514,7 +659,8 @@ class SqliteAdapter {
     const users = this.db.prepare("SELECT COUNT(*) as c FROM users").get().c;
     const app_config = this.db.prepare("SELECT COUNT(*) as c FROM app_config").get().c;
     const packs = this.db.prepare("SELECT COUNT(*) as c FROM packs").get().c;
-    return { settings, leaderboard, vocab_packs, users, app_config, packs };
+    const crashes = this.db.prepare("SELECT COUNT(*) as c FROM crash_events").get().c;
+    return { settings, leaderboard, vocab_packs, users, app_config, packs, crashes };
   }
 }
 

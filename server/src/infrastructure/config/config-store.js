@@ -3,10 +3,16 @@ const { badRequest } = require("../../shared/errors");
 const SAFE_CONFIG_KEYS = new Set([
   "app.settings",
   "app.features",
+  "app.runtime",
+  "app.about",
+  "app.wizard",
   "contest.rules",
   "generator.defaults",
   "theme.defaults",
-  "service.email"
+  "service.email",
+  "auth.providers",
+  "db.driver_meta",
+  "language.packs.meta"
 ]);
 
 const VALID_SCOPES = new Set(["global", "tenant", "user"]);

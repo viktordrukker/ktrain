@@ -175,4 +175,7 @@ jobs:
               exit 1
             fi
             export IMAGE="ghcr.io/${{ github.repository }}:${{ github.event.inputs.image_tag || 'latest' }}"
-            APP_DIR="$DEPLOY_PATH" IMAGE="$IMAGE" ./scripts/deploy_remote.sh
+            export APP_BUILD="${{ github.run_number }}"
+            export APP_COMMIT="${{ github.sha }}"
+            export APP_VERSION="${{ github.event.inputs.image_tag || 'latest' }}"
+            APP_DIR="$DEPLOY_PATH" IMAGE="$IMAGE" APP_BUILD="$APP_BUILD" APP_COMMIT="$APP_COMMIT" APP_VERSION="$APP_VERSION" ./scripts/deploy_remote.sh

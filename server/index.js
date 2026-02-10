@@ -12,7 +12,19 @@ const { loadSettings, saveSettings } = require("./settings");
 const { readRuntimeConfig, writeRuntimeConfig, RUNTIME_CONFIG_PATH } = require("./db/runtime-config");
 const { Roles, Permissions, normalizeRole, hasPermission } = require("./src/domain/rbac");
 const { resolveActor } = require("./src/application/identity");
-const { createAuthSession, createMagicLink, consumeMagicLink, getOrCreateUserByEmail, hashToken } = require("./src/application/auth");
+const {
+  createAuthSession,
+  getOrCreateUserByEmail,
+  hashToken,
+  normalizeEmail,
+  validatePasswordPolicy,
+  hashPassword,
+  verifyPassword,
+  upsertPasswordIdentity,
+  getPasswordIdentityByEmail,
+  createPasswordReset,
+  consumePasswordReset
+} = require("./src/application/auth");
 const { seedBuiltinLanguagePacks, strictPrompt } = require("./src/application/language-packs");
 const { checkConfigSchema, checkMigrations, checkRequiredIndexes, checkEncryption } = require("./src/application/self-checks");
 const { requestContextMiddleware, requirePermission, withAsync, errorHandler } = require("./src/interface/http/middleware");
@@ -20,6 +32,7 @@ const { asEnum, asNumber, asString, parseJsonArrayOfStrings, requireObject } = r
 const { ConfigStore, SAFE_CONFIG_KEYS } = require("./src/infrastructure/config/config-store");
 const { EncryptionService } = require("./src/infrastructure/security/encryption");
 const { SmtpService } = require("./src/infrastructure/email/smtp-service");
+const { CrashHandler } = require("./src/infrastructure/reliability/crash-handler");
 const logger = require("./src/shared/logger");
 const { AppError, badRequest } = require("./src/shared/errors");
 const defaults = require("./data/defaults");
@@ -34,12 +47,23 @@ let smtpService;
 let activeDriver = resolveDriver();
 let maintenanceMode = false;
 let startupSelfChecks = {};
+let startupReady = false;
+let startupPhase = "boot";
+let shuttingDown = false;
+
+const BUILD_INFO = {
+  version: process.env.APP_VERSION || "0.0.0",
+  build: process.env.APP_BUILD || "0",
+  commit: process.env.APP_COMMIT || process.env.GIT_COMMIT || "unknown"
+};
 
 const PORT = process.env.PORT || 3000;
 const OWNER_EMAIL = process.env.OWNER_EMAIL || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const APP_BASE_URL = process.env.APP_BASE_URL || "http://localhost:3000";
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
+const SESSION_COOKIE_NAME = process.env.SESSION_COOKIE_NAME || "ktrain_session";
+const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 30 * 24 * 60 * 60 * 1000);
 const AUTH_OWNER_GROUPS = String(process.env.AUTH_OWNER_GROUPS || "owners").split(",").map((x) => x.trim()).filter(Boolean);
 const AUTH_ADMIN_GROUPS = String(process.env.AUTH_ADMIN_GROUPS || "admins,ldap-admins").split(",").map((x) => x.trim()).filter(Boolean);
 const AUTH_MODERATOR_GROUPS = String(process.env.AUTH_MODERATOR_GROUPS || "moderators").split(",").map((x) => x.trim()).filter(Boolean);
@@ -49,10 +73,37 @@ const DB_SWITCH_RESTART_CMD = process.env.DB_SWITCH_RESTART_CMD || "";
 const DB_SWITCH_POSTGRES_UP_CMD = process.env.DB_SWITCH_POSTGRES_UP_CMD || "";
 const DB_SWITCH_DUMP_DIR = process.env.DB_SWITCH_DUMP_DIR || "/data/db-switch";
 const DB_SWITCH_AUDIT_LOG = process.env.DB_SWITCH_AUDIT_LOG || "/data/db-switch/switch-audit.log";
+const APP_MODE = String(process.env.APP_MODE || "info").toLowerCase();
+const ADVANCED_DEBUG_TTL_MINUTES = Number(process.env.ADVANCED_DEBUG_TTL_MINUTES || 30);
+const CRASH_REPORTS_DIR = process.env.CRASH_REPORTS_DIR || "/data/crash-reports";
+const CRASH_ALERT_EMAILS = String(process.env.CRASH_ALERT_EMAILS || "").split(",").map((x) => x.trim()).filter(Boolean);
+let currentAppMode = APP_MODE;
 
 if (AUTH_TRUST_PROXY) {
   app.set("trust proxy", true);
 }
+
+if (currentAppMode === "advanced-debug") {
+  logger.warn("advanced_debug_enabled", {
+    ttlMinutes: ADVANCED_DEBUG_TTL_MINUTES,
+    warning: "ADVANCED DEBUG ACTIVE"
+  });
+}
+
+function setStartupPhase(phase) {
+  startupPhase = phase;
+}
+
+const crashHandler = new CrashHandler({
+  getRepo: () => repo,
+  getSmtpService: () => smtpService,
+  getBuildInfo: () => BUILD_INFO,
+  getStartupPhase: () => startupPhase,
+  getAppMode: () => currentAppMode,
+  getAdminEmails: () => Array.from(new Set([OWNER_EMAIL, ...CRASH_ALERT_EMAILS].filter(Boolean))),
+  crashDir: CRASH_REPORTS_DIR,
+  recoveryPort: Number(PORT)
+});
 
 app.use(helmet({
   contentSecurityPolicy: {
@@ -143,6 +194,45 @@ function clampNumber(value, min, max, fallback = 0) {
   return Math.min(Math.max(num, min), max);
 }
 
+function setSessionCookie(res, token, expiresAt) {
+  const expiresDate = new Date(expiresAt || Date.now() + SESSION_TTL_MS);
+  const parts = [
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
+    "HttpOnly",
+    "Path=/",
+    `Max-Age=${Math.floor(Math.max(expiresDate.getTime() - Date.now(), 1) / 1000)}`,
+    `Expires=${expiresDate.toUTCString()}`,
+    "SameSite=Lax"
+  ];
+  if (String(process.env.NODE_ENV || "").toLowerCase() === "production") {
+    parts.push("Secure");
+  }
+  res.setHeader("Set-Cookie", parts.join("; "));
+}
+
+function clearSessionCookie(res) {
+  const parts = [
+    `${SESSION_COOKIE_NAME}=`,
+    "HttpOnly",
+    "Path=/",
+    "Max-Age=0",
+    "Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+    "SameSite=Lax"
+  ];
+  if (String(process.env.NODE_ENV || "").toLowerCase() === "production") {
+    parts.push("Secure");
+  }
+  res.setHeader("Set-Cookie", parts.join("; "));
+}
+
+function safeJsonStringify(value) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "__serialization_error__";
+  }
+}
+
 function createRateLimiter({ windowMs, max }) {
   const hits = new Map();
   return (req, res, next) => {
@@ -165,6 +255,7 @@ function createRateLimiter({ windowMs, max }) {
 const adminLimiter = createRateLimiter({ windowMs: 60_000, max: 60 });
 const resultsLimiter = createRateLimiter({ windowMs: 60_000, max: 90 });
 const generationLimiter = createRateLimiter({ windowMs: 60_000, max: 30 });
+const authLimiter = createRateLimiter({ windowMs: 10 * 60_000, max: 30 });
 
 async function getSetting(key) {
   return repo.getSetting(key);
@@ -215,13 +306,20 @@ async function generateTasks(level, count, contentMode, language = "en") {
   const level3PackItems = contentMode === "vocab" ? await repo.getPublishedPackItems({ language, type: "level3" }) : [];
   const sentencePackItems = contentMode === "vocab" ? await repo.getPublishedPackItems({ language, type: "sentence_words" }) : [];
 
-  const level2Words = level2PackItems.length ? level2PackItems.map((row) => row.text) : defaults.level2Words;
-  const level3Words = level3PackItems.length ? level3PackItems.map((row) => row.text) : defaults.level3Words;
-  const sentenceWords = sentencePackItems.length ? sentencePackItems.map((row) => row.text) : defaults.sentenceWords;
+  const useRuDefaults = language === "ru";
+  const level2Words = level2PackItems.length
+    ? level2PackItems.map((row) => row.text)
+    : (useRuDefaults ? defaults.level2WordsRu : defaults.level2Words);
+  const level3Words = level3PackItems.length
+    ? level3PackItems.map((row) => row.text)
+    : (useRuDefaults ? defaults.level3WordsRu : defaults.level3Words);
+  const sentenceWords = sentencePackItems.length
+    ? sentencePackItems.map((row) => row.text)
+    : (useRuDefaults ? defaults.sentenceWordsRu : defaults.sentenceWords);
 
   if (level === 1) {
     for (let i = 0; i < count; i++) {
-      const pool = [...defaults.letters, ...defaults.digits];
+      const pool = [...(language === "ru" ? defaults.lettersRu : defaults.letters), ...defaults.digits];
       const letter = chooseRandom(pool);
       tasks.push({ id: `${level}-c-${Date.now()}-${i}`, level, prompt: letter, answer: letter });
     }
@@ -438,10 +536,13 @@ async function rollbackDbSwitch(requestedBy) {
 }
 
 app.get("/healthz", (req, res) => {
-  res.json({ ok: true, service: "ktrain", driver: activeDriver, maintenanceMode });
+  res.json({ ok: true, service: "ktrain", driver: activeDriver, maintenanceMode, startupReady, appMode: currentAppMode, build: BUILD_INFO });
 });
 
 app.get("/readyz", async (req, res) => {
+  if (!startupReady) {
+    return res.status(503).json({ ok: false, ready: false, error: "Startup not complete", phase: startupPhase });
+  }
   try {
     await repo.ping();
     res.json({ ok: true, ready: true, driver: activeDriver });
@@ -451,7 +552,7 @@ app.get("/readyz", async (req, res) => {
 });
 
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, driver: activeDriver, dbDriverEnv: DB_DRIVER_ENV });
+  res.json({ ok: true, driver: activeDriver, dbDriverEnv: DB_DRIVER_ENV, startupReady, appMode: currentAppMode, build: BUILD_INFO });
 });
 
 app.get("/api/public/session", (req, res) => {
@@ -459,75 +560,203 @@ app.get("/api/public/session", (req, res) => {
   res.json({ ok: true, isAdmin: role === Roles.ADMIN || role === Roles.OWNER, role, actor: req.actor || null });
 });
 
-app.get("/api/auth/providers", (req, res) => {
+app.get("/api/public/version", (req, res) => {
   res.json({
     ok: true,
-    google: { enabled: Boolean(GOOGLE_CLIENT_ID), clientId: GOOGLE_CLIENT_ID || null },
-    magicLink: { enabled: true }
+    version: BUILD_INFO.version,
+    build: BUILD_INFO.build,
+    commit: BUILD_INFO.commit,
+    appMode: currentAppMode,
+    buildTime: process.env.APP_BUILD_TIME || null,
+    githubUrl: process.env.APP_GITHUB_URL || "https://github.com/viktordrukker/ktrain",
+    website: "https://thedrukkers.com",
+    contact: "mailto:vdrukker@thedrukkers.com"
   });
 });
 
-app.post("/api/auth/google", generationLimiter, withAsync(async (req, res) => {
+app.get("/api/auth/providers", withAsync(async (req, res) => {
+  const emailSettings = await smtpService.getEmailSettings();
+  const passwordResetEnabled = Boolean(
+    emailSettings.host && emailSettings.username && emailSettings.password && emailSettings.fromAddress
+  );
+  res.json({
+    ok: true,
+    google: { enabled: Boolean(GOOGLE_CLIENT_ID), clientId: GOOGLE_CLIENT_ID || null },
+    password: { enabled: true, resetEnabled: passwordResetEnabled }
+  });
+}));
+
+app.get("/api/setup/status", withAsync(async (req, res) => {
+  let dbOk = false;
+  try {
+    await repo.ping();
+    dbOk = true;
+  } catch {
+    dbOk = false;
+  }
+  const owner = dbOk ? await repo.getOwnerUser() : null;
+  const email = dbOk ? await smtpService.getEmailSettings() : null;
+  const wizard = dbOk
+    ? await configStore.get("app.wizard", { scope: "global", scopeId: "global", fallback: { completedAt: null, schemaVersion: 1 } })
+    : { completedAt: null, schemaVersion: 1 };
+  res.json({
+    ok: true,
+    wizardCompleted: Boolean(wizard?.completedAt),
+    steps: {
+      database: { ready: dbOk },
+      smtp: { ready: Boolean(email?.host && email?.username && email?.fromAddress) },
+      adminUser: { ready: Boolean(owner) },
+      googleAuth: { ready: Boolean(GOOGLE_CLIENT_ID) }
+    }
+  });
+}));
+
+app.post("/api/setup/complete", requirePermission(Permissions.ADMIN_CONFIG_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  await configStore.setSafe("app.wizard", {
+    completedAt: new Date().toISOString(),
+    schemaVersion: 1
+  }, { scope: "global", scopeId: "global", updatedBy: req.actor?.externalSubject || "admin" });
+  await audit(req, "setup.complete", "wizard", "app");
+  res.json({ ok: true });
+}));
+
+async function issueSessionForUser(req, res, user, auditAction) {
+  // SECURITY: rotate existing sessions so stolen old cookies stop working after login.
+  await repo.revokeAuthSessionsForUser(user.id);
+  const session = await createAuthSession(repo, user, { userAgent: req.headers["user-agent"], ip: req.ip });
+  setSessionCookie(res, session.token, session.expiresAt);
+  if (auditAction) {
+    await audit(req, auditAction, "user", String(user.id), { email: user.email });
+  }
+}
+
+function genericAuthError() {
+  return new AppError("Invalid email or password", { status: 401, code: "AUTH_INVALID", expose: true });
+}
+
+app.post("/api/auth/google", authLimiter, withAsync(async (req, res) => {
   const credential = asString(req.body?.credential || "", { min: 32, max: 8000, field: "credential" });
   const payload = await verifyGoogleCredential(credential);
   const email = payload.email;
   if (!email) throw badRequest("Google account email is required");
-  const user = await getOrCreateUserByEmail(repo, email, Roles.USER);
+  let user = await getOrCreateUserByEmail(repo, email, Roles.USER);
+  await repo.upsertAuthIdentity({
+    userId: user.id,
+    provider: "google",
+    providerSubject: String(payload.sub || ""),
+    passwordHash: null
+  });
   await repo.updateUserProfile(user.id, { displayName: payload.name || user.displayName, avatarUrl: payload.picture || "" });
-  const session = await createAuthSession(repo, user, { userAgent: req.headers["user-agent"], ip: req.ip });
-  await audit(req, "auth.google.login", "user", String(user.id), { email });
+  await repo.touchUserLogin(user.id);
+  user = await repo.findUserById(user.id);
+  await issueSessionForUser(req, res, user, "auth.google.login");
   res.json({
     ok: true,
-    token: session.token,
-    expiresAt: session.expiresAt,
     user: {
       id: user.id,
       email: user.email,
-      displayName: payload.name || user.displayName,
-      avatarUrl: payload.picture || "",
+      displayName: user.displayName,
+      avatarUrl: user.avatarUrl || payload.picture || "",
       role: user.role
     }
   });
 }));
 
-app.post("/api/auth/magic-link/request", generationLimiter, withAsync(async (req, res) => {
-  const email = asString(req.body?.email || "", { min: 5, max: 255, field: "email" }).toLowerCase();
-  const link = await createMagicLink(repo, email, { ip: req.ip });
-  const url = `${APP_BASE_URL}/?magic_token=${encodeURIComponent(link.token)}`;
-  await smtpService.send({
-    to: email,
-    subject: "Your KTrain sign-in link",
-    text: `Use this sign-in link (expires in 15 minutes): ${url}`,
-    html: `<p>Use this sign-in link (expires in 15 minutes):</p><p><a href=\"${url}\">${url}</a></p>`
+app.post("/api/auth/register", authLimiter, withAsync(async (req, res) => {
+  const email = normalizeEmail(asString(req.body?.email || "", { min: 5, max: 255, field: "email" }));
+  const displayName = asString(req.body?.displayName || email.split("@")[0] || "Player", { min: 1, max: 64, field: "displayName" });
+  const password = asString(req.body?.password || "", { min: 10, max: 128, field: "password" });
+  const passwordPolicy = validatePasswordPolicy(password);
+  if (!passwordPolicy.ok) throw badRequest(passwordPolicy.message);
+
+  const existing = await repo.findUserByEmail(email);
+  if (existing) {
+    throw new AppError("Email already in use", { status: 409, code: "EMAIL_EXISTS", expose: true });
+  }
+  const user = await repo.createUser({
+    externalSubject: `password:${email}`,
+    email,
+    displayName,
+    role: Roles.USER
   });
-  await audit(req, "auth.magic_link.request", "email", email);
-  res.json({ ok: true });
+  const passwordHash = await hashPassword(password);
+  await upsertPasswordIdentity(repo, user.id, passwordHash);
+  await repo.touchUserLogin(user.id);
+  const fresh = await repo.findUserById(user.id);
+  await issueSessionForUser(req, res, fresh, "auth.password.register");
+  res.status(201).json({ ok: true, user: { id: fresh.id, email: fresh.email, displayName: fresh.displayName, avatarUrl: fresh.avatarUrl || "", role: fresh.role } });
 }));
 
-app.post("/api/auth/magic-link/verify", generationLimiter, withAsync(async (req, res) => {
+app.post("/api/auth/login", authLimiter, withAsync(async (req, res) => {
+  const email = normalizeEmail(asString(req.body?.email || "", { min: 5, max: 255, field: "email" }));
+  const password = asString(req.body?.password || "", { min: 1, max: 128, field: "password" });
+  const identity = await getPasswordIdentityByEmail(repo, email);
+  const ok = await verifyPassword(password, identity?.passwordhash || identity?.passwordHash || "");
+  if (!identity || !ok) throw genericAuthError();
+  const user = await repo.findUserById(identity.userid || identity.userId);
+  if (!user || Number(user.isActive) !== 1) throw genericAuthError();
+  await repo.touchUserLogin(user.id);
+  await issueSessionForUser(req, res, user, "auth.password.login");
+  res.json({ ok: true, user: { id: user.id, email: user.email, displayName: user.displayName, avatarUrl: user.avatarUrl || "", role: user.role } });
+}));
+
+app.post("/api/auth/password-reset/request", authLimiter, withAsync(async (req, res) => {
+  const email = normalizeEmail(asString(req.body?.email || "", { min: 5, max: 255, field: "email" }));
+  const user = await repo.findUserByEmail(email);
+  const responseMessage = "If the account exists, a password reset email has been sent.";
+  if (!user) {
+    await audit(req, "auth.password.reset.request", "email", email, { result: "masked_no_user" });
+    return res.json({ ok: true, message: responseMessage });
+  }
+  try {
+    const token = await createPasswordReset(repo, user.id, { ip: req.ip });
+    const url = `${APP_BASE_URL}/?reset_token=${encodeURIComponent(token.token)}`;
+    await smtpService.send({
+      to: email,
+      subject: "Reset your KTrain password",
+      text: `Reset your password using this link (expires in 1 hour): ${url}`,
+      html: `<p>Reset your password using this link (expires in 1 hour):</p><p><a href="${url}">${url}</a></p>`
+    });
+    await audit(req, "auth.password.reset.request", "user", String(user.id), { email, sent: true });
+  } catch {
+    await audit(req, "auth.password.reset.request", "user", String(user.id), { email, sent: false });
+  }
+  return res.json({ ok: true, message: responseMessage });
+}));
+
+app.post("/api/auth/password-reset/confirm", authLimiter, withAsync(async (req, res) => {
   const token = asString(req.body?.token || "", { min: 20, max: 255, field: "token" });
-  const session = await consumeMagicLink(repo, token, { userAgent: req.headers["user-agent"], ip: req.ip });
-  if (!session) throw badRequest("Invalid or expired link");
-  await audit(req, "auth.magic_link.verify", "user", String(session.user.id), { email: session.user.email });
-  res.json({
-    ok: true,
-    token: session.token,
-    expiresAt: session.expiresAt,
-    user: {
-      id: session.user.id,
-      email: session.user.email,
-      displayName: session.user.displayName,
-      role: session.user.role
-    }
-  });
+  const password = asString(req.body?.password || "", { min: 10, max: 128, field: "password" });
+  const passwordPolicy = validatePasswordPolicy(password);
+  if (!passwordPolicy.ok) throw badRequest(passwordPolicy.message);
+  const row = await consumePasswordReset(repo, token);
+  if (!row) throw badRequest("Invalid or expired reset token");
+  const userId = row.userid || row.userId;
+  const passwordHash = await hashPassword(password);
+  await upsertPasswordIdentity(repo, userId, passwordHash);
+  await repo.revokeAuthSessionsForUser(userId);
+  const user = await repo.findUserById(userId);
+  await repo.touchUserLogin(userId);
+  await issueSessionForUser(req, res, user, "auth.password.reset.success");
+  res.json({ ok: true });
 }));
 
 app.post("/api/auth/logout", withAsync(async (req, res) => {
   const authHeader = String(req.headers.authorization || "");
+  const cookieHeader = String(req.headers.cookie || "");
   if (authHeader.startsWith("Bearer ")) {
     const tokenHash = hashToken(authHeader.slice("Bearer ".length).trim());
     await repo.revokeAuthSession(tokenHash);
   }
+  const cookieToken = cookieHeader
+    .split(";")
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(`${SESSION_COOKIE_NAME}=`));
+  if (cookieToken) {
+    const raw = decodeURIComponent(cookieToken.split("=").slice(1).join("=") || "");
+    if (raw) await repo.revokeAuthSession(hashToken(raw));
+  }
+  clearSessionCookie(res);
   res.json({ ok: true });
 }));
 
@@ -548,11 +777,7 @@ app.get("/api/user/profile", requirePermission(Permissions.SESSION_READ), withAs
   if (!req.actor?.isAuthenticated) {
     return res.json({ ok: true, profile: null });
   }
-  const avatarCfg = await configStore.get("user.avatar", {
-    scope: "user",
-    scopeId: String(req.actor.id),
-    fallback: { avatarUrl: "" }
-  });
+  const dbUser = await repo.findUserById(req.actor.id);
   res.json({
     ok: true,
     profile: {
@@ -560,7 +785,7 @@ app.get("/api/user/profile", requirePermission(Permissions.SESSION_READ), withAs
       email: req.actor.email,
       displayName: req.actor.displayName,
       role: req.actor.role,
-      avatarUrl: avatarCfg.avatarUrl || ""
+      avatarUrl: dbUser?.avatarUrl || req.actor.avatarUrl || ""
     }
   });
 }));
@@ -603,11 +828,21 @@ app.post("/api/tasks/generate", requirePermission(Permissions.TASKS_GENERATE), r
   const safeCount = asNumber(body.count ?? 10, { min: 5, max: 100, field: "count" });
   const safeContentMode = body.contentMode === "vocab" ? "vocab" : "default";
   const requestedLanguage = String(body.language || "en").toLowerCase();
-  const fallbackLanguage = ["en", "ru"].includes(requestedLanguage) ? requestedLanguage : "en";
   const languages = await repo.listPublishedLanguagesByType(safeLevel === 2 ? "level2" : safeLevel === 3 ? "level3" : "sentence_words");
-  const language = languages.includes(requestedLanguage) ? requestedLanguage : fallbackLanguage;
+  let fallbackNotice = null;
+  let language = requestedLanguage;
+  if (!languages.includes(language)) {
+    if (requestedLanguage === "ru" && languages.includes("en")) {
+      language = "en";
+      fallbackNotice = "Russian pack missing, using English";
+    } else if (languages.length > 0) {
+      language = languages[0];
+    } else {
+      language = requestedLanguage === "ru" ? "ru" : "en";
+    }
+  }
   const tasks = await generateTasks(safeLevel, safeCount, safeContentMode, language);
-  res.json({ tasks, language, safeDefaultsApplied: !actorIsAuthorized });
+  res.json({ tasks, language, fallbackNotice, safeDefaultsApplied: !actorIsAuthorized });
 }));
 
 app.post("/api/results", requirePermission(Permissions.RESULTS_WRITE), requireNotMaintenance, resultsLimiter, withAsync(async (req, res) => {
@@ -653,7 +888,12 @@ app.post("/api/results", requirePermission(Permissions.RESULTS_WRITE), requireNo
 
 app.get("/api/leaderboard", requirePermission(Permissions.LEADERBOARD_READ), withAsync(async (req, res) => {
   const entries = await repo.queryLeaderboard({ ...(req.query || {}), onlyAuthorized: true });
-  res.json({ entries });
+  let myRank = null;
+  if (req.actor?.isAuthenticated) {
+    const idx = entries.findIndex((entry) => Number(entry.userid || entry.userId) === Number(req.actor.id));
+    if (idx >= 0) myRank = idx + 1;
+  }
+  res.json({ entries, myRank });
 }));
 
 app.get("/api/packs/languages", requirePermission(Permissions.TASKS_GENERATE), withAsync(async (req, res) => {
@@ -883,9 +1123,10 @@ app.get("/api/admin/service-settings", requirePermission(Permissions.ADMIN_CONFI
 
 app.post("/api/admin/service-settings/email", requirePermission(Permissions.ADMIN_CONFIG_MANAGE), adminLimiter, withAsync(async (req, res) => {
   const payload = requireObject(req.body || {}, "email settings");
-  const saved = await smtpService.saveEmailSettings(payload, req.actor?.externalSubject || "admin");
+  await smtpService.saveEmailSettings(payload, req.actor?.externalSubject || "admin");
+  const saved = await smtpService.getEmailSettings();
   await audit(req, "service_settings.email.update", "email", "smtp");
-  res.json({ ok: true, settings: { ...saved, hasPassword: Boolean(payload.password) } });
+  res.json({ ok: true, settings: { ...saved, hasPassword: Boolean(saved.password) } });
 }));
 
 app.post("/api/admin/service-settings/email/test", requirePermission(Permissions.ADMIN_CONFIG_MANAGE), adminLimiter, withAsync(async (req, res) => {
@@ -1048,6 +1289,139 @@ app.post("/api/admin/config/import", requirePermission(Permissions.ADMIN_CONFIG_
   res.json({ ok: true });
 }));
 
+app.post("/api/admin/config/export", requirePermission(Permissions.ADMIN_CONFIG_PORTABILITY), adminLimiter, withAsync(async (req, res) => {
+  const includeSecrets = Boolean(req.body?.includeSecrets);
+  const rows = await configStore.exportSafeConfig();
+  const runtime = readRuntimeConfig();
+  const languagePackMeta = (await repo.listLanguagePacks({})).map((p) => ({
+    id: p.id,
+    language: p.language,
+    type: p.type,
+    status: p.status,
+    topic: p.topic,
+    updatedAt: p.updatedAt || p.updatedat
+  }));
+  const metadata = {
+    appVersion: BUILD_INFO.version,
+    schemaVersion: 1,
+    exportedAt: new Date().toISOString(),
+    build: BUILD_INFO.build,
+    commit: BUILD_INFO.commit
+  };
+  let secrets = [];
+  if (includeSecrets) {
+    const smtpSecret = await repo.getSystemSecret("smtp.password");
+    if (smtpSecret) {
+      secrets.push({
+        key: "smtp.password",
+        ciphertext: smtpSecret.ciphertext,
+        iv: smtpSecret.iv,
+        authTag: smtpSecret.authtag || smtpSecret.authTag
+      });
+    }
+  }
+  res.json({
+    ok: true,
+    metadata,
+    config: rows,
+    runtime: { activeDriver: runtime.activeDriver, dbConfigPresent: Boolean(runtime.dbConfig) },
+    languagePackMeta,
+    authProviderMeta: { googleEnabled: Boolean(GOOGLE_CLIENT_ID), passwordEnabled: true },
+    smtpMeta: {
+      configured: Boolean((await smtpService.getEmailSettings()).host)
+    },
+    secrets: includeSecrets ? secrets : []
+  });
+}));
+
+app.post("/api/admin/config/import-preview", requirePermission(Permissions.ADMIN_CONFIG_PORTABILITY), adminLimiter, withAsync(async (req, res) => {
+  const payload = requireObject(req.body || {}, "payload");
+  const incoming = Array.isArray(payload.config) ? payload.config : [];
+  const current = await configStore.exportSafeConfig();
+  const mapCurrent = new Map(current.map((row) => [`${row.scope}:${row.scopeId}:${row.key}`, row]));
+  const diff = incoming.map((row) => {
+    const k = `${row.scope || "global"}:${row.scopeId || "global"}:${row.key}`;
+    const prev = mapCurrent.get(k);
+    return {
+      key: row.key,
+      scope: row.scope || "global",
+      scopeId: row.scopeId || "global",
+      changed: safeJsonStringify(prev?.valueJson) !== safeJsonStringify(row.valueJson),
+      previousValue: prev ? prev.valueJson : null,
+      nextValue: row.valueJson
+    };
+  });
+  res.json({ ok: true, compatible: true, diff });
+}));
+
+app.post("/api/admin/config/import-apply", requirePermission(Permissions.ADMIN_CONFIG_PORTABILITY), adminLimiter, withAsync(async (req, res) => {
+  const payload = requireObject(req.body || {}, "payload");
+  const rows = Array.isArray(payload.config) ? payload.config : [];
+  const mode = asEnum(payload.mode || "replace", ["replace", "merge"], "mode");
+  const partialKeys = Array.isArray(payload.partialKeys) ? new Set(payload.partialKeys.map((x) => String(x))) : null;
+
+  let applyRows = rows;
+  if (partialKeys && partialKeys.size > 0) {
+    applyRows = rows.filter((row) => partialKeys.has(String(row.key)));
+  }
+  if (mode === "replace") {
+    const existing = await configStore.exportSafeConfig();
+    for (const row of existing) {
+      if (!applyRows.find((r) => r.key === row.key && (r.scope || "global") === row.scope && (r.scopeId || "global") === row.scopeId)) {
+        await repo.setConfig(row.key, row.scope, row.scopeId, row.valueJson, req.actor?.externalSubject || "admin");
+      }
+    }
+  }
+  await configStore.importSafeConfig(applyRows, req.actor?.externalSubject || "admin");
+  if (Array.isArray(payload.secrets)) {
+    for (const secret of payload.secrets) {
+      if (secret.key === "smtp.password" && secret.ciphertext && secret.iv && secret.authTag) {
+        await repo.setSystemSecret("smtp.password", {
+          ciphertext: secret.ciphertext,
+          iv: secret.iv,
+          authTag: secret.authTag
+        }, req.actor?.externalSubject || "admin");
+      }
+    }
+  }
+  await audit(req, "config.import.apply", "config", "global", { count: applyRows.length, mode });
+  res.json({ ok: true, applied: applyRows.length, mode });
+}));
+
+app.post("/api/admin/runtime/mode", requirePermission(Permissions.ADMIN_CONFIG_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const mode = asEnum(String(req.body?.mode || "").toLowerCase(), ["info", "debug", "advanced-debug"], "mode");
+  const reason = asString(req.body?.reason || "manual change", { min: 3, max: 240, field: "reason" });
+  let advancedDebugExpiresAt = null;
+  if (mode === "advanced-debug") {
+    advancedDebugExpiresAt = new Date(Date.now() + ADVANCED_DEBUG_TTL_MINUTES * 60 * 1000).toISOString();
+  }
+  await configStore.setSafe("app.runtime", {
+    mode,
+    advancedDebugExpiresAt
+  }, { scope: "global", scopeId: "global", updatedBy: req.actor?.externalSubject || "admin" });
+  const previous = currentAppMode;
+  currentAppMode = mode;
+  await audit(req, "runtime.mode.change", "runtime_mode", mode, { from: previous, to: mode, reason, advancedDebugExpiresAt });
+  res.json({ ok: true, mode, previous, advancedDebugExpiresAt });
+}));
+
+app.get("/api/admin/language/diagnostics", requirePermission(Permissions.ADMIN_DIAGNOSTICS_READ), adminLimiter, withAsync(async (req, res) => {
+  const level = asNumber(req.query.level || 2, { min: 1, max: 5, field: "level" });
+  const requestedLanguage = asString(req.query.language || "en", { min: 2, max: 10, field: "language" }).toLowerCase();
+  const type = level === 2 ? "level2" : level === 3 ? "level3" : "sentence_words";
+  const languages = await repo.listPublishedLanguagesByType(type);
+  const language = languages.includes(requestedLanguage) ? requestedLanguage : (languages[0] || requestedLanguage);
+  const pack = (await repo.listLanguagePacks({ language, type, status: "PUBLISHED" }))[0] || null;
+  const sample = (await generateTasks(level, 1, "vocab", language))[0] || null;
+  res.json({
+    ok: true,
+    requestedLanguage,
+    currentLanguage: language,
+    packUsed: pack ? { id: pack.id, language: pack.language, type: pack.type, topic: pack.topic } : null,
+    preview: sample
+  });
+}));
+
 app.get("/api/diagnostics/rbac", requirePermission(Permissions.ADMIN_DIAGNOSTICS_READ), adminLimiter, (req, res) => {
   res.json({
     ok: true,
@@ -1081,13 +1455,36 @@ app.get("/api/admin/audit-logs", requirePermission(Permissions.ADMIN_AUDIT_READ)
   res.json({ ok: true, logs });
 }));
 
+app.get("/api/admin/crashes", requirePermission(Permissions.ADMIN_DIAGNOSTICS_READ), adminLimiter, withAsync(async (req, res) => {
+  const limit = asNumber(req.query.limit || 50, { min: 1, max: 500, field: "limit" });
+  const unresolvedOnly = String(req.query.unresolvedOnly || "false") === "true";
+  const crashes = await repo.listCrashEvents(limit, unresolvedOnly);
+  const unresolvedCount = (await repo.listCrashEvents(500, true)).length;
+  res.json({ ok: true, crashes, unresolvedCount });
+}));
+
+app.get("/api/admin/crashes/:id", requirePermission(Permissions.ADMIN_DIAGNOSTICS_READ), adminLimiter, withAsync(async (req, res) => {
+  const id = asNumber(req.params.id, { min: 1, field: "id" });
+  const crash = await repo.getCrashEventById(id);
+  if (!crash) throw new AppError("Crash event not found", { status: 404, code: "NOT_FOUND", expose: true });
+  res.json({ ok: true, crash });
+}));
+
+app.post("/api/admin/crashes/:id/ack", requirePermission(Permissions.ADMIN_DIAGNOSTICS_READ), adminLimiter, withAsync(async (req, res) => {
+  const id = asNumber(req.params.id, { min: 1, field: "id" });
+  const updated = await repo.acknowledgeCrashEvent(id, req.actor?.externalSubject || req.actor?.email || "admin");
+  if (!updated) throw new AppError("Crash event not found", { status: 404, code: "NOT_FOUND", expose: true });
+  await audit(req, "crash.acknowledge", "crash_event", String(id));
+  res.json({ ok: true, crash: updated });
+}));
+
 const clientDist = path.join(__dirname, "../client/dist");
 const indexHtml = path.join(clientDist, "index.html");
 if (fs.existsSync(clientDist)) {
   app.use(express.static(clientDist));
   app.get(["/admin*", "/settings-admin*"], (req, res, next) => {
     const role = normalizeRole(req.actor?.role || Roles.GUEST);
-    if (![Roles.ADMIN, Roles.OWNER].includes(role)) return res.status(403).send("Forbidden");
+    if (![Roles.ADMIN, Roles.OWNER].includes(role)) return res.status(403).send("Not authorized. Sign in with an admin account.");
     return next();
   });
   app.get("*", (req, res) => {
@@ -1120,27 +1517,74 @@ async function ensureOwnerBootstrap() {
 
 async function seedDefaultRuntimeConfig() {
   const existing = await configStore.list({ scope: "global", scopeId: "global" });
-  if (existing.length > 0) return;
-  await configStore.setSafe("app.features", { maintenanceMode: false }, { scope: "global", scopeId: "global", updatedBy: "bootstrap" });
-  await configStore.setSafe("contest.rules", { maxAllowedLevel: 5, durations: [30, 60, 120], taskTargets: [10, 20, 50] }, { scope: "global", scopeId: "global", updatedBy: "bootstrap" });
-  await configStore.setSafe("generator.defaults", { openAiModel: OPENAI_MODEL, maxCount: 200 }, { scope: "global", scopeId: "global", updatedBy: "bootstrap" });
+  const keys = new Set(existing.map((row) => row.key));
+  if (!keys.has("app.features")) {
+    await configStore.setSafe("app.features", { maintenanceMode: false }, { scope: "global", scopeId: "global", updatedBy: "bootstrap" });
+  }
+  if (!keys.has("contest.rules")) {
+    await configStore.setSafe("contest.rules", { maxAllowedLevel: 5, durations: [30, 60, 120], taskTargets: [10, 20, 50] }, { scope: "global", scopeId: "global", updatedBy: "bootstrap" });
+  }
+  if (!keys.has("generator.defaults")) {
+    await configStore.setSafe("generator.defaults", { openAiModel: OPENAI_MODEL, maxCount: 200 }, { scope: "global", scopeId: "global", updatedBy: "bootstrap" });
+  }
+  if (!keys.has("app.runtime")) {
+    await configStore.setSafe("app.runtime", { mode: APP_MODE, advancedDebugExpiresAt: null }, { scope: "global", scopeId: "global", updatedBy: "bootstrap" });
+  }
+  if (!keys.has("app.about")) {
+    await configStore.setSafe("app.about", {
+      website: "https://thedrukkers.com",
+      contact: "mailto:vdrukker@thedrukkers.com",
+      githubUrl: process.env.APP_GITHUB_URL || "https://github.com/viktordrukker/ktrain"
+    }, { scope: "global", scopeId: "global", updatedBy: "bootstrap" });
+  }
+  if (!keys.has("app.wizard")) {
+    await configStore.setSafe("app.wizard", { completedAt: null, schemaVersion: 1 }, { scope: "global", scopeId: "global", updatedBy: "bootstrap" });
+  }
 }
 
 async function start() {
+  setStartupPhase("init_db");
   const dbState = await initDb();
   repo = dbState.adapter;
   activeDriver = dbState.driver;
+
+  setStartupPhase("init_config_store");
   configStore = new ConfigStore({
     repo,
     ttlMs: Number(process.env.CONFIG_CACHE_TTL_MS || 5000)
   });
+
+  setStartupPhase("init_encryption");
   encryptionService = new EncryptionService(process.env.KTRAIN_MASTER_KEY || "");
   smtpService = new SmtpService({ configStore, repo, encryptionService });
 
+  setStartupPhase("owner_bootstrap");
   await ensureOwnerBootstrap();
+  setStartupPhase("seed_runtime_config");
   await seedDefaultRuntimeConfig();
+  const runtimeModeCfg = await configStore.get("app.runtime", {
+    scope: "global",
+    scopeId: "global",
+    fallback: { mode: APP_MODE, advancedDebugExpiresAt: null }
+  });
+  currentAppMode = ["info", "debug", "advanced-debug"].includes(String(runtimeModeCfg?.mode || ""))
+    ? String(runtimeModeCfg.mode)
+    : APP_MODE;
+  if (currentAppMode === "advanced-debug" && runtimeModeCfg?.advancedDebugExpiresAt) {
+    const expiresAt = Date.parse(runtimeModeCfg.advancedDebugExpiresAt);
+    if (Number.isFinite(expiresAt) && expiresAt <= Date.now()) {
+      currentAppMode = "debug";
+      await configStore.setSafe("app.runtime", { mode: "debug", advancedDebugExpiresAt: null }, {
+        scope: "global",
+        scopeId: "global",
+        updatedBy: "system:auto-expire"
+      });
+    }
+  }
+  setStartupPhase("seed_language_packs");
   await seedBuiltinLanguagePacks(repo);
 
+  setStartupPhase("startup_self_checks");
   startupSelfChecks = {
     configSchema: await checkConfigSchema(configStore),
     migrations: await checkMigrations(repo, activeDriver),
@@ -1149,6 +1593,10 @@ async function start() {
   };
   logger.info("startup_self_checks", startupSelfChecks);
 
+  if (!startupSelfChecks.migrations.ok || !startupSelfChecks.indexes.ok) {
+    throw new Error("Startup self-check failed: required migrations/indexes missing");
+  }
+
   setInterval(() => {
     Promise.all([
       repo.cleanupActiveSessions(120),
@@ -1156,12 +1604,74 @@ async function start() {
     ]).catch((err) => logger.warn("background_cleanup_failed", { error: err }));
   }, 60 * 1000);
 
+  if (currentAppMode === "advanced-debug") {
+    setTimeout(() => {
+      currentAppMode = "debug";
+      configStore.setSafe("app.runtime", { mode: "debug", advancedDebugExpiresAt: null }, {
+        scope: "global",
+        scopeId: "global",
+        updatedBy: "system:auto-expire"
+      }).catch(() => null);
+      logger.warn("advanced_debug_expired", { ttlMinutes: ADVANCED_DEBUG_TTL_MINUTES });
+    }, ADVANCED_DEBUG_TTL_MINUTES * 60 * 1000);
+  }
+
+  setStartupPhase("http_listen");
   app.listen(PORT, () => {
+    startupReady = true;
+    setStartupPhase("ready");
     logger.info("server_started", { port: PORT, driver: activeDriver });
   });
 }
 
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try {
+    await crashHandler.capture({
+      type: "manual_termination",
+      error: new Error(`Received ${signal}`),
+      metadata: { signal }
+    });
+  } catch {
+    // ignore capture failures during shutdown
+  }
+  try {
+    if (repo?.close) await repo.close();
+  } catch {
+    // ignore
+  }
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => { void shutdown("SIGTERM"); });
+process.on("SIGINT", () => { void shutdown("SIGINT"); });
+
+process.on("uncaughtException", (err) => {
+  void crashHandler.capture({
+    type: "runtime_fatal_exception",
+    error: err,
+    metadata: { phase: startupPhase }
+  }).finally(() => process.exit(1));
+});
+
+process.on("unhandledRejection", (reason) => {
+  const err = reason instanceof Error ? reason : new Error(String(reason));
+  void crashHandler.capture({
+    type: "runtime_unhandled_rejection",
+    error: err,
+    metadata: { phase: startupPhase }
+  }).finally(() => process.exit(1));
+});
+
 start().catch((err) => {
-  logger.error("server_start_failed", { error: err });
-  process.exit(1);
+  startupReady = false;
+  logger.error("server_start_failed", { error: err, phase: startupPhase });
+  void crashHandler.capture({
+    type: "startup_failure",
+    error: err,
+    metadata: { phase: startupPhase }
+  }).then(() => {
+    crashHandler.startRecoveryServer();
+  });
 });

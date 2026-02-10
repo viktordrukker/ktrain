@@ -41,6 +41,11 @@ docker compose exec -T ktrain sh -lc 'cd /app/server && npm run migrate'
 
 echo "Waiting for readiness"
 for i in {1..20}; do
+  if ! docker ps --format '{{.Names}}' | grep -qx 'ktrain'; then
+    echo "Container exited before readiness check completed."
+    docker logs --tail 200 ktrain || true
+    exit 1
+  fi
   if curl -fsS http://127.0.0.1:3000/readyz >/dev/null; then
     echo "Ready"; exit 0
   fi
@@ -48,4 +53,5 @@ for i in {1..20}; do
 done
 
 echo "Service did not become ready in time"
+docker logs --tail 200 ktrain || true
 exit 1

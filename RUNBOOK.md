@@ -40,3 +40,21 @@
 3. Backup current DB.
 4. Roll back DB switch/migration if needed.
 5. Redeploy previous image tag.
+
+## Startup Crash Debugging
+1. Check logs:
+   - `docker logs --tail 300 ktrain`
+2. If startup failed, use recovery endpoints:
+   - `GET /crash`
+   - `GET /setup`
+3. Collect crash evidence:
+   - DB table `crash_events`
+   - filesystem fallback `/data/crash-reports/*.json`
+4. Fix root cause (DB unreachable, migration error, config/secrets mismatch).
+5. Restart and verify `GET /readyz` returns 200.
+
+## Crash Acknowledgment
+1. Open `Settings -> Admin -> Crash diagnostics`.
+2. Review unresolved crashes.
+3. Mark handled crashes as acknowledged.
+4. Keep unresolved count at zero in normal operations.
