@@ -1,5 +1,15 @@
 const { Roles, normalizeRole } = require("../domain/rbac");
 
+/**
+ * Central configuration health evaluator.
+ *
+ * Output contract:
+ * - Required checks decide `SETUP_REQUIRED`.
+ * - Optional checks decide `DEGRADED`.
+ * - Maintenance is reserved for migration/runtime safety gates.
+ *
+ * This module is the single source of truth for setup/degraded readiness.
+ */
 function statusDetail({
   key,
   severity,
@@ -50,6 +60,11 @@ async function hasAdminPasswordIdentity(repo) {
   return false;
 }
 
+/**
+ * Compute runtime configuration health from DB-backed config plus live dependency checks.
+ *
+ * SECURITY: the returned object must be safe to expose (no secrets, only status metadata).
+ */
 async function computeConfigStatus({
   repo,
   configStore,
