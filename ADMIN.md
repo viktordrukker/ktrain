@@ -26,11 +26,19 @@ Pack status:
 - DB runtime controls
 - SMTP settings
 - Send test email
+- Google auth settings (enabled/client ID/client secret)
 - Password reset email flow depends on SMTP health.
+- Config status panel shows `READY`/`DEGRADED`/`SETUP_REQUIRED` and remediation hints.
 
 Secrets policy:
 - SMTP password encrypted at rest.
+- Google client secret encrypted at rest.
 - Secrets never returned by API responses.
+
+## Setup vs Remediation
+- Setup mode is triggered only by missing/invalid required config (`database`, `adminUser`).
+- Optional failures (SMTP, Google, OpenAI, RU packs) do not force setup; they appear as `DEGRADED`.
+- Admin can remediate optional failures anytime in Settings/Admin without reinit.
 
 ## Live Activity
 Start screen shows live activity:

@@ -108,6 +108,33 @@ type CrashEvent = {
   metadataJson?: any;
 };
 
+type ConfigState = "READY" | "MISSING" | "INVALID";
+type ConfigOverall = "READY" | "SETUP_REQUIRED" | "DEGRADED" | "MAINTENANCE";
+type ConfigStatusDetail = {
+  key: string;
+  severity: "INFO" | "WARN" | "ERROR";
+  message: string;
+  remediation_hint: string;
+  affected_features: string[];
+  blocking: boolean;
+};
+type ConfigStatus = {
+  overall: ConfigOverall;
+  required: {
+    database: ConfigState;
+    adminUser: ConfigState;
+  };
+  optional: {
+    smtp: ConfigState;
+    googleAuth: ConfigState;
+    openai: ConfigState;
+    languagePacks: ConfigState;
+  };
+  details: ConfigStatusDetail[];
+  computed_at: string;
+  config_version: number;
+};
+
 type Screen = "home" | "game" | "results" | "leaderboard" | "settings";
 
 type GameSettings = {
@@ -427,6 +454,40 @@ const API = {
     if (!res.ok) throw new Error("Failed to load public version");
     return res.json();
   },
+  async getSetupStatus() {
+    const res = await fetch("/api/setup/status", { headers: withAuthHeaders() });
+    if (!res.ok) throw new Error("Failed to load setup status");
+    return res.json();
+  },
+  async getPublicConfigStatus() {
+    const res = await fetch("/api/public/config/status", { headers: withAuthHeaders() });
+    if (!res.ok) throw new Error("Failed to load public config status");
+    return res.json();
+  },
+  async completeSetup() {
+    const res = await fetch("/api/setup/complete", { method: "POST", headers: withAuthHeaders() });
+    if (!res.ok) throw new Error("Failed to complete setup");
+    return res.json();
+  },
+  async setupCreateAdmin(payload: { email: string; displayName: string; password: string }) {
+    const res = await fetch("/api/setup/admin-user", {
+      method: "POST",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error("Failed to create setup admin");
+    return res.json();
+  },
+  async getSetupDbStatus() {
+    const res = await fetch("/api/setup/db-status", { headers: withAuthHeaders() });
+    if (!res.ok) throw new Error("Failed to load setup database status");
+    return res.json();
+  },
+  async bootstrapOwner() {
+    const res = await fetch("/api/setup/bootstrap-owner", { method: "POST", headers: withAuthHeaders() });
+    if (!res.ok) throw new Error("Failed to bootstrap owner");
+    return res.json();
+  },
   async getAuthProviders() {
     const res = await fetch("/api/auth/providers");
     if (!res.ok) throw new Error("Failed to load providers");
@@ -652,6 +713,39 @@ const API = {
     if (!res.ok) throw new Error("Failed to load service settings");
     return res.json();
   },
+  async getAdminConfigStatus(): Promise<{ status: ConfigStatus }> {
+    const res = await fetch("/api/admin/config/status", { headers: withAuthHeaders() });
+    if (!res.ok) throw new Error("Failed to load config status");
+    return res.json();
+  },
+  async applyAdminConfig(changes: Array<{ key: string; valueJson: any; scope?: string; scopeId?: string }>, allowPartialSetup = false) {
+    const res = await fetch("/api/admin/config/apply", {
+      method: "POST",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ changes, allowPartialSetup })
+    });
+    if (!res.ok) throw new Error("Failed to apply config");
+    return res.json();
+  },
+  async testSmtpConfig(payload: { to?: string; settings?: any }) {
+    const res = await fetch("/api/admin/config/test/smtp", {
+      method: "POST",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload || {})
+    });
+    if (!res.ok) throw new Error("SMTP test failed");
+    return res.json();
+  },
+  async testGoogleConfig() {
+    const res = await fetch("/api/admin/config/test/google", { method: "POST", headers: withAuthHeaders() });
+    if (!res.ok) throw new Error("Google config test failed");
+    return res.json();
+  },
+  async testDatabaseConfig() {
+    const res = await fetch("/api/admin/config/test/db", { method: "POST", headers: withAuthHeaders() });
+    if (!res.ok) throw new Error("Database test failed");
+    return res.json();
+  },
   async saveEmailSettings(payload: any) {
     const res = await fetch("/api/admin/service-settings/email", {
       method: "POST",
@@ -659,6 +753,15 @@ const API = {
       body: JSON.stringify(payload)
     });
     if (!res.ok) throw new Error("Failed to save email settings");
+    return res.json();
+  },
+  async saveGoogleAuthSettings(payload: { enabled: boolean; clientId: string; clientSecret?: string }) {
+    const res = await fetch("/api/admin/service-settings/auth/google", {
+      method: "POST",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error("Failed to save Google auth settings");
     return res.json();
   },
   async sendTestEmail(to: string) {
@@ -987,6 +1090,14 @@ function App() {
   const [showStopModal, setShowStopModal] = useState(false);
   const [showUnsavedSettingsModal, setShowUnsavedSettingsModal] = useState(false);
   const [pendingScreen, setPendingScreen] = useState<Screen | null>(null);
+  const [setupStatus, setSetupStatus] = useState<any>(null);
+  const [setupWizardOpen, setSetupWizardOpen] = useState(false);
+  const [setupMessage, setSetupMessage] = useState("");
+  const [setupAdminEmail, setSetupAdminEmail] = useState("");
+  const [setupAdminName, setSetupAdminName] = useState("");
+  const [setupAdminPassword, setSetupAdminPassword] = useState("");
+  const [publicConfigOverall, setPublicConfigOverall] = useState<ConfigOverall>("READY");
+  const [setupDbStatus, setSetupDbStatus] = useState<any>(null);
   const [savePartial, setSavePartial] = useState(false);
   const [levelConverted, setLevelConverted] = useState(false);
   const [authEmail, setAuthEmail] = useState("");
@@ -1167,6 +1278,18 @@ function App() {
   }, []);
 
   useEffect(() => {
+    API.getPublicConfigStatus()
+      .then((status) => {
+        setPublicConfigOverall((status?.overall || "READY") as ConfigOverall);
+        if (status?.setupRequired) setSetupWizardOpen(true);
+      })
+      .catch(() => {
+        setPublicConfigOverall("SETUP_REQUIRED");
+        setSetupWizardOpen(true);
+      });
+  }, []);
+
+  useEffect(() => {
     API.getAuthProviders()
       .then((providers) => {
         const cid = providers?.google?.enabled ? providers.google.clientId || "" : "";
@@ -1178,6 +1301,31 @@ function App() {
         setPasswordResetEnabled(false);
       });
   }, []);
+
+  const refreshSetupStatus = useCallback(async () => {
+    try {
+      const data = await API.getSetupStatus();
+      setSetupStatus(data);
+      const overall = (data?.overall || (data?.wizardCompleted ? "READY" : "SETUP_REQUIRED")) as ConfigOverall;
+      setPublicConfigOverall(overall);
+      setSetupWizardOpen(Boolean(data?.setupRequired) || !Boolean(data?.wizardCompleted));
+      if (Boolean(data?.setupRequired)) {
+        const db = await API.getSetupDbStatus().catch(() => null);
+        setSetupDbStatus(db);
+      } else {
+        setSetupDbStatus(null);
+        if (window.location.pathname === "/setup") {
+          setSetupMessage("Setup is completed. Open Settings/Admin for optional configuration.");
+        }
+      }
+    } catch {
+      setSetupStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshSetupStatus().catch(() => null);
+  }, [refreshSetupStatus, sessionUser]);
 
   useEffect(() => {
     API.getHealth()
@@ -1949,6 +2097,105 @@ function App() {
           </Button>
         </Group>
       </Modal>
+      <Modal
+        opened={setupWizardOpen}
+        onClose={() => {
+          if (setupStatus?.wizardCompleted) setSetupWizardOpen(false);
+        }}
+        title="Installation Wizard"
+        centered
+        closeOnClickOutside={Boolean(setupStatus?.wizardCompleted)}
+        closeOnEscape={Boolean(setupStatus?.wizardCompleted)}
+      >
+        <Stack gap="sm">
+          <Alert color={publicConfigOverall === "SETUP_REQUIRED" ? "red" : publicConfigOverall === "DEGRADED" ? "yellow" : "green"} title={`Config status: ${publicConfigOverall}`}>
+            Setup mode is derived from required configuration health.
+          </Alert>
+          <Text size="sm">Complete required setup steps to enable full admin functionality.</Text>
+          <Text size="sm">1. Database: {setupStatus?.steps?.database?.state || (setupStatus?.steps?.database?.ready ? "READY" : "MISSING")}</Text>
+          <Text size="sm">2. Admin user: {setupStatus?.steps?.adminUser?.state || (setupStatus?.steps?.adminUser?.ready ? "READY" : "MISSING")}</Text>
+          <Text size="sm">3. SMTP: {setupStatus?.steps?.smtp?.state || (setupStatus?.steps?.smtp?.ready ? "READY" : "MISSING")} (optional)</Text>
+          <Text size="sm">4. Google auth: {setupStatus?.steps?.googleAuth?.state || (setupStatus?.steps?.googleAuth?.ready ? "READY" : "MISSING")} (optional)</Text>
+          {setupDbStatus && (
+            <Alert color={setupDbStatus?.database === "READY" ? "green" : "red"} title="Database status">
+              Driver: {setupDbStatus?.activeDriver || "unknown"} | State: {setupDbStatus?.database || "unknown"}
+            </Alert>
+          )}
+          {!setupStatus?.steps?.adminUser?.ready && (
+            <Card withBorder>
+              <Stack gap="xs">
+                <Text fw={600} size="sm">Create initial admin user</Text>
+                <TextInput label="Admin email" value={setupAdminEmail} onChange={(e) => setSetupAdminEmail(e.currentTarget.value)} />
+                <TextInput label="Display name" value={setupAdminName} onChange={(e) => setSetupAdminName(e.currentTarget.value)} />
+                <TextInput label="Password" type="password" value={setupAdminPassword} onChange={(e) => setSetupAdminPassword(e.currentTarget.value)} />
+                <Button
+                  onClick={async () => {
+                    try {
+                      await API.setupCreateAdmin({ email: setupAdminEmail, displayName: setupAdminName, password: setupAdminPassword });
+                      setSetupMessage("Admin user created.");
+                      setSetupAdminPassword("");
+                      await refreshSetupStatus();
+                    } catch (err: any) {
+                      setSetupMessage(err?.message || "Admin setup failed.");
+                    }
+                  }}
+                >
+                  Create admin
+                </Button>
+              </Stack>
+            </Card>
+          )}
+          {Array.isArray(setupStatus?.details) && setupStatus.details.length > 0 && (
+            <Card withBorder>
+              <Stack gap="xs">
+                <Text fw={600} size="sm">Remediation</Text>
+                {setupStatus.details.map((d: any) => (
+                  <Text key={String(d.key)} size="xs">
+                    [{String(d.severity || "INFO")}] {String(d.message || "")} - {String(d.remediation_hint || "")}
+                  </Text>
+                ))}
+              </Stack>
+            </Card>
+          )}
+          {setupMessage && <Alert color="yellow">{setupMessage}</Alert>}
+          <Group justify="space-between">
+            <Button variant="light" onClick={() => refreshSetupStatus().catch(() => null)}>Refresh</Button>
+            <Group>
+              {!setupStatus?.steps?.adminUser?.ready && sessionUser && (
+                <Button
+                  variant="light"
+                  onClick={async () => {
+                    try {
+                      await API.bootstrapOwner();
+                      setSetupMessage("Owner bootstrap complete.");
+                      await API.getPublicSession().then((s) => setSessionUser(s.actor?.isAuthenticated ? s.actor : null));
+                      await refreshSetupStatus();
+                    } catch (err: any) {
+                      setSetupMessage(err?.message || "Owner bootstrap failed.");
+                    }
+                  }}
+                >
+                  Make me owner
+                </Button>
+              )}
+              <Button
+                disabled={!isAdminUser || publicConfigOverall === "SETUP_REQUIRED"}
+                onClick={async () => {
+                  try {
+                    await API.completeSetup();
+                    setSetupMessage("Setup completed.");
+                    await refreshSetupStatus();
+                  } catch (err: any) {
+                    setSetupMessage(err?.message || "Failed to complete setup.");
+                  }
+                }}
+              >
+                Complete setup
+              </Button>
+            </Group>
+          </Group>
+        </Stack>
+      </Modal>
       <header className="topbar">
         <UnstyledButton className="brand" onClick={handleBrandClick} aria-label="Go to main menu">K-TRAIN</UnstyledButton>
         <div className="topbar-actions">
@@ -2608,6 +2855,7 @@ function SettingsScreen({
   const [dbMessage, setDbMessage] = useState("");
   const [dbBusy, setDbBusy] = useState(false);
   const [emailSettings, setEmailSettings] = useState({
+    enabled: false,
     host: "",
     port: 587,
     secure: false,
@@ -2619,6 +2867,13 @@ function SettingsScreen({
   });
   const [emailTestTo, setEmailTestTo] = useState("");
   const [emailMessage, setEmailMessage] = useState("");
+  const [googleSettings, setGoogleSettings] = useState({
+    enabled: false,
+    clientId: "",
+    clientSecret: "",
+    hasClientSecret: false
+  });
+  const [googleMessage, setGoogleMessage] = useState("");
   const [pinStatus, setPinStatus] = useState<{ pinIsDefault: boolean; source: string } | null>(null);
   const [newAdminPin, setNewAdminPin] = useState("");
   const [confirmAdminPin, setConfirmAdminPin] = useState("");
@@ -2629,7 +2884,23 @@ function SettingsScreen({
   const [selectedCrash, setSelectedCrash] = useState<CrashEvent | null>(null);
   const [crashBusy, setCrashBusy] = useState(false);
   const [crashMessage, setCrashMessage] = useState("");
+  const [configStatus, setConfigStatus] = useState<ConfigStatus | null>(null);
+  const [configStatusMessage, setConfigStatusMessage] = useState("");
   const themePreview = applyVisibilityGuard(computeTheme(appSettings), appSettings.visibilityGuard).theme;
+
+  const refreshConfigStatus = async () => {
+    if (!adminPin) {
+      setConfigStatus(null);
+      return;
+    }
+    try {
+      const data = await API.getAdminConfigStatus();
+      setConfigStatus((data?.status || null) as ConfigStatus | null);
+      setConfigStatusMessage("");
+    } catch (err: any) {
+      setConfigStatusMessage(err?.message || "Failed to load config status.");
+    }
+  };
 
   const refreshDb = async () => {
     if (!adminPin) {
@@ -2645,11 +2916,14 @@ function SettingsScreen({
       ]);
       API.getServiceSettings().then((service) => {
         const email = service?.settings?.email || {};
+        const google = service?.settings?.auth?.google || {};
         setEmailSettings((prev) => ({ ...prev, ...email, password: "" }));
+        setGoogleSettings((prev) => ({ ...prev, ...google, clientSecret: "" }));
       }).catch(() => null);
       setDbStatus(status);
       setDbConfig(configRes.dbConfig);
       setDbMessage(`DB status loaded. Active: ${status.activeDriver}`);
+      await refreshConfigStatus();
     } catch (err: any) {
       setDbMessage(err?.message || "Failed to load DB status");
     } finally {
@@ -2810,6 +3084,7 @@ function SettingsScreen({
     try {
       await API.saveEmailSettings(emailSettings);
       setEmailMessage("Email settings saved.");
+      await refreshConfigStatus();
     } catch (err: any) {
       setEmailMessage(err?.message || "Failed to save email settings.");
     }
@@ -2821,10 +3096,30 @@ function SettingsScreen({
       return;
     }
     try {
-      await API.sendTestEmail(emailTestTo || "admin@example.com");
+      await API.testSmtpConfig({ to: emailTestTo || "admin@example.com" });
       setEmailMessage("Test email sent.");
+      await refreshConfigStatus();
     } catch (err: any) {
       setEmailMessage(err?.message || "Failed to send test email.");
+    }
+  };
+
+  const saveGoogleSettings = async () => {
+    if (!adminPin) {
+      setGoogleMessage("Sign in with an admin account first.");
+      return;
+    }
+    try {
+      await API.saveGoogleAuthSettings({
+        enabled: Boolean(googleSettings.enabled),
+        clientId: String(googleSettings.clientId || "").trim(),
+        clientSecret: String(googleSettings.clientSecret || "").trim() || undefined
+      });
+      setGoogleMessage("Google auth settings saved.");
+      setGoogleSettings((prev) => ({ ...prev, clientSecret: "" }));
+      await refreshConfigStatus();
+    } catch (err: any) {
+      setGoogleMessage(err?.message || "Failed to save Google auth settings.");
     }
   };
 
@@ -2832,6 +3127,7 @@ function SettingsScreen({
     if (!adminPin) return;
     refreshPinStatus().catch(() => null);
     refreshCrashes().catch(() => null);
+    refreshConfigStatus().catch(() => null);
   }, [adminPin]);
 
   const updateSettings = (patch: Partial<AppSettings>) => {
@@ -2918,10 +3214,31 @@ function SettingsScreen({
             <Group>
               <Button variant="light" disabled={!hasUnsavedSettings} onClick={onResetSettingsDraft}>Reset</Button>
               <Button disabled={!hasUnsavedSettings || !adminPin} onClick={() => void onApplySettings()}>Apply</Button>
+              {isAdmin && <Button variant="light" onClick={() => refreshConfigStatus().catch(() => null)}>Refresh status</Button>}
               <Text size="xs" c="dimmed">
                 {lastSettingsAppliedAt ? `Last applied: ${new Date(lastSettingsAppliedAt).toLocaleString()}` : "Not applied yet"}
               </Text>
             </Group>
+            {isAdmin && configStatus && (
+              <Alert
+                color={configStatus.overall === "READY" ? "green" : configStatus.overall === "DEGRADED" ? "yellow" : "red"}
+                title={`Configuration: ${configStatus.overall}`}
+              >
+                Version {configStatus.config_version}. {configStatus.details.length} issue(s) reported.
+              </Alert>
+            )}
+            {isAdmin && configStatus && configStatus.details.length > 0 && (
+              <Card withBorder>
+                <Stack gap="xs">
+                  {configStatus.details.map((row) => (
+                    <Text size="xs" key={`${row.key}-${row.message}`}>
+                      [{row.severity}] {row.message} - {row.remediation_hint}
+                    </Text>
+                  ))}
+                </Stack>
+              </Card>
+            )}
+            {isAdmin && configStatusMessage && <Alert color="yellow">{configStatusMessage}</Alert>}
             {isAdmin && crashUnresolvedCount > 0 && (
               <Alert color="red" title="Unresolved crash events">
                 {crashUnresolvedCount} crash event(s) require acknowledgment in Admin Diagnostics.
@@ -3326,116 +3643,130 @@ function SettingsScreen({
             </SettingRow>
           </SettingsSection>
 
-          {isAdmin && (
           <SettingsSection
             id="content"
             title="Content & Randomness"
             description="Manage vocabulary packs and generation."
           >
-            <div className="setting-row full">
-              <Button variant="light" onClick={() => setLanguagePackModalOpen(true)}>Open Language Packs</Button>
-            </div>
-            <Modal opened={languagePackModalOpen} onClose={() => setLanguagePackModalOpen(false)} title="Language Packs" size="xl" centered>
-              <div className="vocab-manager">
-                <Group justify="space-between" mb="sm">
-                  <Button
-                    variant="light"
-                    onClick={async () => {
-                      const exported = await API.exportLanguagePacks();
-                      setPackJson(JSON.stringify(exported, null, 2));
-                    }}
-                  >
-                    Export JSON
-                  </Button>
-                  <Button
-                    variant="light"
-                    onClick={async () => {
-                      try {
-                        const parsed = JSON.parse(packJson || "{}");
-                        await API.importLanguagePacks(parsed);
-                        onReloadPacks();
-                        setOpenaiStatus("Pack JSON imported.");
-                      } catch {
-                        setOpenaiStatus("Invalid JSON for import.");
-                      }
-                    }}
-                  >
-                    Import JSON
-                  </Button>
-                </Group>
-                <Textarea
-                  label="Import / Export JSON"
-                  value={packJson}
-                  onChange={(e) => setPackJson(e.currentTarget.value)}
-                  minRows={4}
-                />
-                <Group align="flex-end" style={{ flexWrap: "wrap" }}>
-                  <TextInput
-                    label="Topic"
-                    value={generateName}
-                    onChange={(e) => setGenerateName(e.currentTarget.value)}
-                    placeholder="e.g. animals"
-                  />
-                  <Select
-                    label="Pack type"
-                    value={generateType}
-                    onChange={(value) => setGenerateType((value || "level2") as any)}
-                    data={[
-                      { value: "level2", label: "Level 2 words" },
-                      { value: "level3", label: "Level 3 words" },
-                      { value: "sentence_words", label: "Sentence words" }
-                    ]}
-                  />
-                  <NumberInput
-                    label="Count"
-                    min={10}
-                    max={200}
-                    value={generateCount}
-                    onChange={(value) => setGenerateCount(Number(value) || 10)}
-                  />
-                  <Button
-                    onClick={async () => {
-                      await onGenerate({ topic: generateName, count: generateCount, type: generateType, language: settings.language });
-                      onReloadPacks();
-                    }}
-                  >
-                    Generate Draft
-                  </Button>
-                </Group>
-
-                <div className="pack-list">
-                  {packs.map((pack) => (
-                    <div className="pack" key={pack.id}>
-                      <div className="pack-header">
-                        <strong>{pack.name}</strong>
-                        <span>{pack.packType}</span>
-                        <span>{pack.active ? "PUBLISHED" : "DRAFT"}</span>
-                      </div>
-                      <Textarea
-                        value={manualEdit[pack.id] ?? pack.items.join(", ")}
-                        onChange={(e) => setManualEdit({ ...manualEdit, [pack.id]: e.currentTarget.value })}
-                        minRows={3}
-                      />
-                      <div className="row">
-                        <Button variant="light" onClick={() => onActivatePack(pack.id)}>Publish</Button>
-                        <Button
-                          variant="light"
-                          onClick={() => {
-                            const raw = manualEdit[pack.id] ?? pack.items.join(", ");
-                            onUpdatePack(pack.id, { items: raw.split(/\s*,\s*/).filter(Boolean) });
-                          }}
-                        >
-                          Save
-                        </Button>
-                        <Button variant="light" onClick={() => onDeletePack(pack.id)}>Unpublish</Button>
-                      </div>
-                    </div>
-                  ))}
+            {isAdmin ? (
+              <>
+                <div className="setting-row full">
+                  <Button variant="light" onClick={() => setLanguagePackModalOpen(true)}>Open Language Packs</Button>
                 </div>
+                <Modal opened={languagePackModalOpen} onClose={() => setLanguagePackModalOpen(false)} title="Language Packs" size="xl" centered>
+                  <div className="vocab-manager">
+                    <Group justify="space-between" mb="sm">
+                      <Button
+                        variant="light"
+                        onClick={async () => {
+                          const exported = await API.exportLanguagePacks();
+                          setPackJson(JSON.stringify(exported, null, 2));
+                        }}
+                      >
+                        Export JSON
+                      </Button>
+                      <Button
+                        variant="light"
+                        onClick={async () => {
+                          try {
+                            const parsed = JSON.parse(packJson || "{}");
+                            await API.importLanguagePacks(parsed);
+                            onReloadPacks();
+                            setOpenaiStatus("Pack JSON imported.");
+                          } catch {
+                            setOpenaiStatus("Invalid JSON for import.");
+                          }
+                        }}
+                      >
+                        Import JSON
+                      </Button>
+                    </Group>
+                    <Textarea
+                      label="Import / Export JSON"
+                      value={packJson}
+                      onChange={(e) => setPackJson(e.currentTarget.value)}
+                      minRows={4}
+                    />
+                    <Group align="flex-end" style={{ flexWrap: "wrap" }}>
+                      <TextInput
+                        label="Topic"
+                        value={generateName}
+                        onChange={(e) => setGenerateName(e.currentTarget.value)}
+                        placeholder="e.g. animals"
+                      />
+                      <Select
+                        label="Pack type"
+                        value={generateType}
+                        onChange={(value) => setGenerateType((value || "level2") as any)}
+                        data={[
+                          { value: "level2", label: "Level 2 words" },
+                          { value: "level3", label: "Level 3 words" },
+                          { value: "sentence_words", label: "Sentence words" }
+                        ]}
+                      />
+                      <NumberInput
+                        label="Count"
+                        min={10}
+                        max={200}
+                        value={generateCount}
+                        onChange={(value) => setGenerateCount(Number(value) || 10)}
+                      />
+                      <Button
+                        disabled={Boolean(configStatus && configStatus.optional.openai !== "READY")}
+                        onClick={async () => {
+                          await onGenerate({ topic: generateName, count: generateCount, type: generateType, language: settings.language });
+                          onReloadPacks();
+                        }}
+                      >
+                        Generate Draft
+                      </Button>
+                    </Group>
+                    {configStatus && configStatus.optional.openai !== "READY" && (
+                      <Alert color="yellow" title="OpenAI generation unavailable">
+                        Configure and validate OpenAI settings to enable generation. Built-in EN/RU packs remain available.
+                      </Alert>
+                    )}
+
+                    <div className="pack-list">
+                      {packs.map((pack) => (
+                        <div className="pack" key={pack.id}>
+                          <div className="pack-header">
+                            <strong>{pack.name}</strong>
+                            <span>{pack.packType}</span>
+                            <span>{pack.active ? "PUBLISHED" : "DRAFT"}</span>
+                          </div>
+                          <Textarea
+                            value={manualEdit[pack.id] ?? pack.items.join(", ")}
+                            onChange={(e) => setManualEdit({ ...manualEdit, [pack.id]: e.currentTarget.value })}
+                            minRows={3}
+                          />
+                          <div className="row">
+                            <Button variant="light" onClick={() => onActivatePack(pack.id)}>Publish</Button>
+                            <Button
+                              variant="light"
+                              onClick={() => {
+                                const raw = manualEdit[pack.id] ?? pack.items.join(", ");
+                                onUpdatePack(pack.id, { items: raw.split(/\s*,\s*/).filter(Boolean) });
+                              }}
+                            >
+                              Save
+                            </Button>
+                            <Button variant="light" onClick={() => onDeletePack(pack.id)}>Unpublish</Button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </Modal>
+              </>
+            ) : (
+              <div className="setting-row full">
+                <Alert color="yellow" title="Admin access required">
+                  Sign in as OWNER or ADMIN to manage language packs.
+                </Alert>
               </div>
-            </Modal>
+            )}
           </SettingsSection>
-          )}
 
           <SettingsSection
             id="preview"
@@ -3514,17 +3845,18 @@ function SettingsScreen({
             </SettingRow>
           </SettingsSection>
 
-          {isAdmin && (
           <SettingsSection
             id="admin"
             title="Admin"
             description="OpenAI, resets, and admin authorization."
           >
-            <div className="setting-row full">
-              <Alert color="blue" title="Admin Authorization">
-                Access is controlled by OWNER/ADMIN role. Admin PIN is fully removed.
-              </Alert>
-            </div>
+            {isAdmin ? (
+              <>
+                <div className="setting-row full">
+                  <Alert color="blue" title="Admin Authorization">
+                    Access is controlled by OWNER/ADMIN role. Admin PIN is fully removed.
+                  </Alert>
+                </div>
             <Divider my="sm" />
             <SettingRow label="Database status" helper="Current backend and runtime status.">
               <Group>
@@ -3534,6 +3866,9 @@ function SettingsScreen({
               </Group>
             </SettingRow>
             <Divider my="sm" />
+            <SettingRow label="SMTP enabled" helper="Optional service. Disable to keep app running without email.">
+              <Switch checked={Boolean(emailSettings.enabled)} onChange={(e) => setEmailSettings({ ...emailSettings, enabled: e.currentTarget.checked })} />
+            </SettingRow>
             <SettingRow label="SMTP host" helper="Used for password reset emails and notifications.">
               <TextInput value={emailSettings.host} onChange={(e) => setEmailSettings({ ...emailSettings, host: e.currentTarget.value })} placeholder="smtp.example.com" />
             </SettingRow>
@@ -3563,6 +3898,42 @@ function SettingsScreen({
               <div className="setting-row full">
                 <Alert color="yellow" title="Email Service">
                   {emailMessage}
+                </Alert>
+              </div>
+            )}
+            <Divider my="sm" />
+            <SettingRow label="Google auth enabled" helper="Optional login method for end users.">
+              <Switch checked={Boolean(googleSettings.enabled)} onChange={(e) => setGoogleSettings({ ...googleSettings, enabled: e.currentTarget.checked })} />
+            </SettingRow>
+            <SettingRow label="Google client ID" helper="OAuth client ID for browser sign-in.">
+              <TextInput value={googleSettings.clientId} onChange={(e) => setGoogleSettings({ ...googleSettings, clientId: e.currentTarget.value })} />
+            </SettingRow>
+            <SettingRow label="Google client secret" helper={googleSettings.hasClientSecret ? "Stored securely. Leave blank to keep current." : "Stored securely (encrypted at rest)."}>
+              <TextInput type="password" value={googleSettings.clientSecret} onChange={(e) => setGoogleSettings({ ...googleSettings, clientSecret: e.currentTarget.value })} />
+            </SettingRow>
+            <SettingRow label="Google auth actions" helper="Save and validate Google auth configuration.">
+              <Group>
+                <Button variant="light" onClick={saveGoogleSettings}>Save Google settings</Button>
+                <Button
+                  variant="light"
+                  onClick={async () => {
+                    try {
+                      const result = await API.testGoogleConfig();
+                      setGoogleMessage(`Google config: ${result?.result?.status || "READY"}`);
+                      await refreshConfigStatus();
+                    } catch (err: any) {
+                      setGoogleMessage(err?.message || "Google auth test failed.");
+                    }
+                  }}
+                >
+                  Test Google settings
+                </Button>
+              </Group>
+            </SettingRow>
+            {googleMessage && (
+              <div className="setting-row full">
+                <Alert color="yellow" title="Google Auth">
+                  {googleMessage}
                 </Alert>
               </div>
             )}
@@ -3616,11 +3987,44 @@ function SettingsScreen({
             <SettingRow label="DB actions" helper="Save config, switch backend, or rollback to last dump.">
               <Group>
                 <Button variant="light" loading={dbBusy} onClick={testPostgresConnection}>Test Postgres connection</Button>
+                <Button
+                  variant="light"
+                  loading={dbBusy}
+                  onClick={async () => {
+                    setDbBusy(true);
+                    try {
+                      const result = await API.testDatabaseConfig();
+                      setDbMessage(`DB self-test: ${result?.result?.status || "READY"}`);
+                    } catch (err: any) {
+                      setDbMessage(err?.message || "DB self-test failed");
+                    } finally {
+                      setDbBusy(false);
+                    }
+                  }}
+                >
+                  Test active DB
+                </Button>
                 <Button variant="light" loading={dbBusy} onClick={saveDbConfig}>Save DB config</Button>
                 <Button variant="light" color="teal" loading={dbBusy} onClick={() => switchDb("sqlite")}>Switch to SQLite</Button>
                 <Button variant="light" color="blue" loading={dbBusy} onClick={() => switchDb("postgres")}>Switch to Postgres</Button>
                 <Button variant="light" color="red" loading={dbBusy} onClick={rollbackDb}>Rollback DB switch</Button>
               </Group>
+            </SettingRow>
+            <SettingRow label="Google auth config" helper="Validate whether Google auth is configured and usable.">
+              <Button
+                variant="light"
+                onClick={async () => {
+                  try {
+                    const result = await API.testGoogleConfig();
+                    setDbMessage(`Google auth: ${result?.result?.status || "READY"}`);
+                    await refreshConfigStatus();
+                  } catch (err: any) {
+                    setDbMessage(err?.message || "Google config check failed");
+                  }
+                }}
+              >
+                Test Google config
+              </Button>
             </SettingRow>
             {dbStatus?.counts && (
               <div className="setting-row full">
@@ -3744,8 +4148,15 @@ function SettingsScreen({
                 </Button>
               </Group>
             </SettingRow>
+              </>
+            ) : (
+              <div className="setting-row full">
+                <Alert color="red" title="Not authorized">
+                  Admin settings are restricted to OWNER/ADMIN accounts.
+                </Alert>
+              </div>
+            )}
           </SettingsSection>
-          )}
 
           {statusMessage && <div className="status">{statusMessage}</div>}
         </div>

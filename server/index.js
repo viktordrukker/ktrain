@@ -27,6 +27,7 @@ const {
 } = require("./src/application/auth");
 const { seedBuiltinLanguagePacks, strictPrompt } = require("./src/application/language-packs");
 const { checkConfigSchema, checkMigrations, checkRequiredIndexes, checkEncryption } = require("./src/application/self-checks");
+const { computeConfigStatus } = require("./src/application/config-status");
 const { requestContextMiddleware, requirePermission, withAsync, errorHandler } = require("./src/interface/http/middleware");
 const { asEnum, asNumber, asString, parseJsonArrayOfStrings, requireObject } = require("./src/interface/http/validation");
 const { ConfigStore, SAFE_CONFIG_KEYS } = require("./src/infrastructure/config/config-store");
@@ -50,6 +51,9 @@ let startupSelfChecks = {};
 let startupReady = false;
 let startupPhase = "boot";
 let shuttingDown = false;
+let setupModeActive = false;
+let configStatusSnapshot = null;
+let configStatusExpiresAt = 0;
 
 const BUILD_INFO = {
   version: process.env.APP_VERSION || "0.0.0",
@@ -61,7 +65,7 @@ const PORT = process.env.PORT || 3000;
 const OWNER_EMAIL = process.env.OWNER_EMAIL || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const APP_BASE_URL = process.env.APP_BASE_URL || "http://localhost:3000";
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
+const BOOTSTRAP_GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const SESSION_COOKIE_NAME = process.env.SESSION_COOKIE_NAME || "ktrain_session";
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 30 * 24 * 60 * 60 * 1000);
 const AUTH_OWNER_GROUPS = String(process.env.AUTH_OWNER_GROUPS || "owners").split(",").map((x) => x.trim()).filter(Boolean);
@@ -125,6 +129,7 @@ app.disable("x-powered-by");
 
 app.use(requestContextMiddleware());
 app.use(withAsync(resolveRequestActor));
+app.use(withAsync(enforceSetupMode));
 
 async function resolveRequestActor(req, res, next) {
   req.actor = await resolveActor({
@@ -160,6 +165,51 @@ async function audit(req, action, targetType, targetId, metadata = null) {
 function requireNotMaintenance(req, res, next) {
   if (!maintenanceMode) return next();
   return res.status(503).json({ error: "Maintenance mode active. Try again shortly." });
+}
+
+async function refreshConfigStatus({ force = false } = {}) {
+  if (!repo || !configStore || !smtpService) return null;
+  const now = Date.now();
+  if (!force && configStatusSnapshot && configStatusExpiresAt > now) return configStatusSnapshot;
+  const snapshot = await computeConfigStatus({
+    repo,
+    configStore,
+    smtpService,
+    activeDriver,
+    maintenanceMode,
+    migrationStatus: getMigrationStatus,
+    googleClientIdFromEnv: BOOTSTRAP_GOOGLE_CLIENT_ID,
+    openaiModel: OPENAI_MODEL
+  });
+  configStatusSnapshot = snapshot;
+  configStatusExpiresAt = now + 3000;
+  setupModeActive = snapshot.overall === "SETUP_REQUIRED";
+  return snapshot;
+}
+
+function isSetupPathAllowed(req) {
+  const p = req.path || "/";
+  if (p === "/healthz" || p === "/readyz" || p === "/setup") return true;
+  if (p.startsWith("/api/public/config/status")) return true;
+  if (p.startsWith("/api/setup/")) return true;
+  return false;
+}
+
+async function enforceSetupMode(req, res, next) {
+  if (!repo || !configStore || !smtpService) return next();
+  const status = await refreshConfigStatus();
+  req.configStatus = status;
+  if (status?.overall !== "SETUP_REQUIRED") return next();
+  if (isSetupPathAllowed(req)) return next();
+  if (req.path.startsWith("/api/")) {
+    return res.status(503).json({
+      ok: false,
+      error: "SETUP_REQUIRED",
+      message: "Application is in setup mode. Complete required setup steps.",
+      setupRequired: true
+    });
+  }
+  return res.redirect("/setup");
 }
 
 function chooseRandom(list) {
@@ -392,13 +442,21 @@ async function callOpenAI({ apiKey, prompt }) {
 }
 
 async function verifyGoogleCredential(idToken) {
-  if (!GOOGLE_CLIENT_ID) throw new Error("Google auth is not configured");
+  const providers = await configStore.get("auth.providers", {
+    scope: "global",
+    scopeId: "global",
+    fallback: {
+      google: { enabled: Boolean(BOOTSTRAP_GOOGLE_CLIENT_ID), clientId: BOOTSTRAP_GOOGLE_CLIENT_ID || "" }
+    }
+  });
+  const googleClientId = String(providers?.google?.clientId || BOOTSTRAP_GOOGLE_CLIENT_ID || "");
+  if (!providers?.google?.enabled || !googleClientId) throw new Error("Google auth is not configured");
   // SECURITY: verify token signature and audience server-side before trusting claims.
   const { OAuth2Client } = require("google-auth-library");
-  const client = new OAuth2Client(GOOGLE_CLIENT_ID);
+  const client = new OAuth2Client(googleClientId);
   const ticket = await client.verifyIdToken({
     idToken,
-    audience: GOOGLE_CLIENT_ID
+    audience: googleClientId
   });
   return ticket.getPayload();
 }
@@ -536,12 +594,25 @@ async function rollbackDbSwitch(requestedBy) {
 }
 
 app.get("/healthz", (req, res) => {
-  res.json({ ok: true, service: "ktrain", driver: activeDriver, maintenanceMode, startupReady, appMode: currentAppMode, build: BUILD_INFO });
+  const setupRequired = Boolean(req.configStatus?.overall === "SETUP_REQUIRED" || setupModeActive);
+  res.json({
+    ok: !setupRequired,
+    service: "ktrain",
+    driver: activeDriver,
+    maintenanceMode,
+    setupRequired,
+    startupReady,
+    appMode: currentAppMode,
+    build: BUILD_INFO
+  });
 });
 
 app.get("/readyz", async (req, res) => {
   if (!startupReady) {
     return res.status(503).json({ ok: false, ready: false, error: "Startup not complete", phase: startupPhase });
+  }
+  if (req.configStatus?.overall === "SETUP_REQUIRED" || setupModeActive) {
+    return res.status(503).json({ ok: false, ready: false, error: "Setup required", setupRequired: true });
   }
   try {
     await repo.ping();
@@ -552,8 +623,26 @@ app.get("/readyz", async (req, res) => {
 });
 
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, driver: activeDriver, dbDriverEnv: DB_DRIVER_ENV, startupReady, appMode: currentAppMode, build: BUILD_INFO });
+  res.json({
+    ok: true,
+    driver: activeDriver,
+    dbDriverEnv: DB_DRIVER_ENV,
+    startupReady,
+    setupModeActive,
+    appMode: currentAppMode,
+    build: BUILD_INFO
+  });
 });
+
+app.get("/api/public/config/status", withAsync(async (req, res) => {
+  const status = await refreshConfigStatus();
+  res.json({
+    ok: true,
+    overall: status?.overall || "SETUP_REQUIRED",
+    setupRequired: (status?.overall || "SETUP_REQUIRED") === "SETUP_REQUIRED",
+    computed_at: status?.computed_at || new Date().toISOString()
+  });
+}));
 
 app.get("/api/public/session", (req, res) => {
   const role = normalizeRole(req.actor?.role || Roles.GUEST);
@@ -576,48 +665,119 @@ app.get("/api/public/version", (req, res) => {
 
 app.get("/api/auth/providers", withAsync(async (req, res) => {
   const emailSettings = await smtpService.getEmailSettings();
+  const providerConfig = await configStore.get("auth.providers", {
+    scope: "global",
+    scopeId: "global",
+    fallback: {
+      google: { enabled: Boolean(BOOTSTRAP_GOOGLE_CLIENT_ID), clientId: BOOTSTRAP_GOOGLE_CLIENT_ID || "" }
+    }
+  });
+  const googleEnabled = Boolean(providerConfig?.google?.enabled);
+  const googleClientId = String(providerConfig?.google?.clientId || BOOTSTRAP_GOOGLE_CLIENT_ID || "");
+  const googleSecret = await repo.getSystemSecret("google.client_secret");
   const passwordResetEnabled = Boolean(
-    emailSettings.host && emailSettings.username && emailSettings.password && emailSettings.fromAddress
+    emailSettings.enabled && emailSettings.host && emailSettings.username && emailSettings.password && emailSettings.fromAddress
   );
   res.json({
     ok: true,
-    google: { enabled: Boolean(GOOGLE_CLIENT_ID), clientId: GOOGLE_CLIENT_ID || null },
+    google: { enabled: googleEnabled && Boolean(googleClientId) && Boolean(googleSecret?.ciphertext), clientId: googleClientId || null },
     password: { enabled: true, resetEnabled: passwordResetEnabled }
   });
 }));
 
 app.get("/api/setup/status", withAsync(async (req, res) => {
-  let dbOk = false;
-  try {
-    await repo.ping();
-    dbOk = true;
-  } catch {
-    dbOk = false;
-  }
-  const owner = dbOk ? await repo.getOwnerUser() : null;
-  const email = dbOk ? await smtpService.getEmailSettings() : null;
-  const wizard = dbOk
-    ? await configStore.get("app.wizard", { scope: "global", scopeId: "global", fallback: { completedAt: null, schemaVersion: 1 } })
-    : { completedAt: null, schemaVersion: 1 };
+  const status = await refreshConfigStatus({ force: true });
   res.json({
     ok: true,
-    wizardCompleted: Boolean(wizard?.completedAt),
+    wizardCompleted: status?.overall !== "SETUP_REQUIRED",
+    overall: status?.overall || "SETUP_REQUIRED",
+    details: status?.details || [],
+    setupRequired: status?.overall === "SETUP_REQUIRED",
     steps: {
-      database: { ready: dbOk },
-      smtp: { ready: Boolean(email?.host && email?.username && email?.fromAddress) },
-      adminUser: { ready: Boolean(owner) },
-      googleAuth: { ready: Boolean(GOOGLE_CLIENT_ID) }
-    }
+      database: { ready: status?.required?.database === "READY", state: status?.required?.database || "MISSING" },
+      smtp: { ready: status?.optional?.smtp === "READY", state: status?.optional?.smtp || "MISSING" },
+      adminUser: { ready: status?.required?.adminUser === "READY", state: status?.required?.adminUser || "MISSING" },
+      googleAuth: { ready: status?.optional?.googleAuth === "READY", state: status?.optional?.googleAuth || "MISSING" },
+      openai: { ready: status?.optional?.openai === "READY", state: status?.optional?.openai || "MISSING" },
+      languagePacks: { ready: status?.optional?.languagePacks === "READY", state: status?.optional?.languagePacks || "MISSING" }
+    },
+    configVersion: status?.config_version || 1
   });
 }));
 
 app.post("/api/setup/complete", requirePermission(Permissions.ADMIN_CONFIG_MANAGE), adminLimiter, withAsync(async (req, res) => {
-  await configStore.setSafe("app.wizard", {
-    completedAt: new Date().toISOString(),
-    schemaVersion: 1
-  }, { scope: "global", scopeId: "global", updatedBy: req.actor?.externalSubject || "admin" });
-  await audit(req, "setup.complete", "wizard", "app");
-  res.json({ ok: true });
+  const status = await refreshConfigStatus({ force: true });
+  if (status?.overall === "SETUP_REQUIRED") {
+    throw new AppError("Required setup steps are incomplete", { status: 409, code: "SETUP_REQUIRED", expose: true });
+  }
+  await audit(req, "setup.complete", "wizard", "app", { overall: status?.overall });
+  res.json({ ok: true, status });
+}));
+
+app.post("/api/setup/bootstrap-owner", requirePermission(Permissions.SESSION_READ), withAsync(async (req, res) => {
+  if (!req.actor?.isAuthenticated || !req.actor?.id) {
+    throw new AppError("Authentication required", { status: 401, code: "UNAUTHORIZED", expose: true });
+  }
+  const existingOwner = await repo.getOwnerUser();
+  if (existingOwner) {
+    throw new AppError("Owner already exists", { status: 409, code: "OWNER_EXISTS", expose: true });
+  }
+  const updated = await repo.updateUserRole(req.actor.id, Roles.OWNER);
+  await audit(req, "setup.bootstrap_owner", "user", String(req.actor.id));
+  await refreshConfigStatus({ force: true });
+  res.json({ ok: true, owner: updated });
+}));
+
+app.post("/api/setup/admin-user", withAsync(async (req, res) => {
+  if (!setupModeActive) {
+    throw new AppError("Setup mode is not active", { status: 409, code: "SETUP_NOT_ACTIVE", expose: true });
+  }
+  const email = normalizeEmail(asString(req.body?.email || "", { min: 5, max: 255, field: "email" }));
+  const displayName = asString(req.body?.displayName || email.split("@")[0] || "Admin", { min: 1, max: 64, field: "displayName" });
+  const password = asString(req.body?.password || "", { min: 10, max: 128, field: "password" });
+  const policy = validatePasswordPolicy(password);
+  if (!policy.ok) throw badRequest(policy.message);
+
+  let user = await repo.findUserByEmail(email);
+  if (!user) {
+    user = await repo.createUser({
+      externalSubject: `password:${email}`,
+      email,
+      displayName,
+      role: Roles.OWNER
+    });
+  } else if (![Roles.ADMIN, Roles.OWNER].includes(normalizeRole(user.role))) {
+    user = await repo.updateUserRole(user.id, Roles.OWNER);
+  }
+
+  const passwordHash = await hashPassword(password);
+  await upsertPasswordIdentity(repo, user.id, passwordHash);
+  await repo.touchUserLogin(user.id);
+  await audit(req, "setup.admin_user.create", "user", String(user.id), { email: user.email });
+  const status = await refreshConfigStatus({ force: true });
+  res.status(201).json({
+    ok: true,
+    setupRequired: status?.overall === "SETUP_REQUIRED",
+    user: { id: user.id, email: user.email, displayName: user.displayName, role: user.role }
+  });
+}));
+
+app.get("/api/setup/db-status", withAsync(async (req, res) => {
+  let dbOk = false;
+  let migration = null;
+  try {
+    await repo.ping();
+    dbOk = true;
+    migration = await getMigrationStatus(repo, activeDriver);
+  } catch {
+    dbOk = false;
+  }
+  res.json({
+    ok: true,
+    activeDriver,
+    database: dbOk ? "READY" : "INVALID",
+    migrations: migration || null
+  });
 }));
 
 async function issueSessionForUser(req, res, user, auditAction) {
@@ -1101,10 +1261,17 @@ app.post("/api/admin/reset", requirePermission(Permissions.ADMIN_RESET), adminLi
 
 app.get("/api/admin/service-settings", requirePermission(Permissions.ADMIN_CONFIG_MANAGE), adminLimiter, withAsync(async (req, res) => {
   const email = await smtpService.getEmailSettings();
+  const providers = await configStore.get("auth.providers", {
+    scope: "global",
+    scopeId: "global",
+    fallback: { google: { enabled: Boolean(BOOTSTRAP_GOOGLE_CLIENT_ID), clientId: BOOTSTRAP_GOOGLE_CLIENT_ID || "" } }
+  });
+  const googleSecret = await repo.getSystemSecret("google.client_secret");
   res.json({
     ok: true,
     settings: {
       email: {
+        enabled: Boolean(email.enabled),
         host: email.host,
         port: email.port,
         secure: email.secure,
@@ -1112,6 +1279,13 @@ app.get("/api/admin/service-settings", requirePermission(Permissions.ADMIN_CONFI
         fromAddress: email.fromAddress,
         fromName: email.fromName,
         hasPassword: Boolean(email.password)
+      },
+      auth: {
+        google: {
+          enabled: Boolean(providers?.google?.enabled),
+          clientId: String(providers?.google?.clientId || ""),
+          hasClientSecret: Boolean(googleSecret?.ciphertext)
+        }
       },
       db: {
         activeDriver,
@@ -1124,21 +1298,69 @@ app.get("/api/admin/service-settings", requirePermission(Permissions.ADMIN_CONFI
 app.post("/api/admin/service-settings/email", requirePermission(Permissions.ADMIN_CONFIG_MANAGE), adminLimiter, withAsync(async (req, res) => {
   const payload = requireObject(req.body || {}, "email settings");
   await smtpService.saveEmailSettings(payload, req.actor?.externalSubject || "admin");
+  await configStore.setSafe("service.email.status", {
+    lastTestOk: false,
+    lastError: "",
+    lastTestAt: null
+  }, { scope: "global", scopeId: "global", updatedBy: req.actor?.externalSubject || "admin" });
   const saved = await smtpService.getEmailSettings();
   await audit(req, "service_settings.email.update", "email", "smtp");
+  await refreshConfigStatus({ force: true });
   res.json({ ok: true, settings: { ...saved, hasPassword: Boolean(saved.password) } });
 }));
 
 app.post("/api/admin/service-settings/email/test", requirePermission(Permissions.ADMIN_CONFIG_MANAGE), adminLimiter, withAsync(async (req, res) => {
   const to = asString(req.body?.to || req.actor?.email || "", { min: 5, max: 255, field: "to" });
-  await smtpService.send({
-    to,
-    subject: "KTrain SMTP test",
-    text: "SMTP test message from KTrain admin settings.",
-    html: "<p>SMTP test message from KTrain admin settings.</p>"
+  const payload = requireObject(req.body || {}, "email test");
+  try {
+    await smtpService.testSettings(payload.settings || {}, to);
+    await configStore.setSafe("service.email.status", {
+      lastTestOk: true,
+      lastError: "",
+      lastTestAt: new Date().toISOString()
+    }, { scope: "global", scopeId: "global", updatedBy: req.actor?.externalSubject || "admin" });
+    await audit(req, "service_settings.email.test", "email", to, { ok: true });
+    await refreshConfigStatus({ force: true });
+    return res.json({ ok: true });
+  } catch (err) {
+    await configStore.setSafe("service.email.status", {
+      lastTestOk: false,
+      lastError: String(err?.message || "SMTP test failed"),
+      lastTestAt: new Date().toISOString()
+    }, { scope: "global", scopeId: "global", updatedBy: req.actor?.externalSubject || "admin" });
+    await audit(req, "service_settings.email.test", "email", to, { ok: false });
+    await refreshConfigStatus({ force: true });
+    throw err;
+  }
+}));
+
+app.post("/api/admin/service-settings/auth/google", requirePermission(Permissions.ADMIN_CONFIG_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const payload = requireObject(req.body || {}, "google auth settings");
+  const enabled = Boolean(payload.enabled);
+  const clientId = String(payload.clientId || "").trim();
+  if (enabled && !clientId) throw badRequest("Google clientId is required when enabled");
+
+  const providers = await configStore.get("auth.providers", {
+    scope: "global",
+    scopeId: "global",
+    fallback: { google: { enabled: false, clientId: "" } }
   });
-  await audit(req, "service_settings.email.test", "email", to);
-  res.json({ ok: true });
+  await configStore.setSafe("auth.providers", {
+    ...providers,
+    google: {
+      enabled,
+      clientId
+    }
+  }, { scope: "global", scopeId: "global", updatedBy: req.actor?.externalSubject || "admin" });
+
+  if (payload.clientSecret) {
+    const encrypted = encryptionService.encrypt(String(payload.clientSecret));
+    await repo.setSystemSecret("google.client_secret", encrypted, req.actor?.externalSubject || "admin");
+  }
+
+  await audit(req, "service_settings.google.update", "auth", "google", { enabled, hasClientId: Boolean(clientId), hasClientSecret: Boolean(payload.clientSecret) });
+  await refreshConfigStatus({ force: true });
+  res.json({ ok: true, settings: { enabled, clientId, hasClientSecret: Boolean(await repo.getSystemSecret("google.client_secret")) } });
 }));
 
 app.post("/api/admin/seed-defaults", requirePermission(Permissions.ADMIN_SEED_DEFAULTS), adminLimiter, withAsync(async (req, res) => {
@@ -1277,6 +1499,103 @@ app.post("/api/admin/config", requirePermission(Permissions.ADMIN_CONFIG_MANAGE)
   res.json({ ok: true, config: result });
 }));
 
+app.get("/api/admin/config/status", requirePermission(Permissions.ADMIN_CONFIG_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const status = await refreshConfigStatus({ force: true });
+  res.json({ ok: true, status });
+}));
+
+app.post("/api/admin/config/test/smtp", requirePermission(Permissions.ADMIN_CONFIG_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const payload = requireObject(req.body || {}, "smtp test");
+  const to = asString(payload.to || req.actor?.email || "", { min: 5, max: 255, field: "to" });
+  try {
+    await smtpService.testSettings(payload.settings || {}, to);
+    await configStore.setSafe("service.email.status", {
+      lastTestOk: true,
+      lastError: "",
+      lastTestAt: new Date().toISOString()
+    }, { scope: "global", scopeId: "global", updatedBy: req.actor?.externalSubject || "admin" });
+    await audit(req, "config.test.smtp", "smtp", to, { ok: true });
+    await refreshConfigStatus({ force: true });
+    res.json({ ok: true, result: { status: "READY" } });
+  } catch (err) {
+    await configStore.setSafe("service.email.status", {
+      lastTestOk: false,
+      lastError: String(err?.message || "SMTP test failed"),
+      lastTestAt: new Date().toISOString()
+    }, { scope: "global", scopeId: "global", updatedBy: req.actor?.externalSubject || "admin" });
+    await audit(req, "config.test.smtp", "smtp", to, { ok: false });
+    await refreshConfigStatus({ force: true });
+    res.status(400).json({ ok: false, result: { status: "INVALID", message: String(err?.message || "SMTP test failed") } });
+  }
+}));
+
+app.post("/api/admin/config/test/db", requirePermission(Permissions.ADMIN_DB_TEST), adminLimiter, withAsync(async (req, res) => {
+  try {
+    await repo.ping();
+    const migration = await getMigrationStatus(repo, activeDriver);
+    const ok = Array.isArray(migration?.pending) ? migration.pending.length === 0 : true;
+    res.json({ ok: true, result: { status: ok ? "READY" : "INVALID", migration } });
+  } catch (err) {
+    res.status(400).json({ ok: false, result: { status: "INVALID", message: String(err?.message || "DB test failed") } });
+  }
+}));
+
+app.post("/api/admin/config/test/google", requirePermission(Permissions.ADMIN_CONFIG_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const provider = await configStore.get("auth.providers", {
+    scope: "global",
+    scopeId: "global",
+    fallback: { google: { enabled: false, clientId: "" } }
+  });
+  const enabled = Boolean(provider?.google?.enabled);
+  const clientId = String(provider?.google?.clientId || "");
+  const secret = await repo.getSystemSecret("google.client_secret");
+  const ok = !enabled || (clientId && secret?.ciphertext);
+  res.json({
+    ok,
+    result: {
+      status: ok ? "READY" : "INVALID",
+      enabled,
+      hasClientId: Boolean(clientId),
+      hasClientSecret: Boolean(secret?.ciphertext)
+    }
+  });
+}));
+
+app.post("/api/admin/config/apply", requirePermission(Permissions.ADMIN_CONFIG_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const payload = requireObject(req.body || {}, "config apply");
+  const changes = Array.isArray(payload.changes) ? payload.changes : [];
+  const allowPartialSetup = Boolean(payload.allowPartialSetup);
+  if (changes.length === 0) throw badRequest("No config changes provided");
+
+  const snapshot = await configStore.exportSafeConfig();
+  const updates = [];
+  for (const row of changes) {
+    const key = asString(row?.key || "", { min: 1, max: 128, field: "key" });
+    const scope = asEnum(row?.scope || "global", ["global", "tenant", "user"], "scope");
+    const scopeId = asString(row?.scopeId || "global", { min: 1, max: 128, field: "scopeId" });
+    const valueJson = row?.valueJson;
+    const updated = await configStore.setSafe(key, valueJson, {
+      scope,
+      scopeId,
+      updatedBy: req.actor?.externalSubject || "admin"
+    });
+    updates.push(updated);
+  }
+
+  const status = await refreshConfigStatus({ force: true });
+  if (!allowPartialSetup && status?.overall === "SETUP_REQUIRED") {
+    await configStore.importSafeConfig(snapshot, req.actor?.externalSubject || "admin:rollback");
+    await refreshConfigStatus({ force: true });
+    throw new AppError("Apply rejected: required configuration became invalid", {
+      status: 409,
+      code: "CONFIG_REQUIRED_INVALID",
+      expose: true
+    });
+  }
+  await audit(req, "config.apply", "config", "global", { keys: updates.map((row) => row.key) });
+  res.json({ ok: true, status, appliedKeys: updates.map((row) => row.key) });
+}));
+
 app.get("/api/admin/config/export", requirePermission(Permissions.ADMIN_CONFIG_PORTABILITY), adminLimiter, withAsync(async (req, res) => {
   const rows = await configStore.exportSafeConfig();
   res.json({ ok: true, rows });
@@ -1286,12 +1605,19 @@ app.post("/api/admin/config/import", requirePermission(Permissions.ADMIN_CONFIG_
   const rows = req.body?.rows;
   await configStore.importSafeConfig(rows, req.actor?.externalSubject || "admin");
   await audit(req, "config.import", "config", "global", { count: Array.isArray(rows) ? rows.length : 0 });
+  await refreshConfigStatus({ force: true });
   res.json({ ok: true });
 }));
 
 app.post("/api/admin/config/export", requirePermission(Permissions.ADMIN_CONFIG_PORTABILITY), adminLimiter, withAsync(async (req, res) => {
   const includeSecrets = Boolean(req.body?.includeSecrets);
   const rows = await configStore.exportSafeConfig();
+  const authProviders = await configStore.get("auth.providers", {
+    scope: "global",
+    scopeId: "global",
+    fallback: { google: { enabled: Boolean(BOOTSTRAP_GOOGLE_CLIENT_ID), clientId: BOOTSTRAP_GOOGLE_CLIENT_ID || "" } }
+  });
+  const emailSettings = await smtpService.getEmailSettings();
   const runtime = readRuntimeConfig();
   const languagePackMeta = (await repo.listLanguagePacks({})).map((p) => ({
     id: p.id,
@@ -1326,9 +1652,9 @@ app.post("/api/admin/config/export", requirePermission(Permissions.ADMIN_CONFIG_
     config: rows,
     runtime: { activeDriver: runtime.activeDriver, dbConfigPresent: Boolean(runtime.dbConfig) },
     languagePackMeta,
-    authProviderMeta: { googleEnabled: Boolean(GOOGLE_CLIENT_ID), passwordEnabled: true },
+    authProviderMeta: { googleEnabled: Boolean(authProviders?.google?.enabled), passwordEnabled: true },
     smtpMeta: {
-      configured: Boolean((await smtpService.getEmailSettings()).host)
+      configured: Boolean(emailSettings.enabled && emailSettings.host)
     },
     secrets: includeSecrets ? secrets : []
   });
@@ -1385,6 +1711,7 @@ app.post("/api/admin/config/import-apply", requirePermission(Permissions.ADMIN_C
     }
   }
   await audit(req, "config.import.apply", "config", "global", { count: applyRows.length, mode });
+  await refreshConfigStatus({ force: true });
   res.json({ ok: true, applied: applyRows.length, mode });
 }));
 
@@ -1518,6 +1845,9 @@ async function ensureOwnerBootstrap() {
 async function seedDefaultRuntimeConfig() {
   const existing = await configStore.list({ scope: "global", scopeId: "global" });
   const keys = new Set(existing.map((row) => row.key));
+  if (!keys.has("app.config_version")) {
+    await configStore.setSafe("app.config_version", { version: 1, updatedAt: new Date().toISOString() }, { scope: "global", scopeId: "global", updatedBy: "bootstrap" });
+  }
   if (!keys.has("app.features")) {
     await configStore.setSafe("app.features", { maintenanceMode: false }, { scope: "global", scopeId: "global", updatedBy: "bootstrap" });
   }
@@ -1525,7 +1855,33 @@ async function seedDefaultRuntimeConfig() {
     await configStore.setSafe("contest.rules", { maxAllowedLevel: 5, durations: [30, 60, 120], taskTargets: [10, 20, 50] }, { scope: "global", scopeId: "global", updatedBy: "bootstrap" });
   }
   if (!keys.has("generator.defaults")) {
-    await configStore.setSafe("generator.defaults", { openAiModel: OPENAI_MODEL, maxCount: 200 }, { scope: "global", scopeId: "global", updatedBy: "bootstrap" });
+    await configStore.setSafe("generator.defaults", { openAiModel: OPENAI_MODEL, maxCount: 200, openaiEnabled: false }, { scope: "global", scopeId: "global", updatedBy: "bootstrap" });
+  }
+  if (!keys.has("service.email")) {
+    await configStore.setSafe("service.email", {
+      enabled: false,
+      host: "",
+      port: 587,
+      secure: false,
+      username: "",
+      fromAddress: "",
+      fromName: "KTrain"
+    }, { scope: "global", scopeId: "global", updatedBy: "bootstrap" });
+  }
+  if (!keys.has("service.email.status")) {
+    await configStore.setSafe("service.email.status", {
+      lastTestOk: false,
+      lastError: "",
+      lastTestAt: null
+    }, { scope: "global", scopeId: "global", updatedBy: "bootstrap" });
+  }
+  if (!keys.has("auth.providers")) {
+    await configStore.setSafe("auth.providers", {
+      google: {
+        enabled: Boolean(BOOTSTRAP_GOOGLE_CLIENT_ID),
+        clientId: BOOTSTRAP_GOOGLE_CLIENT_ID || ""
+      }
+    }, { scope: "global", scopeId: "global", updatedBy: "bootstrap" });
   }
   if (!keys.has("app.runtime")) {
     await configStore.setSafe("app.runtime", { mode: APP_MODE, advancedDebugExpiresAt: null }, { scope: "global", scopeId: "global", updatedBy: "bootstrap" });
@@ -1543,6 +1899,9 @@ async function seedDefaultRuntimeConfig() {
 }
 
 async function start() {
+  if (!process.env.KTRAIN_MASTER_KEY) {
+    throw new Error("KTRAIN_MASTER_KEY is required");
+  }
   setStartupPhase("init_db");
   const dbState = await initDb();
   repo = dbState.adapter;
@@ -1596,6 +1955,10 @@ async function start() {
   if (!startupSelfChecks.migrations.ok || !startupSelfChecks.indexes.ok) {
     throw new Error("Startup self-check failed: required migrations/indexes missing");
   }
+
+  setStartupPhase("compute_config_status");
+  const status = await refreshConfigStatus({ force: true });
+  logger.info("config_status", { overall: status?.overall, required: status?.required, optional: status?.optional });
 
   setInterval(() => {
     Promise.all([

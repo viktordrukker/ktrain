@@ -5,6 +5,7 @@ const { PostgresAdapter } = require("./adapters/postgres");
 const { readRuntimeConfig } = require("./runtime-config");
 const { migrateUp, migrationStatus, rollbackLast } = require("./migration-runner");
 
+const KTRAIN_BOOTSTRAP_DB = process.env.KTRAIN_BOOTSTRAP_DB || "";
 const DB_DRIVER_ENV = process.env.DB_DRIVER || "sqlite";
 const SQLITE_PATH = process.env.SQLITE_PATH || process.env.DB_PATH || "/data/ktrain.sqlite";
 
@@ -31,9 +32,33 @@ function sanitizeDbConfig(input = {}) {
   };
 }
 
+function parseBootstrapDb(input = "") {
+  const raw = String(input || "").trim();
+  if (!raw) return null;
+  if (raw.startsWith("postgres://") || raw.startsWith("postgresql://")) {
+    return {
+      activeDriver: "postgres",
+      dbConfig: sanitizeDbConfig({ postgres: { connectionString: raw } })
+    };
+  }
+  if (raw.startsWith("sqlite:")) {
+    return {
+      activeDriver: "sqlite",
+      dbConfig: sanitizeDbConfig({ sqlitePath: raw.replace(/^sqlite:/, "") })
+    };
+  }
+  return {
+    activeDriver: "sqlite",
+    dbConfig: sanitizeDbConfig({ sqlitePath: raw })
+  };
+}
+
 function resolveDbConfig() {
   const runtime = readRuntimeConfig();
-  return sanitizeDbConfig(runtime.dbConfig || {});
+  if (runtime.dbConfig) return sanitizeDbConfig(runtime.dbConfig || {});
+  const bootstrap = parseBootstrapDb(KTRAIN_BOOTSTRAP_DB);
+  if (bootstrap?.dbConfig) return bootstrap.dbConfig;
+  return sanitizeDbConfig({});
 }
 
 function loadMigrationSql(driver) {
@@ -43,6 +68,8 @@ function loadMigrationSql(driver) {
 
 function resolveDriver() {
   const runtime = readRuntimeConfig();
+  const bootstrap = parseBootstrapDb(KTRAIN_BOOTSTRAP_DB);
+  if (!runtime.activeDriver && bootstrap?.activeDriver) return bootstrap.activeDriver;
   return runtime.activeDriver || DB_DRIVER_ENV;
 }
 
