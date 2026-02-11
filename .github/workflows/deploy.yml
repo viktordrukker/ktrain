@@ -192,8 +192,20 @@ jobs:
               echo "scripts directory is missing after bootstrap"
               exit 1
             fi
+            echo "Deploy script fingerprint:"
+            sha256sum ./scripts/deploy_remote.sh || true
+            echo "Deploy readiness settings present in script:"
+            grep -nE 'READINESS_PATH|READINESS_TIMEOUT_SEC|READINESS_POLL_SEC' ./scripts/deploy_remote.sh || true
             export IMAGE="ghcr.io/${{ github.repository }}:${{ github.event.inputs.image_tag || 'latest' }}"
             export APP_BUILD="${{ github.run_number }}"
             export APP_COMMIT="${{ github.sha }}"
             export APP_VERSION="${{ github.event.inputs.image_tag || 'latest' }}"
-            APP_DIR="$DEPLOY_PATH" IMAGE="$IMAGE" APP_BUILD="$APP_BUILD" APP_COMMIT="$APP_COMMIT" APP_VERSION="$APP_VERSION" ./scripts/deploy_remote.sh
+            APP_DIR="$DEPLOY_PATH" \
+            IMAGE="$IMAGE" \
+            APP_BUILD="$APP_BUILD" \
+            APP_COMMIT="$APP_COMMIT" \
+            APP_VERSION="$APP_VERSION" \
+            READINESS_PATH="/healthz" \
+            READINESS_TIMEOUT_SEC="180" \
+            READINESS_POLL_SEC="2" \
+            ./scripts/deploy_remote.sh
