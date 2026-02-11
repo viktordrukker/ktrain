@@ -98,6 +98,34 @@ body {
   align-items: stretch;
 }
 
+.menu-hero {
+  width: min(920px, 94vw);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  text-align: center;
+}
+
+.start-now-btn {
+  min-height: 64px;
+  min-width: min(520px, 92vw);
+  font-size: clamp(1.1rem, 2vw, 1.45rem);
+}
+
+.menu-stats-row {
+  width: min(920px, 94vw);
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  padding-bottom: 6px;
+}
+
+.menu-stat-card {
+  min-width: 170px;
+  flex: 1 0 170px;
+}
+
 h1, h2, h3 {
   margin: 0;
   text-transform: uppercase;
@@ -1259,6 +1287,14 @@ input, select, textarea {
   }
   .setting-row {
     grid-template-columns: 1fr;
+  }
+  .menu-hero {
+    align-items: stretch;
+    text-align: left;
+  }
+  .start-now-btn {
+    width: 100%;
+    min-width: 0;
   }
 }
 

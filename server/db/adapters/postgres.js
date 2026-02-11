@@ -148,6 +148,58 @@ class PostgresAdapter {
     return rows;
   }
 
+  async getGamePreferences(userId) {
+    const { rows } = await this.pool.query("SELECT * FROM game_preferences WHERE userId = $1 LIMIT 1", [userId]);
+    return rows[0] || null;
+  }
+
+  async upsertGamePreferences({ userId, mode, level, contentType, language, updatedAt }) {
+    await this.pool.query(
+      `INSERT INTO game_preferences (userId, mode, level, contentType, language, updatedAt)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT(userId) DO UPDATE SET
+         mode = EXCLUDED.mode,
+         level = EXCLUDED.level,
+         contentType = EXCLUDED.contentType,
+         language = EXCLUDED.language,
+         updatedAt = EXCLUDED.updatedAt`,
+      [userId, mode, level, contentType, language, updatedAt]
+    );
+  }
+
+  async getPlayerStats(userId) {
+    const { rows } = await this.pool.query("SELECT * FROM player_stats WHERE userId = $1 LIMIT 1", [userId]);
+    return rows[0] || null;
+  }
+
+  async upsertPlayerStats({
+    userId,
+    totalLettersTyped,
+    totalCorrect,
+    totalIncorrect,
+    bestWPM,
+    sessionsCount,
+    totalPlayTimeMs,
+    streakDays,
+    lastSessionAt
+  }) {
+    await this.pool.query(
+      `INSERT INTO player_stats
+      (userId, totalLettersTyped, totalCorrect, totalIncorrect, bestWPM, sessionsCount, totalPlayTimeMs, streakDays, lastSessionAt)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      ON CONFLICT(userId) DO UPDATE SET
+        totalLettersTyped = EXCLUDED.totalLettersTyped,
+        totalCorrect = EXCLUDED.totalCorrect,
+        totalIncorrect = EXCLUDED.totalIncorrect,
+        bestWPM = EXCLUDED.bestWPM,
+        sessionsCount = EXCLUDED.sessionsCount,
+        totalPlayTimeMs = EXCLUDED.totalPlayTimeMs,
+        streakDays = EXCLUDED.streakDays,
+        lastSessionAt = EXCLUDED.lastSessionAt`,
+      [userId, totalLettersTyped, totalCorrect, totalIncorrect, bestWPM, sessionsCount, totalPlayTimeMs, streakDays, lastSessionAt || null]
+    );
+  }
+
   async listPacks() {
     const { rows } = await this.pool.query("SELECT * FROM vocab_packs ORDER BY createdAt DESC");
     return rows;
