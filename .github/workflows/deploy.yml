@@ -148,7 +148,10 @@ jobs:
             fi
             echo "Syncing deployment tree to commit ${{ github.sha }}"
             git fetch --depth 1 origin "${{ github.sha }}"
-            git checkout -B deploy FETCH_HEAD
+            # SCP may overwrite tracked files before this step; ensure a clean tree.
+            git reset --hard || true
+            git clean -fd || true
+            git checkout --force -B deploy FETCH_HEAD
             git reset --hard "${{ github.sha }}"
             ls -la
 
