@@ -6,6 +6,7 @@ import {
   Card,
   ColorInput,
   Checkbox,
+  Drawer,
   Divider,
   Group,
   Modal,
@@ -168,6 +169,27 @@ type GameStats = {
   maxStreak: number;
 };
 
+type GamePreferences = {
+  userId: number | null;
+  mode: Mode;
+  level: number;
+  contentType: ContentMode;
+  language: string;
+  updatedAt?: string;
+};
+
+type PlayerStats = {
+  userId: number | null;
+  totalLettersTyped: number;
+  totalCorrect: number;
+  totalIncorrect: number;
+  bestWPM: number;
+  sessionsCount: number;
+  totalPlayTimeMs: number;
+  streakDays: number;
+  lastSessionAt: string | null;
+};
+
 type TextSize = "small" | "medium" | "large" | "xlarge";
 type ThemeName = "high_contrast" | "soft_pastel" | "dark_calm" | "warm_playful" | "custom";
 type VisualSet = "stars" | "hearts" | "balloons" | "smiles" | "confetti";
@@ -251,6 +273,26 @@ const defaultSettings: GameSettings = {
   contentMode: "default",
   language: "en",
   playerName: ""
+};
+
+const defaultGamePreferences: GamePreferences = {
+  userId: null,
+  mode: "learning",
+  level: 1,
+  contentType: "default",
+  language: "en"
+};
+
+const emptyPlayerStats: PlayerStats = {
+  userId: null,
+  totalLettersTyped: 0,
+  totalCorrect: 0,
+  totalIncorrect: 0,
+  bestWPM: 0,
+  sessionsCount: 0,
+  totalPlayTimeMs: 0,
+  streakDays: 0,
+  lastSessionAt: null
 };
 
 const defaultAppSettings: AppSettings = {
@@ -491,6 +533,34 @@ const API = {
   async getPublicSession() {
     const res = await fetch("/api/public/session", { headers: withAuthHeaders() });
     if (!res.ok) throw await parseApiError(res, "Failed to load session");
+    return res.json();
+  },
+  async getGamePreferences(): Promise<{ preferences: GamePreferences; source: string }> {
+    const res = await fetch("/api/user/preferences", { headers: withAuthHeaders() });
+    if (!res.ok) throw await parseApiError(res, "Failed to load game preferences");
+    return res.json();
+  },
+  async saveGamePreferences(payload: Pick<GamePreferences, "mode" | "level" | "contentType" | "language">) {
+    const res = await fetch("/api/user/preferences", {
+      method: "PUT",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw await parseApiError(res, "Failed to save game preferences");
+    return res.json();
+  },
+  async getPlayerStats(): Promise<{ stats: PlayerStats | null; source: string }> {
+    const res = await fetch("/api/user/stats", { headers: withAuthHeaders() });
+    if (!res.ok) throw await parseApiError(res, "Failed to load player stats");
+    return res.json();
+  },
+  async saveSessionStats(payload: { lettersTyped: number; correct: number; incorrect: number; bestWPM: number; totalPlayTimeMs: number; lastSessionAt: string }) {
+    const res = await fetch("/api/user/stats/session-end", {
+      method: "POST",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw await parseApiError(res, "Failed to save session stats");
     return res.json();
   },
   async getUserProfile() {
@@ -1142,6 +1212,12 @@ function App() {
   const PLAY_SESSION_KEY = "ktrain_play_session_id_v2";
   const [screen, setScreen] = useState<Screen>("home");
   const [settings, setSettings] = useState<GameSettings>(defaultSettings);
+  const [menuDrawerOpen, setMenuDrawerOpen] = useState(false);
+  const [menuDraftSettings, setMenuDraftSettings] = useState<GameSettings>(defaultSettings);
+  const [savedPreferences, setSavedPreferences] = useState<GamePreferences>(defaultGamePreferences);
+  const [playerStats, setPlayerStats] = useState<PlayerStats>(emptyPlayerStats);
+  const [guestSessionStats, setGuestSessionStats] = useState<PlayerStats>(emptyPlayerStats);
+  const [isMobileMainMenu, setIsMobileMainMenu] = useState(false);
   const [appSettings, setAppSettings] = useState<AppSettings>(defaultAppSettings);
   const [savedAppSettings, setSavedAppSettings] = useState<AppSettings>(defaultAppSettings);
   const [lastSettingsAppliedAt, setLastSettingsAppliedAt] = useState<string>("");
@@ -1290,6 +1366,16 @@ function App() {
     () => JSON.stringify(appSettings) !== JSON.stringify(savedAppSettings),
     [appSettings, savedAppSettings]
   );
+  const hasUnsavedMenuChanges = useMemo(() => (
+    settings.mode !== menuDraftSettings.mode
+    || settings.level !== menuDraftSettings.level
+    || settings.contentMode !== menuDraftSettings.contentMode
+    || settings.language !== menuDraftSettings.language
+  ), [settings.mode, settings.level, settings.contentMode, settings.language, menuDraftSettings]);
+  const menuStatsDisplay = sessionUser ? playerStats : guestSessionStats;
+  const menuAccuracy = menuStatsDisplay.totalLettersTyped > 0
+    ? Math.round((menuStatsDisplay.totalCorrect / menuStatsDisplay.totalLettersTyped) * 100)
+    : 0;
   const isSetupRoute = window.location.pathname === "/setup";
   const isSetupRequired = publicConfigOverall === "SETUP_REQUIRED";
 
@@ -1413,6 +1499,38 @@ function App() {
       window.history.replaceState({}, "", window.location.pathname);
     }
   }, [isSetupRoute, isSetupRequired, reportClientError]);
+
+  useEffect(() => {
+    setMenuDraftSettings(settings);
+  }, [settings.mode, settings.level, settings.contentMode, settings.language]);
+
+  useEffect(() => {
+    if (!sessionUser?.isAuthenticated) {
+      setSavedPreferences(defaultGamePreferences);
+      setPlayerStats(emptyPlayerStats);
+      return;
+    }
+    API.getGamePreferences()
+      .then((data) => {
+        const pref = data?.preferences || defaultGamePreferences;
+        setSavedPreferences(pref);
+        setSettings((prev) => ({
+          ...prev,
+          mode: pref.mode === "contest" ? "contest" : "learning",
+          level: Math.max(1, Math.min(5, Number(pref.level || 1))),
+          contentMode: pref.contentType === "vocab" ? "vocab" : "default",
+          language: String(pref.language || "en").toLowerCase()
+        }));
+      })
+      .catch((err) => reportClientError("load_game_preferences", err));
+
+    API.getPlayerStats()
+      .then((data) => {
+        if (data?.stats) setPlayerStats(data.stats);
+        else setPlayerStats({ ...emptyPlayerStats, userId: Number(sessionUser?.id || 0) || null });
+      })
+      .catch((err) => reportClientError("load_player_stats", err));
+  }, [sessionUser?.id, sessionUser?.isAuthenticated, reportClientError]);
 
   useEffect(() => {
     API.getPublicConfigStatus()
@@ -1619,6 +1737,7 @@ function App() {
   useEffect(() => {
     const update = () => {
       setCompactUI(window.innerHeight < 700 || window.innerWidth < 700);
+      setIsMobileMainMenu(window.innerWidth <= 720);
     };
     update();
     window.addEventListener("resize", update);
@@ -1664,23 +1783,122 @@ function App() {
     setMistakeFlash(false);
   };
 
+  const recordSessionStats = async (endedAtMs: number, totalMs: number) => {
+    const sessionSummary = {
+      lettersTyped: gameStats.correct + gameStats.incorrect,
+      correct: gameStats.correct,
+      incorrect: gameStats.incorrect,
+      bestWPM: cpm,
+      totalPlayTimeMs: Math.max(0, totalMs),
+      lastSessionAt: new Date(endedAtMs).toISOString()
+    };
+    setGuestSessionStats((prev) => ({
+      ...prev,
+      totalLettersTyped: prev.totalLettersTyped + sessionSummary.lettersTyped,
+      totalCorrect: prev.totalCorrect + sessionSummary.correct,
+      totalIncorrect: prev.totalIncorrect + sessionSummary.incorrect,
+      bestWPM: Math.max(prev.bestWPM, sessionSummary.bestWPM),
+      sessionsCount: prev.sessionsCount + 1,
+      totalPlayTimeMs: prev.totalPlayTimeMs + sessionSummary.totalPlayTimeMs,
+      lastSessionAt: sessionSummary.lastSessionAt
+    }));
+
+    if (sessionUser?.isAuthenticated) {
+      try {
+        const saved = await API.saveSessionStats(sessionSummary);
+        if (saved?.stats) setPlayerStats(saved.stats);
+      } catch (err) {
+        reportClientError("save_session_stats", err);
+      }
+    }
+  };
+
   const stopSession = async (save: boolean) => {
     if (settings.mode === "contest" && save) {
       await endGame();
       return;
     }
+    if (screen === "game" && startTime > 0) {
+      const endedAt = Date.now();
+      await recordSessionStats(endedAt, endedAt - startTime);
+    }
     resetSessionState();
     setScreen("home");
   };
 
-  const startGame = async () => {
-    setStatusMessage("");
-    if (!sessionUser && !String(settings.playerName || "").trim()) {
-      setStatusMessage("Guest nickname is required.");
+  const applyMenuDraftToSettings = () => {
+    setSettings((prev) => ({
+      ...prev,
+      mode: menuDraftSettings.mode,
+      level: menuDraftSettings.level,
+      contentMode: menuDraftSettings.contentMode,
+      language: menuDraftSettings.language
+    }));
+  };
+
+  const resetMenuDraftToDefaults = () => {
+    setMenuDraftSettings((prev) => ({
+      ...prev,
+      mode: "learning",
+      level: 1,
+      contentMode: "default",
+      language: "en"
+    }));
+  };
+
+  const saveMenuDefaults = async () => {
+    if (!sessionUser?.isAuthenticated) {
+      setStatusMessage("Sign in to save defaults.");
       return;
     }
-    const generated = await API.generateTasks(settings.level, 40, settings.contentMode, settings.language);
-    if (generated.language !== settings.language) {
+    try {
+      const payload = {
+        mode: menuDraftSettings.mode,
+        level: menuDraftSettings.level,
+        contentType: menuDraftSettings.contentMode,
+        language: menuDraftSettings.language
+      };
+      const data = await API.saveGamePreferences(payload);
+      setSavedPreferences(data.preferences || { ...defaultGamePreferences, ...payload });
+      setStatusMessage("Defaults saved.");
+    } catch (err) {
+      setStatusMessage("Could not save defaults.");
+      reportClientError("save_game_preferences", err);
+    }
+  };
+
+  const startQuickGame = async () => {
+    let nextSettings: GameSettings;
+    if (sessionUser?.isAuthenticated) {
+      nextSettings = {
+        ...settings,
+        mode: savedPreferences.mode === "contest" ? "contest" : "learning",
+        level: Math.max(1, Math.min(5, Number(savedPreferences.level || 1))),
+        contentMode: savedPreferences.contentType === "vocab" ? "vocab" : "default",
+        language: String(savedPreferences.language || "en").toLowerCase()
+      };
+    } else {
+      nextSettings = {
+        ...settings,
+        mode: "learning",
+        level: 1,
+        contentMode: "default",
+        language: "en",
+        playerName: String(settings.playerName || "").trim() || "Guest"
+      };
+    }
+    setSettings(nextSettings);
+    await startGame(nextSettings);
+  };
+
+  const startGame = async (activeSettings?: GameSettings) => {
+    const runSettings = activeSettings || settings;
+    setStatusMessage("");
+    if (!sessionUser && !String(runSettings.playerName || "").trim()) {
+      setSettings((prev) => ({ ...prev, playerName: "Guest" }));
+    }
+    const generated = await API.generateTasks(runSettings.level, 40, runSettings.contentMode, runSettings.language);
+    if (generated.language !== runSettings.language) {
       setSettings((prev) => ({ ...prev, language: generated.language || prev.language }));
     }
     if (generated.fallbackNotice) {
@@ -1700,12 +1918,12 @@ function App() {
     const start = Date.now();
     setStartTime(start);
     setElapsedMs(0);
-    if (settings.mode === "contest" && settings.contestType === "time") {
-      setTimeLeft(settings.duration * 1000);
+    if (runSettings.mode === "contest" && runSettings.contestType === "time") {
+      setTimeLeft(runSettings.duration * 1000);
     } else {
       setTimeLeft(null);
     }
-    const prev = localStorage.getItem(settingsKey(settings));
+    const prev = localStorage.getItem(settingsKey(runSettings));
     if (prev) {
       try {
         const parsed = JSON.parse(prev);
@@ -1742,6 +1960,8 @@ function App() {
       maxStreak: gameStats.maxStreak,
       mode: settings.mode
     };
+
+    await recordSessionStats(endTime, totalMs);
 
     if (settings.mode === "contest") {
       try {
@@ -2551,27 +2771,71 @@ function App() {
 
       {screen === "home" && (
         <div className="screen home">
-          <Title order={1}>Keyboard Trainer</Title>
-          <Text>Big keys. Big wins.</Text>
-          <Card className="form-card" shadow="sm" radius="lg" withBorder>
+          <div className="menu-hero">
+            <Title order={1}>Keyboard Trainer</Title>
+            <Text>One tap to start. Advanced setup when needed.</Text>
+            {sessionUser ? (
+              <Text size="sm">Welcome back, {sessionUser.displayName || sessionUser.email || "Player"}.</Text>
+            ) : (
+              <TextInput
+                label="Guest nickname (optional)"
+                value={settings.playerName}
+                onChange={(e) => setSettings((prev) => ({ ...prev, playerName: e.target.value }))}
+                placeholder="Guest"
+                maw={420}
+              />
+            )}
+            <Button size="xl" className="start-now-btn" onClick={() => void startQuickGame()}>
+              Start Now
+            </Button>
+            <Button variant="light" size="md" onClick={() => { setMenuDraftSettings(settings); setMenuDrawerOpen(true); }}>
+              Customize Game
+            </Button>
+            <div className="menu-stats-row" role="group" aria-label="Session progress stats">
+              <Card withBorder className="menu-stat-card">
+                <Text size="xs" c="dimmed">Total letters</Text>
+                <Text fw={700}>{menuStatsDisplay.totalLettersTyped}</Text>
+              </Card>
+              <Card withBorder className="menu-stat-card">
+                <Text size="xs" c="dimmed">Accuracy</Text>
+                <Text fw={700}>{menuAccuracy}%</Text>
+              </Card>
+              <Card withBorder className="menu-stat-card">
+                <Text size="xs" c="dimmed">Best WPM</Text>
+                <Text fw={700}>{menuStatsDisplay.bestWPM}</Text>
+              </Card>
+              <Card withBorder className="menu-stat-card">
+                <Text size="xs" c="dimmed">{sessionUser ? "Sessions" : "Session count"}</Text>
+                <Text fw={700}>{menuStatsDisplay.sessionsCount}</Text>
+              </Card>
+            </div>
+            <Card withBorder radius="md" p="sm" maw={620}>
+              <Text fw={600}>Live Activity</Text>
+              <Text size="sm">Users playing now: {liveStats.total}</Text>
+              <Text size="xs" c="dimmed">Authorized: {liveStats.authorized} • Guests: {liveStats.guests}</Text>
+            </Card>
+          </div>
+
+          <Drawer
+            opened={menuDrawerOpen}
+            onClose={() => {
+              if (hasUnsavedMenuChanges) {
+                const shouldClose = window.confirm("Discard unapplied menu changes?");
+                if (!shouldClose) return;
+                setMenuDraftSettings(settings);
+              }
+              setMenuDrawerOpen(false);
+            }}
+            position={isMobileMainMenu ? "bottom" : "right"}
+            size={isMobileMainMenu ? "85%" : "md"}
+            title="Customize Game"
+          >
             <Stack gap="md">
-              {sessionUser ? (
-                <Card withBorder radius="md" p="sm">
-                  <Text fw={600}>Playing as: {sessionUser.displayName || sessionUser.email || "Player"}</Text>
-                </Card>
-              ) : (
-                <TextInput
-                  label="Guest nickname"
-                  value={settings.playerName}
-                  onChange={(e) => setSettings({ ...settings, playerName: e.target.value })}
-                  placeholder="Guest"
-                />
-              )}
               <Stack gap="xs">
                 <Text fw={600}>Mode</Text>
                 <SegmentedControl
-                  value={settings.mode}
-                  onChange={(value) => setSettings({ ...settings, mode: value as Mode })}
+                  value={menuDraftSettings.mode}
+                  onChange={(value) => setMenuDraftSettings((prev) => ({ ...prev, mode: value as Mode }))}
                   data={[
                     { value: "learning", label: "Learning" },
                     { value: "contest", label: "Contest" }
@@ -2581,60 +2845,16 @@ function App() {
               <Stack gap="xs">
                 <Text fw={600}>Level</Text>
                 <SegmentedControl
-                  value={String(settings.level)}
-                  onChange={(value) => setSettings({ ...settings, level: Number(value) })}
-                  data={allowedLevels.map((lvl) => ({
-                    value: String(lvl),
-                    label: String(lvl)
-                  }))}
+                  value={String(menuDraftSettings.level)}
+                  onChange={(value) => setMenuDraftSettings((prev) => ({ ...prev, level: Number(value) }))}
+                  data={allowedLevels.map((lvl) => ({ value: String(lvl), label: String(lvl) }))}
                 />
               </Stack>
-              {settings.mode === "contest" && (
-                <Stack gap="xs">
-                  <Text fw={600}>Contest type</Text>
-                  <SegmentedControl
-                    value={settings.contestType}
-                    onChange={(value) => setSettings({ ...settings, contestType: value as ContestType })}
-                    data={[
-                      { value: "time", label: "Time" },
-                      { value: "tasks", label: "Tasks" }
-                    ]}
-                  />
-                </Stack>
-              )}
-              {settings.mode === "contest" && settings.contestType === "time" && (
-                <Stack gap="xs">
-                  <Text fw={600}>Duration</Text>
-                  <SegmentedControl
-                    value={String(settings.duration)}
-                    onChange={(value) => setSettings({ ...settings, duration: Number(value) as 30 | 60 | 120 })}
-                    data={[
-                      { value: "30", label: "30s" },
-                      { value: "60", label: "60s" },
-                      { value: "120", label: "120s" }
-                    ]}
-                  />
-                </Stack>
-              )}
-              {settings.mode === "contest" && settings.contestType === "tasks" && (
-                <Stack gap="xs">
-                  <Text fw={600}>Tasks</Text>
-                  <SegmentedControl
-                    value={String(settings.taskTarget)}
-                    onChange={(value) => setSettings({ ...settings, taskTarget: Number(value) as 10 | 20 | 50 })}
-                    data={[
-                      { value: "10", label: "10" },
-                      { value: "20", label: "20" },
-                      { value: "50", label: "50" }
-                    ]}
-                  />
-                </Stack>
-              )}
               <Stack gap="xs">
                 <Text fw={600}>Content</Text>
                 <SegmentedControl
-                  value={settings.contentMode}
-                  onChange={(value) => setSettings({ ...settings, contentMode: value as ContentMode })}
+                  value={menuDraftSettings.contentMode}
+                  onChange={(value) => setMenuDraftSettings((prev) => ({ ...prev, contentMode: value as ContentMode }))}
                   data={[
                     { value: "default", label: "Default" },
                     { value: "vocab", label: "Vocab Pack" }
@@ -2645,18 +2865,30 @@ function App() {
                 <Text fw={600}>Language</Text>
                 <Select
                   data={availableLanguages.map((lang) => ({ value: lang, label: lang.toUpperCase() }))}
-                  value={settings.language}
-                  onChange={(value) => setSettings({ ...settings, language: value || "en" })}
+                  value={menuDraftSettings.language}
+                  onChange={(value) => setMenuDraftSettings((prev) => ({ ...prev, language: value || "en" }))}
                 />
               </Stack>
-              <Card withBorder radius="md" p="sm">
-                <Text fw={600}>Live Activity</Text>
-                <Text size="sm">Users playing now: {liveStats.total}</Text>
-                <Text size="xs" c="dimmed">Authorized: {liveStats.authorized} • Guests: {liveStats.guests}</Text>
-              </Card>
-              <Button size="lg" onClick={startGame}>Start</Button>
+              <Group justify="space-between">
+                <Button variant="subtle" onClick={resetMenuDraftToDefaults}>Reset to default</Button>
+                <Button variant="light" onClick={() => void saveMenuDefaults()}>Save as my default</Button>
+              </Group>
+              <Group justify="space-between">
+                <Button variant="default" onClick={() => {
+                  if (hasUnsavedMenuChanges) {
+                    const shouldClose = window.confirm("Discard unapplied menu changes?");
+                    if (!shouldClose) return;
+                    setMenuDraftSettings(settings);
+                  }
+                  setMenuDrawerOpen(false);
+                }}>Close</Button>
+                <Button onClick={() => { applyMenuDraftToSettings(); setMenuDrawerOpen(false); }}>
+                  Apply Changes
+                </Button>
+              </Group>
             </Stack>
-          </Card>
+          </Drawer>
+
           <Group>
             <Button variant="light" onClick={() => setScreen("leaderboard")}>Leaderboard</Button>
             <Button variant="light" onClick={() => setScreen("settings")}>Settings / Admin</Button>

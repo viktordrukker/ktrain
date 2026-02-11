@@ -113,6 +113,54 @@ class SqliteAdapter {
     return this.db.prepare(`SELECT * FROM leaderboard ${where} ORDER BY score DESC, accuracy DESC LIMIT 20`).all(...params);
   }
 
+  async getGamePreferences(userId) {
+    return this.db.prepare("SELECT * FROM game_preferences WHERE userId = ? LIMIT 1").get(userId) || null;
+  }
+
+  async upsertGamePreferences({ userId, mode, level, contentType, language, updatedAt }) {
+    this.db.prepare(`
+      INSERT INTO game_preferences (userId, mode, level, contentType, language, updatedAt)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(userId) DO UPDATE SET
+        mode = excluded.mode,
+        level = excluded.level,
+        contentType = excluded.contentType,
+        language = excluded.language,
+        updatedAt = excluded.updatedAt
+    `).run(userId, mode, level, contentType, language, updatedAt);
+  }
+
+  async getPlayerStats(userId) {
+    return this.db.prepare("SELECT * FROM player_stats WHERE userId = ? LIMIT 1").get(userId) || null;
+  }
+
+  async upsertPlayerStats({
+    userId,
+    totalLettersTyped,
+    totalCorrect,
+    totalIncorrect,
+    bestWPM,
+    sessionsCount,
+    totalPlayTimeMs,
+    streakDays,
+    lastSessionAt
+  }) {
+    this.db.prepare(`
+      INSERT INTO player_stats
+      (userId, totalLettersTyped, totalCorrect, totalIncorrect, bestWPM, sessionsCount, totalPlayTimeMs, streakDays, lastSessionAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(userId) DO UPDATE SET
+        totalLettersTyped = excluded.totalLettersTyped,
+        totalCorrect = excluded.totalCorrect,
+        totalIncorrect = excluded.totalIncorrect,
+        bestWPM = excluded.bestWPM,
+        sessionsCount = excluded.sessionsCount,
+        totalPlayTimeMs = excluded.totalPlayTimeMs,
+        streakDays = excluded.streakDays,
+        lastSessionAt = excluded.lastSessionAt
+    `).run(userId, totalLettersTyped, totalCorrect, totalIncorrect, bestWPM, sessionsCount, totalPlayTimeMs, streakDays, lastSessionAt || null);
+  }
+
   async listPacks() {
     return this.db.prepare("SELECT * FROM vocab_packs ORDER BY createdAt DESC").all();
   }

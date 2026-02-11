@@ -306,6 +306,34 @@ function clampNumber(value, min, max, fallback = 0) {
   return Math.min(Math.max(num, min), max);
 }
 
+function defaultGamePreferences(userId = null) {
+  return {
+    userId,
+    mode: "learning",
+    level: 1,
+    contentType: "default",
+    language: "en",
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function normalizeDateKey(value) {
+  if (!value) return null;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function dayDiffUtc(aKey, bKey) {
+  if (!aKey || !bKey) return 0;
+  const a = new Date(`${aKey}T00:00:00.000Z`).getTime();
+  const b = new Date(`${bKey}T00:00:00.000Z`).getTime();
+  return Math.round((a - b) / 86400000);
+}
+
 function setSessionCookie(res, token, expiresAt) {
   const expiresDate = new Date(expiresAt || Date.now() + SESSION_TTL_MS);
   const parts = [
@@ -1074,6 +1102,152 @@ app.get("/api/user/history", requirePermission(Permissions.SESSION_READ), withAs
   const entries = await repo.queryLeaderboard({ onlyAuthorized: true });
   const own = entries.filter((row) => Number(row.userid || row.userId) === Number(req.actor.id));
   res.json({ ok: true, entries: own });
+}));
+
+app.get("/api/user/preferences", requirePermission(Permissions.SESSION_READ), withAsync(async (req, res) => {
+  if (!req.actor?.isAuthenticated) {
+    return res.json({ ok: true, preferences: defaultGamePreferences(null), source: "guest_default" });
+  }
+  const existing = await repo.getGamePreferences(req.actor.id);
+  const normalized = existing
+    ? {
+        userId: Number(existing.userid || existing.userId || req.actor.id),
+        mode: existing.mode === "contest" ? "contest" : "learning",
+        level: clampNumber(existing.level, 1, 5, 1),
+        contentType: existing.contenttype || existing.contentType || "default",
+        language: String(existing.language || "en").toLowerCase(),
+        updatedAt: existing.updatedat || existing.updatedAt || new Date().toISOString()
+      }
+    : defaultGamePreferences(req.actor.id);
+  res.json({ ok: true, preferences: normalized, source: existing ? "db" : "default" });
+}));
+
+app.put("/api/user/preferences", requirePermission(Permissions.SESSION_READ), withAsync(async (req, res) => {
+  if (!req.actor?.isAuthenticated) throw new AppError("Authentication required", { status: 401, code: "UNAUTHORIZED", expose: true });
+  const body = requireObject(req.body || {}, "preferences");
+  const mode = body.mode === "contest" ? "contest" : "learning";
+  const level = clampNumber(body.level, 1, 5, 1);
+  const contentType = body.contentType === "vocab" ? "vocab" : "default";
+  const language = String(body.language || "en").toLowerCase();
+  const updatedAt = new Date().toISOString();
+  await repo.upsertGamePreferences({
+    userId: req.actor.id,
+    mode,
+    level,
+    contentType,
+    language,
+    updatedAt
+  });
+  await audit(req, "user.preferences.update", "user", String(req.actor.id), { mode, level, contentType, language });
+  res.json({
+    ok: true,
+    preferences: {
+      userId: req.actor.id,
+      mode,
+      level,
+      contentType,
+      language,
+      updatedAt
+    }
+  });
+}));
+
+app.get("/api/user/stats", requirePermission(Permissions.SESSION_READ), withAsync(async (req, res) => {
+  if (!req.actor?.isAuthenticated) {
+    return res.json({ ok: true, stats: null, source: "guest" });
+  }
+  const row = await repo.getPlayerStats(req.actor.id);
+  const stats = row
+    ? {
+        userId: Number(row.userid || row.userId || req.actor.id),
+        totalLettersTyped: Number(row.totalletterstyped || row.totalLettersTyped || 0),
+        totalCorrect: Number(row.totalcorrect || row.totalCorrect || 0),
+        totalIncorrect: Number(row.totalincorrect || row.totalIncorrect || 0),
+        bestWPM: Number(row.bestwpm || row.bestWPM || 0),
+        sessionsCount: Number(row.sessionscount || row.sessionsCount || 0),
+        totalPlayTimeMs: Number(row.totalplaytimems || row.totalPlayTimeMs || 0),
+        streakDays: Number(row.streakdays || row.streakDays || 0),
+        lastSessionAt: row.lastsessionat || row.lastSessionAt || null
+      }
+    : {
+        userId: req.actor.id,
+        totalLettersTyped: 0,
+        totalCorrect: 0,
+        totalIncorrect: 0,
+        bestWPM: 0,
+        sessionsCount: 0,
+        totalPlayTimeMs: 0,
+        streakDays: 0,
+        lastSessionAt: null
+      };
+  res.json({ ok: true, stats, source: row ? "db" : "default" });
+}));
+
+app.post("/api/user/stats/session-end", requirePermission(Permissions.SESSION_READ), withAsync(async (req, res) => {
+  if (!req.actor?.isAuthenticated) return res.json({ ok: true, saved: false, reason: "guest" });
+  const body = requireObject(req.body || {}, "sessionStats");
+  const lettersTyped = clampNumber(body.lettersTyped, 0, 5_000_000, 0);
+  const correct = clampNumber(body.correct, 0, 5_000_000, 0);
+  const incorrect = clampNumber(body.incorrect, 0, 5_000_000, 0);
+  const bestWPMSession = clampNumber(body.bestWPM, 0, 100_000, 0);
+  const playTimeMs = clampNumber(body.totalPlayTimeMs, 0, 86_400_000, 0);
+  const sessionEndedAt = new Date(body.lastSessionAt || Date.now()).toISOString();
+
+  const existing = await repo.getPlayerStats(req.actor.id);
+  const prior = existing
+    ? {
+        totalLettersTyped: Number(existing.totalletterstyped || existing.totalLettersTyped || 0),
+        totalCorrect: Number(existing.totalcorrect || existing.totalCorrect || 0),
+        totalIncorrect: Number(existing.totalincorrect || existing.totalIncorrect || 0),
+        bestWPM: Number(existing.bestwpm || existing.bestWPM || 0),
+        sessionsCount: Number(existing.sessionscount || existing.sessionsCount || 0),
+        totalPlayTimeMs: Number(existing.totalplaytimems || existing.totalPlayTimeMs || 0),
+        streakDays: Number(existing.streakdays || existing.streakDays || 0),
+        lastSessionAt: existing.lastsessionat || existing.lastSessionAt || null
+      }
+    : {
+        totalLettersTyped: 0,
+        totalCorrect: 0,
+        totalIncorrect: 0,
+        bestWPM: 0,
+        sessionsCount: 0,
+        totalPlayTimeMs: 0,
+        streakDays: 0,
+        lastSessionAt: null
+      };
+
+  const currentDay = normalizeDateKey(sessionEndedAt);
+  const previousDay = normalizeDateKey(prior.lastSessionAt);
+  let streakDays = prior.streakDays || 0;
+  if (!previousDay) {
+    streakDays = 1;
+  } else {
+    const diff = dayDiffUtc(currentDay, previousDay);
+    if (diff <= 0) streakDays = Math.max(1, streakDays || 1);
+    else if (diff === 1) streakDays += 1;
+    else streakDays = 1;
+  }
+
+  const next = {
+    userId: req.actor.id,
+    totalLettersTyped: prior.totalLettersTyped + lettersTyped,
+    totalCorrect: prior.totalCorrect + correct,
+    totalIncorrect: prior.totalIncorrect + incorrect,
+    bestWPM: Math.max(prior.bestWPM, bestWPMSession),
+    sessionsCount: prior.sessionsCount + 1,
+    totalPlayTimeMs: prior.totalPlayTimeMs + playTimeMs,
+    streakDays,
+    lastSessionAt: sessionEndedAt
+  };
+  await repo.upsertPlayerStats(next);
+  await audit(req, "user.stats.session_end", "user", String(req.actor.id), {
+    lettersTyped,
+    correct,
+    incorrect,
+    bestWPMSession,
+    playTimeMs
+  });
+  res.json({ ok: true, saved: true, stats: next });
 }));
 
 app.post("/api/tasks/generate", requirePermission(Permissions.TASKS_GENERATE), requireNotMaintenance, generationLimiter, withAsync(async (req, res) => {
