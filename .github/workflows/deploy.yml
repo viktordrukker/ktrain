@@ -51,6 +51,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      image_digest: ${{ steps.build_and_push.outputs.digest }}
+      image_ref: ghcr.io/${{ github.repository }}@${{ steps.build_and_push.outputs.digest }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -75,6 +78,7 @@ jobs:
             type=sha
 
       - name: Build and push
+        id: build_and_push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -85,9 +89,20 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     needs: build
+    concurrency:
+      group: ktrain-production-deploy
+      cancel-in-progress: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Compute deploy script fingerprint
+        id: script_fingerprint
+        run: |
+          set -euo pipefail
+          SCRIPT_SHA="$(sha256sum ./scripts/deploy_remote.sh | awk '{print $1}')"
+          echo "sha=$SCRIPT_SHA" >> "$GITHUB_OUTPUT"
+          echo "Local deploy script sha: $SCRIPT_SHA"
 
       - name: Upload release to Hetzner
         uses: appleboy/scp-action@v0.1.7
@@ -192,14 +207,22 @@ jobs:
               echo "scripts directory is missing after bootstrap"
               exit 1
             fi
+            EXPECTED_SCRIPT_SHA="${{ steps.script_fingerprint.outputs.sha }}"
             echo "Deploy script fingerprint:"
-            sha256sum ./scripts/deploy_remote.sh || true
+            ACTUAL_SCRIPT_SHA="$(sha256sum ./scripts/deploy_remote.sh | awk '{print $1}')"
+            echo "$ACTUAL_SCRIPT_SHA  ./scripts/deploy_remote.sh"
+            if [ "$ACTUAL_SCRIPT_SHA" != "$EXPECTED_SCRIPT_SHA" ]; then
+              echo "deploy_remote.sh checksum mismatch (expected=$EXPECTED_SCRIPT_SHA actual=$ACTUAL_SCRIPT_SHA)"
+              exit 1
+            fi
             echo "Deploy readiness settings present in script:"
             grep -nE 'READINESS_PATH|READINESS_TIMEOUT_SEC|READINESS_POLL_SEC' ./scripts/deploy_remote.sh || true
-            export IMAGE="ghcr.io/${{ github.repository }}:${{ github.event.inputs.image_tag || 'latest' }}"
+            echo "Deploying commit ${{ github.sha }}"
+            echo "Deploying image digest ${{ needs.build.outputs.image_digest }}"
+            export IMAGE="${{ needs.build.outputs.image_ref }}"
             export APP_BUILD="${{ github.run_number }}"
             export APP_COMMIT="${{ github.sha }}"
-            export APP_VERSION="${{ github.event.inputs.image_tag || 'latest' }}"
+            export APP_VERSION="${{ github.sha }}"
             APP_DIR="$DEPLOY_PATH" \
             IMAGE="$IMAGE" \
             APP_BUILD="$APP_BUILD" \
