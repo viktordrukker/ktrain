@@ -133,27 +133,24 @@ jobs:
             ls -la
             find . -maxdepth 2 -type f -name "*env*" || true
 
-            if [ ! -f docker-compose.yml ]; then
-              echo "No deployment artifacts found in $DEPLOY_PATH. Bootstrapping from git..."
-              if ! command -v git >/dev/null 2>&1; then
-                sudo apt-get update
-                sudo apt-get install -y git
-              fi
-              if [ -d .git ]; then
-                git fetch --depth 1 origin main
-                git reset --hard FETCH_HEAD
-              else
-                git init
-                if git remote get-url origin >/dev/null 2>&1; then
-                  git remote set-url origin "https://github.com/${{ github.repository }}.git"
-                else
-                  git remote add origin "https://github.com/${{ github.repository }}.git"
-                fi
-                git fetch --depth 1 origin main
-                git checkout -B main FETCH_HEAD
-              fi
-              ls -la
+            if ! command -v git >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y git
             fi
+
+            if [ ! -d .git ]; then
+              git init
+            fi
+            if git remote get-url origin >/dev/null 2>&1; then
+              git remote set-url origin "https://github.com/${{ github.repository }}.git"
+            else
+              git remote add origin "https://github.com/${{ github.repository }}.git"
+            fi
+            echo "Syncing deployment tree to commit ${{ github.sha }}"
+            git fetch --depth 1 origin "${{ github.sha }}"
+            git checkout -B deploy FETCH_HEAD
+            git reset --hard "${{ github.sha }}"
+            ls -la
 
             if [ ! -f .env ]; then
               if [ -f .env.example ]; then
