@@ -148,6 +148,13 @@ app.use(requestContextMiddleware());
 app.use(withAsync(resolveRequestActor));
 app.use(withAsync(enforceSetupMode));
 
+/**
+ * Resolves the actor (user identity and role) for the current request.
+ * @param {object} req - Express request object
+ * @param {object} res - Express response object
+ * @param {Function} next - Express next middleware function
+ * @returns {Promise<void>}
+ */
 async function resolveRequestActor(req, res, next) {
   req.actor = await resolveActor({
     req,
@@ -164,6 +171,15 @@ async function resolveRequestActor(req, res, next) {
   return next();
 }
 
+/**
+ * Records an audit log entry for the current request.
+ * @param {object} req - Express request object with actor and requestId
+ * @param {string} action - The action being audited (e.g., "user.login", "settings.update")
+ * @param {string} targetType - The type of resource being acted upon
+ * @param {string|number|null} targetId - The ID of the resource being acted upon
+ * @param {object|null} [metadata=null] - Additional metadata to include in the audit log
+ * @returns {Promise<void>}
+ */
 async function audit(req, action, targetType, targetId, metadata = null) {
   if (!repo?.insertAuditLog) return;
   await repo.insertAuditLog({
@@ -184,6 +200,12 @@ function requireNotMaintenance(req, res, next) {
   return res.status(503).json({ error: "Maintenance mode active. Try again shortly." });
 }
 
+/**
+ * Computes and caches the current config status, determining if setup is required.
+ * @param {object} [options] - Options object
+ * @param {boolean} [options.force=false] - If true, bypass cache and recompute
+ * @returns {Promise<object|null>} Config status snapshot or null if dependencies unavailable
+ */
 async function refreshConfigStatus({ force = false } = {}) {
   if (!repo || !configStore || !smtpService) return null;
   const now = Date.now();
@@ -223,6 +245,13 @@ function isSetupPathAllowed(req) {
   return false;
 }
 
+/**
+ * Middleware that enforces setup mode by blocking non-setup routes when setup is required.
+ * @param {object} req - Express request object
+ * @param {object} res - Express response object
+ * @param {Function} next - Express next middleware function
+ * @returns {Promise<void>}
+ */
 async function enforceSetupMode(req, res, next) {
   if (!repo || !configStore || !smtpService) return next();
   const status = await refreshConfigStatus();
@@ -240,6 +269,11 @@ async function enforceSetupMode(req, res, next) {
   return res.redirect("/setup");
 }
 
+/**
+ * Returns a random element from the provided array.
+ * @param {Array<any>} list - Array to select from
+ * @returns {any} Randomly selected element
+ */
 function chooseRandom(list) {
   return list[Math.floor(Math.random() * list.length)];
 }

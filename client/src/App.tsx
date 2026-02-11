@@ -941,8 +941,12 @@ function useSoundBank(volume: number, muted: boolean) {
       cacheRef.current[src] = audio;
     }
     audio.currentTime = 0;
-    audio.volume = Math.min(Math.max(volume, 0), 1);
-    void audio.play();
+    // Safety: Cap max volume at 0.75 to protect toddler hearing
+    audio.volume = Math.min(Math.max(volume, 0), 0.75);
+    // Gracefully handle autoplay policy failures (browser may block audio without user gesture)
+    audio.play().catch(() => {
+      // Silent fail - toddler game continues without sound rather than crashing
+    });
   }, [muted, volume]);
 
   return { play };
