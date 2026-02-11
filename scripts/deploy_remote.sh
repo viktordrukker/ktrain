@@ -3,6 +3,9 @@ set -euo pipefail
 
 APP_DIR="${APP_DIR:-/opt/ktrain}"
 IMAGE="${IMAGE:-ghcr.io/viktordrukker/ktrain:latest}"
+READINESS_PATH="${READINESS_PATH:-/healthz}"
+READINESS_TIMEOUT_SEC="${READINESS_TIMEOUT_SEC:-120}"
+READINESS_POLL_SEC="${READINESS_POLL_SEC:-2}"
 
 cd "$APP_DIR"
 
@@ -40,18 +43,34 @@ echo "Running DB migration for active backend"
 docker compose exec -T ktrain sh -lc 'cd /app/server && npm run migrate'
 
 echo "Waiting for readiness"
-for i in {1..20}; do
+if ! [[ "$READINESS_TIMEOUT_SEC" =~ ^[0-9]+$ ]] || ! [[ "$READINESS_POLL_SEC" =~ ^[0-9]+$ ]] || [ "$READINESS_POLL_SEC" -le 0 ]; then
+  echo "Invalid readiness settings: READINESS_TIMEOUT_SEC=$READINESS_TIMEOUT_SEC READINESS_POLL_SEC=$READINESS_POLL_SEC"
+  exit 1
+fi
+
+ATTEMPTS=$((READINESS_TIMEOUT_SEC / READINESS_POLL_SEC))
+if [ "$ATTEMPTS" -lt 1 ]; then
+  ATTEMPTS=1
+fi
+
+for i in $(seq 1 "$ATTEMPTS"); do
   if ! docker ps --format '{{.Names}}' | grep -qx 'ktrain'; then
     echo "Container exited before readiness check completed."
     docker logs --tail 200 ktrain || true
     exit 1
   fi
-  if docker compose exec -T ktrain sh -lc 'wget -qO- http://127.0.0.1:3000/readyz >/dev/null' >/dev/null 2>&1; then
+  if docker compose exec -T ktrain sh -lc "wget -qO- http://127.0.0.1:3000${READINESS_PATH} >/dev/null" >/dev/null 2>&1; then
     echo "Ready"; exit 0
   fi
-  sleep 2
+  HEALTH_STATUS="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' ktrain 2>/dev/null || echo unknown)"
+  if [ "$HEALTH_STATUS" = "unhealthy" ]; then
+    echo "Container healthcheck reports unhealthy while waiting for readiness."
+    docker logs --tail 200 ktrain || true
+    exit 1
+  fi
+  sleep "$READINESS_POLL_SEC"
 done
 
-echo "Service did not become ready in time"
+echo "Service did not become ready in time (path=$READINESS_PATH timeout=${READINESS_TIMEOUT_SEC}s)"
 docker logs --tail 200 ktrain || true
 exit 1
