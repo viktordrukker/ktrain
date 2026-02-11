@@ -1,3 +1,9 @@
+# WARNING: Default values below are for LOCAL DEVELOPMENT ONLY.
+# For production deployments, ALWAYS override these via .env file:
+#   - KTRAIN_MASTER_KEY (generate with: openssl rand -base64 32)
+#   - POSTGRES_PASSWORD (use strong random password)
+#   - KTRAIN_BOOTSTRAP_DB (use production database URL)
+#   - OWNER_EMAIL and CRASH_ALERT_EMAILS
 services:
   ktrain:
     build: .

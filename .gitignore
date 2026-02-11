@@ -1,6 +1,69 @@
+# Dependencies
 node_modules
+client/node_modules
+server/node_modules
+
+# Build outputs
 client/dist
+dist
+build
+
+# Environment variables
 .env
+.env.local
+.env.*.local
+
+# OS files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# Editor/IDE
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Testing
+coverage
+.nyc_output
+*.lcov
+
+# Temporary files
+*.tmp
+*.temp
+.cache
+
+# Application data
 backups/
 /data/
+crash-reports/
+
+# Package manager
+.npm
+.yarn
+.pnpm-debug.log
