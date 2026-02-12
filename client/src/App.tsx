@@ -273,6 +273,7 @@ type VocabularyPackRow = {
   version: number;
   generator_config?: any;
   metadata?: any;
+  entry_count?: number;
   created_at?: string;
   updated_at?: string;
 };
@@ -1040,6 +1041,15 @@ const API = {
     if (!res.ok) throw await parseApiError(res, "Failed to import vocabulary pack");
     return res.json();
   },
+  async batchVocabularyPacks(action: "publish" | "unpublish" | "delete" | "export" | "regenerate", payload: { ids: string[]; count?: number; theme?: string }) {
+    const res = await fetch("/api/admin/vocabulary/packs/batch", {
+      method: "POST",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ action, ...payload })
+    });
+    if (!res.ok) throw await parseApiError(res, "Failed to run batch action");
+    return res.json();
+  },
   async sendTestEmail(to: string) {
     const res = await fetch("/api/admin/service-settings/email/test", {
       method: "POST",
@@ -1587,7 +1597,7 @@ function App() {
       setScreen("about");
       return;
     }
-    if (window.location.pathname === "/admin/vocabulary") {
+    if (window.location.pathname === "/admin/vocabulary" || window.location.pathname === "/admin/vocabulary/new") {
       setScreen("vocabulary");
     }
   }, []);
@@ -1596,10 +1606,10 @@ function App() {
     if (screen !== "about" && screen !== "vocabulary" && window.location.pathname === "/about") {
       window.history.replaceState({}, "", "/");
     }
-    if (screen === "vocabulary" && window.location.pathname !== "/admin/vocabulary") {
+    if (screen === "vocabulary" && !window.location.pathname.startsWith("/admin/vocabulary")) {
       window.history.replaceState({}, "", "/admin/vocabulary");
     }
-    if (screen !== "vocabulary" && window.location.pathname === "/admin/vocabulary") {
+    if (screen !== "vocabulary" && window.location.pathname.startsWith("/admin/vocabulary")) {
       window.history.replaceState({}, "", "/");
     }
   }, [screen]);
@@ -2731,37 +2741,47 @@ function App() {
       </Modal>
       <Modal opened={errorLogOpen} onClose={() => setErrorLogOpen(false)} title="Error Diagnostics" size="xl" centered>
         <Stack gap="sm">
-          <Text size="sm">
-            Share this payload when reporting issues. It includes request IDs for backend correlation.
-          </Text>
-          <Textarea
-            minRows={12}
-            autosize
-            readOnly
-            value={JSON.stringify(clientErrors, null, 2)}
-          />
+          {clientErrors.length === 0 && <Text size="sm" c="dimmed">No client-side errors captured.</Text>}
+          {clientErrors.map((err, idx) => (
+            <Card key={`${err.at}-${idx}`} withBorder>
+              <Group justify="space-between">
+                <Text size="sm" fw={700}>{new Date(err.at).toLocaleString()}</Text>
+                <Button
+                  size="xs"
+                  variant="light"
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(JSON.stringify(err, null, 2));
+                      setStatusMessage("Error item copied.");
+                    } catch {
+                      setStatusMessage("Failed to copy error item.");
+                    }
+                  }}
+                >
+                  Copy JSON
+                </Button>
+              </Group>
+              <Text size="sm"><strong>Area:</strong> {err.action}</Text>
+              <Text size="sm"><strong>Message:</strong> {err.message}</Text>
+              <Text size="sm"><strong>Request ID:</strong> {err.requestId || "n/a"}</Text>
+              {err.url && <Text size="xs" c="dimmed">{err.url}</Text>}
+            </Card>
+          ))}
           <Group justify="space-between">
             <Button
               variant="light"
               onClick={async () => {
                 try {
                   await navigator.clipboard.writeText(JSON.stringify(clientErrors, null, 2));
-                  setStatusMessage("Error diagnostics copied.");
+                  setStatusMessage("All diagnostics copied.");
                 } catch {
                   setStatusMessage("Failed to copy diagnostics.");
                 }
               }}
             >
-              Copy diagnostics
+              Copy all
             </Button>
-            <Button
-              color="red"
-              variant="light"
-              onClick={() => {
-                setClientErrors([]);
-                setStatusMessage("Error diagnostics cleared.");
-              }}
-            >
+            <Button color="red" variant="light" onClick={() => setClientErrors([])}>
               Clear
             </Button>
           </Group>
@@ -3581,11 +3601,28 @@ function VocabularyCenterScreen({
   onStatus: (msg: string) => void;
 }) {
   const query = useMemo(() => new URLSearchParams(window.location.search), []);
+  const initialPaneState = useMemo(() => {
+    try {
+      const raw = window.localStorage.getItem("vocab.center.panes.v1");
+      const parsed = raw ? JSON.parse(raw) : {};
+      return {
+        left: Math.max(18, Math.min(30, Number(parsed.left) || 22)),
+        right: Math.max(24, Math.min(45, Number(parsed.right) || 33))
+      };
+    } catch {
+      return { left: 22, right: 33 };
+    }
+  }, []);
+  const [leftPanePercent, setLeftPanePercent] = useState(initialPaneState.left);
+  const [rightPanePercent, setRightPanePercent] = useState(initialPaneState.right);
+  const [isMobile, setIsMobile] = useState(window.innerWidth <= 1024);
+  const [mobileTab, setMobileTab] = useState<"tree" | "table" | "inspector">("table");
   const [tree, setTree] = useState<any>({});
   const [treeSearch, setTreeSearch] = useState("");
   const [collapsedLangs, setCollapsedLangs] = useState<Record<string, boolean>>({});
   const [rows, setRows] = useState<VocabularyPackRow[]>([]);
   const [total, setTotal] = useState(0);
+  const [selectedIds, setSelectedIds] = useState<Record<string, boolean>>({});
   const [page, setPage] = useState(Math.max(1, Number(query.get("page") || 1)));
   const [pageSize, setPageSize] = useState(Math.max(5, Math.min(100, Number(query.get("pageSize") || 20))));
   const [sortBy, setSortBy] = useState(query.get("sort") || "updated_at");
@@ -3598,15 +3635,26 @@ function VocabularyCenterScreen({
     source: query.get("source") || "",
     search: query.get("search") || ""
   });
-  const [loading, setLoading] = useState(false);
+  const [debouncedSearch, setDebouncedSearch] = useState(filters.search);
+  const [loadingInitial, setLoadingInitial] = useState(true);
+  const [tableBusy, setTableBusy] = useState(false);
   const [selectedId, setSelectedId] = useState<string>("");
   const [pack, setPack] = useState<VocabularyPackRow | null>(null);
   const [entries, setEntries] = useState<VocabularyEntryRow[]>([]);
+  const [entriesText, setEntriesText] = useState("");
   const [versions, setVersions] = useState<any[]>([]);
   const [selectedVersion, setSelectedVersion] = useState("");
   const [generatorEnabled, setGeneratorEnabled] = useState(false);
-  const [showCreateWizard, setShowCreateWizard] = useState(false);
   const [createStep, setCreateStep] = useState(1);
+  const [showCreateWizard, setShowCreateWizard] = useState(window.location.pathname === "/admin/vocabulary/new");
+  const [showImportPanel, setShowImportPanel] = useState(false);
+  const [inspectorTab, setInspectorTab] = useState<"details" | "entries" | "history" | "diagnostics">("details");
+  const [inspectorMaximized, setInspectorMaximized] = useState(false);
+  const [importJson, setImportJson] = useState("");
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [saveBusy, setSaveBusy] = useState(false);
+  const [generateBusy, setGenerateBusy] = useState(false);
+  const [lastGenerationError, setLastGenerationError] = useState<any>(null);
   const [createDraft, setCreateDraft] = useState<any>({
     language: "en",
     level: 1,
@@ -3616,61 +3664,93 @@ function VocabularyCenterScreen({
     prompt_template: "",
     advanced_on: false,
     theme: "",
-    temperature: 0.7,
-    max_tokens: 500,
+    temperature: 0.5,
+    max_tokens: 1200,
     random_seed: ""
   });
-  const [isMobile, setIsMobile] = useState(window.innerWidth <= 720);
-  const [showMobileInspector, setShowMobileInspector] = useState(false);
-  const [importJson, setImportJson] = useState("");
-
-  useEffect(() => {
-    const onResize = () => setIsMobile(window.innerWidth <= 720);
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, []);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const originalSnapshotRef = useRef<{ pack: VocabularyPackRow; entriesText: string } | null>(null);
 
   const persistQuery = useCallback((next: any) => {
     const params = new URLSearchParams();
     Object.entries(next).forEach(([k, v]) => {
       if (v !== "" && v !== null && v !== undefined) params.set(k, String(v));
     });
-    window.history.replaceState({}, "", `/admin/vocabulary?${params.toString()}`);
+    const basePath = showCreateWizard ? "/admin/vocabulary/new" : "/admin/vocabulary";
+    window.history.replaceState({}, "", params.toString() ? `${basePath}?${params.toString()}` : basePath);
+  }, [showCreateWizard]);
+
+  const persistPaneSizes = useCallback((left: number, right: number) => {
+    try {
+      window.localStorage.setItem("vocab.center.panes.v1", JSON.stringify({ left, right }));
+    } catch {
+      // ignore storage failures
+    }
   }, []);
 
-  const loadTree = useCallback(async () => {
+  useEffect(() => {
+    const onResize = () => {
+      setIsMobile(window.innerWidth <= 1024);
+      if (window.innerWidth > 1024) setMobileTab("table");
+    };
+    const onPopState = () => {
+      setShowCreateWizard(window.location.pathname === "/admin/vocabulary/new");
+    };
+    window.addEventListener("resize", onResize);
+    window.addEventListener("popstate", onPopState);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("popstate", onPopState);
+    };
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedSearch(filters.search), 250);
+    return () => window.clearTimeout(timer);
+  }, [filters.search]);
+
+  const loadTree = useCallback(async (signalKey: string) => {
     const data = await API.getVocabularyTree({ language: filters.language, status: filters.status });
+    if (signalKey !== `${filters.language}-${filters.status}`) return;
     setTree(data.tree || {});
   }, [filters.language, filters.status]);
 
-  const loadRows = useCallback(async () => {
-    setLoading(true);
+  const loadRows = useCallback(async (initial = false) => {
+    if (initial) setLoadingInitial(true);
+    else setTableBusy(true);
     try {
       const data = await API.listVocabularyPacks({
         ...filters,
+        search: debouncedSearch,
         page,
         pageSize,
         sort: sortBy,
         order: sortDir
       });
-      setRows(data.rows || []);
+      setRows(Array.isArray(data.rows) ? data.rows : []);
       setTotal(Number(data.total || 0));
     } catch (err: any) {
       onStatus(err?.message || "Failed to load vocabulary packs.");
     } finally {
-      setLoading(false);
+      setLoadingInitial(false);
+      setTableBusy(false);
     }
-  }, [filters, page, pageSize, sortBy, sortDir, onStatus]);
+  }, [filters, debouncedSearch, page, pageSize, sortBy, sortDir, onStatus]);
 
-  const loadPackDetail = useCallback(async (id: string) => {
+  const loadPackDetail = useCallback(async (id: string, openInspector = true) => {
     if (!id) return;
     const data = await API.getVocabularyPack(id);
-    setPack(data.pack || null);
-    setEntries(data.entries || []);
+    const nextPack = data.pack || null;
+    const nextEntries = Array.isArray(data.entries) ? data.entries : [];
+    const nextText = nextEntries.map((entry: VocabularyEntryRow) => String(entry.text || "").trim()).filter(Boolean).join("\n");
+    setPack(nextPack);
+    setEntries(nextEntries);
+    setEntriesText(nextText);
     setVersions(data.versions || []);
     setSelectedVersion(data.versions?.[0] ? String(data.versions[0].version) : "");
     setSelectedId(id);
-    if (isMobile) setShowMobileInspector(true);
+    originalSnapshotRef.current = nextPack ? { pack: nextPack, entriesText: nextText } : null;
+    if (openInspector && isMobile) setMobileTab("inspector");
   }, [isMobile]);
 
   useEffect(() => {
@@ -3682,18 +3762,24 @@ function VocabularyCenterScreen({
 
   useEffect(() => {
     if (!isAdmin) return;
-    void loadTree();
-    void loadRows();
-    persistQuery({ ...filters, page, pageSize, sort: sortBy, order: sortDir });
-  }, [isAdmin, loadTree, loadRows, persistQuery, filters, page, pageSize, sortBy, sortDir]);
+    persistQuery({ ...filters, search: debouncedSearch, page, pageSize, sort: sortBy, order: sortDir });
+    void loadRows(rows.length === 0);
+  }, [isAdmin, filters.language, filters.level, filters.type, filters.status, filters.source, debouncedSearch, page, pageSize, sortBy, sortDir]);
 
+  useEffect(() => {
+    if (!isAdmin) return;
+    const key = `${filters.language}-${filters.status}`;
+    void loadTree(key);
+  }, [isAdmin, loadTree]);
+
+  const selectedCount = useMemo(() => Object.values(selectedIds).filter(Boolean).length, [selectedIds]);
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const filteredTree = useMemo(() => {
     if (!treeSearch.trim()) return tree;
     const q = treeSearch.toLowerCase();
     const out: any = {};
     Object.entries(tree || {}).forEach(([lang, levelsAny]) => {
-      const levels = levelsAny as any;
-      Object.entries(levels || {}).forEach(([levelKey, packsAny]) => {
+      Object.entries((levelsAny as any) || {}).forEach(([levelKey, packsAny]) => {
         const packs = (packsAny as any[]).filter((p) => String(p.name || "").toLowerCase().includes(q));
         if (packs.length > 0) {
           out[lang] = out[lang] || {};
@@ -3703,80 +3789,169 @@ function VocabularyCenterScreen({
     });
     return out;
   }, [tree, treeSearch]);
+  const parsedLines = useMemo(() => {
+    const raw = entriesText.split(/\n/).map((line) => line.trim());
+    const nonEmpty = raw.filter(Boolean);
+    const dedupe = new Set<string>();
+    let duplicateCount = 0;
+    const normalized = nonEmpty.filter((line) => {
+      const key = line.toLowerCase();
+      if (dedupe.has(key)) {
+        duplicateCount += 1;
+        return false;
+      }
+      dedupe.add(key);
+      return true;
+    });
+    return {
+      normalized,
+      emptyCount: raw.length - nonEmpty.length,
+      duplicateCount
+    };
+  }, [entriesText]);
+  const hasUnsavedInspectorChanges = useMemo(() => {
+    if (!pack || !originalSnapshotRef.current) return false;
+    const prev = originalSnapshotRef.current;
+    const currentPack = {
+      ...pack,
+      name: String(pack.name || "").trim(),
+      language: String(pack.language || "").toLowerCase()
+    };
+    const basePack = {
+      ...prev.pack,
+      name: String(prev.pack.name || "").trim(),
+      language: String(prev.pack.language || "").toLowerCase()
+    };
+    return JSON.stringify(currentPack) !== JSON.stringify(basePack) || entriesText.trim() !== prev.entriesText.trim();
+  }, [pack, entriesText]);
 
-  const savePack = async () => {
+  const startResize = useCallback((side: "left" | "right", startX: number) => {
+    if (!containerRef.current) return;
+    const bounds = containerRef.current.getBoundingClientRect();
+    const onMove = (event: MouseEvent) => {
+      const relX = event.clientX - bounds.left;
+      if (side === "left") {
+        const next = Math.max(18, Math.min(30, (relX / bounds.width) * 100));
+        setLeftPanePercent(next);
+      } else {
+        const rightWidth = Math.max(24, Math.min(45, ((bounds.right - event.clientX) / bounds.width) * 100));
+        setRightPanePercent(rightWidth);
+      }
+    };
+    const onUp = () => {
+      persistPaneSizes(leftPanePercent, rightPanePercent);
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    onMove({ clientX: startX } as MouseEvent);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, [leftPanePercent, rightPanePercent, persistPaneSizes]);
+
+  const refreshAll = useCallback(async () => {
+    await Promise.all([loadRows(false), loadTree(`${filters.language}-${filters.status}`)]);
+    if (selectedId) await loadPackDetail(selectedId, false);
+  }, [filters.language, filters.status, loadRows, loadTree, selectedId, loadPackDetail]);
+
+  const savePack = useCallback(async () => {
     if (!pack) return;
-    await API.updateVocabularyPack(pack.id, { ...pack, entries, change_note: "manual edit" });
-    await loadPackDetail(pack.id);
-    await loadRows();
-    await loadTree();
-    onStatus("Pack saved.");
-  };
+    setSaveBusy(true);
+    try {
+      const nextEntries = parsedLines.normalized.map((text, idx) => ({
+        id: entries[idx]?.id || `tmp-${idx}`,
+        text,
+        order_index: idx
+      }));
+      await API.updateVocabularyPack(pack.id, { ...pack, entries: nextEntries, change_note: "manual edit" });
+      await loadPackDetail(pack.id, false);
+      await loadRows(false);
+      await loadTree(`${filters.language}-${filters.status}`);
+      onStatus("Pack saved.");
+    } finally {
+      setSaveBusy(false);
+    }
+  }, [pack, parsedLines, entries, loadPackDetail, loadRows, loadTree, filters.language, filters.status, onStatus]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+      if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && hasUnsavedInspectorChanges) {
         event.preventDefault();
         void savePack();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [pack, entries]);
+  }, [hasUnsavedInspectorChanges, savePack]);
 
-  const publishToggle = async () => {
-    if (!pack) return;
-    if (pack.status === "published") await API.unpublishVocabularyPack(pack.id);
-    else await API.publishVocabularyPack(pack.id);
-    await loadPackDetail(pack.id);
-    await loadRows();
-    await loadTree();
+  const publishToggle = async (targetPack?: VocabularyPackRow) => {
+    const localPack = targetPack || pack;
+    if (!localPack) return;
+    if (localPack.status === "published") await API.unpublishVocabularyPack(localPack.id);
+    else await API.publishVocabularyPack(localPack.id);
+    await refreshAll();
   };
 
   const rollbackVersion = async () => {
     if (!pack || !selectedVersion) return;
     await API.rollbackVocabularyPack(pack.id, Number(selectedVersion));
-    await loadPackDetail(pack.id);
-    await loadRows();
-    await loadTree();
+    await refreshAll();
   };
 
-  const exportPack = async () => {
-    if (!pack) return;
-    const data = await API.exportVocabularyPack(pack.id);
+  const exportPack = async (targetId?: string) => {
+    const id = targetId || pack?.id;
+    if (!id) return;
+    const data = await API.exportVocabularyPack(id);
     const asText = JSON.stringify(data.payload, null, 2);
     await navigator.clipboard.writeText(asText);
     onStatus("Pack JSON copied to clipboard.");
   };
 
   const importPack = async () => {
-    const payload = JSON.parse(importJson || "{}");
-    const data = await API.importVocabularyPack(payload);
-    await loadRows();
-    await loadTree();
-    await loadPackDetail(data.id);
-    onStatus("Pack imported.");
+    try {
+      const payload = JSON.parse(importJson || "{}");
+      const data = await API.importVocabularyPack(payload);
+      setShowImportPanel(false);
+      setImportJson("");
+      await refreshAll();
+      await loadPackDetail(data.id);
+      onStatus("Pack imported.");
+    } catch (err: any) {
+      onStatus(err?.message || "Import JSON is invalid.");
+    }
   };
 
-  const runGenerate = async () => {
-    if (!pack) return;
-    await API.regenerateVocabularyPack(pack.id, {
-      count: createDraft.count,
-      prompt_template: createDraft.prompt_template || undefined,
-      model: "gpt-4o-mini",
-      theme: createDraft.theme || undefined,
-      temperature: Number(createDraft.temperature || 0.7),
-      max_tokens: Number(createDraft.max_tokens || 500),
-      random_seed: createDraft.random_seed || undefined,
-      advanced: createDraft.advanced_on ? {
-        story_constraints: createDraft.story_constraints || "",
-        sentence_complexity: createDraft.sentence_complexity || 50
-      } : null
-    });
-    await loadPackDetail(pack.id);
-    await loadRows();
-    await loadTree();
-    onStatus("Draft regenerated.");
+  const runGenerate = async (targetPack?: VocabularyPackRow) => {
+    const localPack = targetPack || pack;
+    if (!localPack) return;
+    setGenerateBusy(true);
+    setLastGenerationError(null);
+    try {
+      await API.regenerateVocabularyPack(localPack.id, {
+        count: createDraft.count,
+        prompt_template: createDraft.prompt_template || undefined,
+        model: "gpt-4o-mini",
+        theme: createDraft.theme || undefined,
+        temperature: Number(createDraft.temperature || 0.5),
+        max_tokens: Number(createDraft.max_tokens || 1200),
+        random_seed: createDraft.random_seed || undefined,
+        advanced: createDraft.advanced_on ? {
+          story_constraints: createDraft.story_constraints || "",
+          sentence_complexity: createDraft.sentence_complexity || 50
+        } : null
+      });
+      await refreshAll();
+      if (localPack.id === selectedId) await loadPackDetail(localPack.id, false);
+      onStatus("Draft regenerated.");
+    } catch (err: any) {
+      setLastGenerationError({
+        code: err?.code || "GEN_UNKNOWN",
+        message: err?.message || "Generation failed",
+        requestId: err?.requestId || null
+      });
+      onStatus(err?.message || "Generation failed.");
+    } finally {
+      setGenerateBusy(false);
+    }
   };
 
   const createPackWizard = async () => {
@@ -3790,8 +3965,8 @@ function VocabularyCenterScreen({
       generator_config: createDraft.prompt_template ? {
         model: "gpt-4o-mini",
         prompt_template: createDraft.prompt_template,
-        temperature: Number(createDraft.temperature || 0.7),
-        max_tokens: Number(createDraft.max_tokens || 500),
+        temperature: Number(createDraft.temperature || 0.5),
+        max_tokens: Number(createDraft.max_tokens || 1200),
         theme: createDraft.theme || null,
         random_seed: createDraft.random_seed || null
       } : null,
@@ -3799,77 +3974,330 @@ function VocabularyCenterScreen({
       entries: []
     };
     const created = await API.createVocabularyPack(payload);
-    setShowCreateWizard(false);
     setCreateStep(1);
-    await loadRows();
-    await loadTree();
+    setShowCreateWizard(false);
+    window.history.replaceState({}, "", "/admin/vocabulary");
+    await refreshAll();
     await loadPackDetail(created.id);
     onStatus("New draft pack created.");
   };
 
-  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const toggleSort = (column: string) => {
+    if (sortBy === column) {
+      setSortDir((prev) => (prev === "asc" ? "desc" : "asc"));
+    } else {
+      setSortBy(column);
+      setSortDir(column === "name" ? "asc" : "desc");
+    }
+    setPage(1);
+  };
 
-  const inspectorContent = (
-    <div className="vocab-inspector">
+  const toggleRowSelection = (id: string, checked: boolean) => {
+    setSelectedIds((prev) => ({ ...prev, [id]: checked }));
+  };
+
+  const runBatch = async (action: "publish" | "unpublish" | "delete" | "export" | "regenerate") => {
+    const ids = Object.entries(selectedIds).filter(([, selected]) => selected).map(([id]) => id);
+    if (!ids.length) return;
+    if ((action === "delete" || action === "regenerate") && !window.confirm(`Run ${action} for ${ids.length} selected packs?`)) return;
+    setBatchBusy(true);
+    try {
+      const response = await API.batchVocabularyPacks(action, { ids, count: createDraft.count, theme: createDraft.theme || "" });
+      if (action === "export") {
+        await navigator.clipboard.writeText(JSON.stringify(response.results || [], null, 2));
+        onStatus(`Exported ${ids.length} packs to clipboard.`);
+      } else {
+        const failed = Array.isArray(response.results) ? response.results.filter((r: any) => !r.ok).length : 0;
+        onStatus(failed ? `${action} completed with ${failed} failures.` : `${action} completed for ${ids.length} packs.`);
+      }
+      if (selectedId && ids.includes(selectedId)) await loadPackDetail(selectedId, false);
+      await refreshAll();
+      setSelectedIds({});
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  const openNewWizard = () => {
+    setShowCreateWizard(true);
+    setCreateStep(1);
+    window.history.pushState({}, "", "/admin/vocabulary/new");
+  };
+
+  const closeNewWizard = () => {
+    setShowCreateWizard(false);
+    setCreateStep(1);
+    window.history.pushState({}, "", "/admin/vocabulary");
+  };
+
+  const openPackPage = (id: string) => {
+    setSelectedId(id);
+    void loadPackDetail(id, true);
+  };
+
+  const renderTreePanel = (
+    <aside className="vocab-tree-panel">
+      <TextInput placeholder="Filter tree..." value={treeSearch} onChange={(e) => setTreeSearch(e.currentTarget.value)} />
+      <div className="vocab-tree">
+        {Object.entries(filteredTree).map(([lang, levelsAny]) => {
+          const collapsed = Boolean(collapsedLangs[lang]);
+          return (
+            <div key={lang} className="vocab-tree-lang">
+              <button
+                className="vocab-tree-toggle"
+                type="button"
+                onClick={() => setCollapsedLangs((prev) => ({ ...prev, [lang]: !prev[lang] }))}
+              >
+                {collapsed ? "▶" : "▼"} {lang}
+              </button>
+              {!collapsed && Object.entries(levelsAny as any).map(([level, packsAny]) => (
+                <div key={`${lang}-${level}`} className="vocab-tree-level">
+                  <Text size="sm" fw={600}>{level}</Text>
+                  {(packsAny as any[]).map((p) => (
+                    <button
+                      type="button"
+                      key={p.id}
+                      className={`vocab-tree-pack ${selectedId === p.id ? "active" : ""}`}
+                      onClick={() => openPackPage(p.id)}
+                    >
+                      <span>{p.name}</span>
+                      <Badge size="xs" color={p.status === "published" ? "green" : p.status === "archived" ? "gray" : "yellow"}>{p.status}</Badge>
+                      <span className="vocab-tree-version">v{p.version}</span>
+                    </button>
+                  ))}
+                </div>
+              ))}
+            </div>
+          );
+        })}
+      </div>
+    </aside>
+  );
+
+  const renderTablePanel = (
+    <section className="vocab-table-panel">
+      <div className="vocab-filters">
+        <Select label="Language" value={filters.language} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, language: v || "" })); }} data={[{ value: "", label: "All" }, { value: "en", label: "EN" }, { value: "ru", label: "RU" }]} />
+        <Select label="Level" value={String(filters.level)} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, level: v || "" })); }} data={[{ value: "", label: "All" }, ...[1, 2, 3, 4, 5].map((n) => ({ value: String(n), label: String(n) }))]} />
+        <Select label="Type" value={filters.type} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, type: v || "" })); }} data={[{ value: "", label: "All" }, ...["words", "sentences", "fiction", "code"].map((v) => ({ value: v, label: v }))]} />
+        <Select label="Status" value={filters.status} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, status: v || "" })); }} data={[{ value: "", label: "All" }, ...["draft", "published", "archived"].map((v) => ({ value: v, label: v }))]} />
+        <Select label="Source" value={filters.source} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, source: v || "" })); }} data={[{ value: "", label: "All" }, ...["manual", "openai", "imported"].map((v) => ({ value: v, label: v }))]} />
+        <TextInput label="Search" value={filters.search} onChange={(e) => { setPage(1); setFilters((p) => ({ ...p, search: e.currentTarget.value })); }} />
+      </div>
+
+      {selectedCount > 0 && (
+        <div className="vocab-batch-bar">
+          <Text size="sm"><strong>{selectedCount}</strong> selected</Text>
+          <Group gap={6}>
+            <Button size="xs" variant="light" disabled={batchBusy} onClick={() => void runBatch("publish")}>Publish</Button>
+            <Button size="xs" variant="light" disabled={batchBusy} onClick={() => void runBatch("unpublish")}>Unpublish</Button>
+            <Button size="xs" variant="light" disabled={batchBusy} onClick={() => void runBatch("export")}>Export</Button>
+            <Button size="xs" color="red" variant="light" disabled={batchBusy} onClick={() => void runBatch("delete")}>Delete</Button>
+            <Button size="xs" variant="default" disabled={batchBusy || !generatorEnabled} onClick={() => void runBatch("regenerate")}>Regenerate</Button>
+          </Group>
+        </div>
+      )}
+
+      <div className={`vocab-table-wrap ${tableBusy ? "is-busy" : ""}`}>
+        <table className="vocab-table">
+          <thead>
+            <tr>
+              <th className="col-check"><Checkbox checked={rows.length > 0 && rows.every((row) => Boolean(selectedIds[row.id]))} onChange={(e) => {
+                const next = { ...selectedIds };
+                rows.forEach((row) => { next[row.id] = e.currentTarget.checked; });
+                setSelectedIds(next);
+              }} /></th>
+              <th className="col-name"><button type="button" className="vocab-sort" onClick={() => toggleSort("name")}>Name</button></th>
+              <th className="col-lang"><button type="button" className="vocab-sort" onClick={() => toggleSort("language")}>Language</button></th>
+              <th className="col-level"><button type="button" className="vocab-sort" onClick={() => toggleSort("level")}>Level</button></th>
+              <th className="col-type"><button type="button" className="vocab-sort" onClick={() => toggleSort("type")}>Type</button></th>
+              <th className="col-entries">Entries</th>
+              <th className="col-status"><button type="button" className="vocab-sort" onClick={() => toggleSort("status")}>Status</button></th>
+              <th className="col-version">Version</th>
+              <th className="col-updated"><button type="button" className="vocab-sort" onClick={() => toggleSort("updated_at")}>Updated</button></th>
+              <th className="col-source"><button type="button" className="vocab-sort" onClick={() => toggleSort("source")}>Source</button></th>
+              <th className="col-actions">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {loadingInitial && rows.length === 0 && Array.from({ length: 8 }, (_, i) => (
+              <tr key={`s-${i}`}><td colSpan={11}><div className="lb-skeleton-line" /></td></tr>
+            ))}
+            {!loadingInitial && rows.length === 0 && (
+              <tr>
+                <td colSpan={11}>
+                  <div className="vocab-empty">
+                    No vocabularies found
+                    <Button size="xs" onClick={openNewWizard}>Create new vocabulary</Button>
+                  </div>
+                </td>
+              </tr>
+            )}
+            {rows.map((row) => (
+              <tr key={row.id} className={selectedId === row.id ? "active" : ""}>
+                <td className="col-check">
+                  <Checkbox checked={Boolean(selectedIds[row.id])} onChange={(e) => toggleRowSelection(row.id, e.currentTarget.checked)} />
+                </td>
+                <td title={row.name}>{row.name}</td>
+                <td>{String(row.language || "").toUpperCase()}</td>
+                <td className="is-number">{row.level}</td>
+                <td>{row.type}</td>
+                <td className="is-number">{Number((row as any).entry_count || 0)}</td>
+                <td>{row.status}</td>
+                <td className="is-number">v{row.version}</td>
+                <td>{new Date(row.updated_at || "").toLocaleString()}</td>
+                <td>{row.source}</td>
+                <td>
+                  <div className="vocab-row-actions">
+                    <Button size="xs" variant="light" onClick={() => openPackPage(row.id)}>Inspect</Button>
+                    <Button size="xs" variant="light" onClick={() => void publishToggle(row)}>{row.status === "published" ? "Unpublish" : "Publish"}</Button>
+                    <Button size="xs" variant="light" onClick={() => void exportPack(row.id)}>Export</Button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="vocab-pagination">
+        <Group>
+          <Text size="sm">Total: {total}</Text>
+          <Select value={String(pageSize)} onChange={(v) => { setPage(1); setPageSize(Number(v || 20)); }} data={[10, 20, 50].map((n) => ({ value: String(n), label: `${n}/page` }))} />
+          <Button size="xs" variant="default" onClick={() => void refreshAll()} disabled={tableBusy}>Refresh</Button>
+        </Group>
+        <Group>
+          <Button size="xs" variant="default" disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>Prev</Button>
+          <Text size="sm">Page {Math.min(page, totalPages)} / {totalPages}</Text>
+          <Button size="xs" variant="default" disabled={page >= totalPages} onClick={() => setPage((p) => p + 1)}>Next</Button>
+        </Group>
+      </div>
+    </section>
+  );
+
+  const inspectorGenerationMeta = (pack?.metadata && typeof pack.metadata === "object")
+    ? (pack.metadata.generation_last || null)
+    : null;
+
+  const renderInspectorPanel = (
+    <aside className={`vocab-inspector-panel${inspectorMaximized ? " maximized" : ""}`}>
       {!pack ? (
         <div className="vocab-empty">Select a pack to inspect and edit details.</div>
       ) : (
-        <>
-          <div className="vocab-inspector-header">
-            <TextInput
-              label="Pack name"
-              value={pack.name}
-              onChange={(e) => setPack((prev) => prev ? { ...prev, name: e.currentTarget.value } : prev)}
-            />
+        <div className="vocab-inspector">
+          <div className="vocab-inspector-toolbar">
             <Group>
               <Badge>{pack.language.toUpperCase()}</Badge>
               <Badge>{pack.type}</Badge>
               <Badge>{pack.status}</Badge>
               <Badge>v{pack.version}</Badge>
             </Group>
+            <Group gap={6}>
+              <Button size="xs" variant="default" onClick={() => setInspectorMaximized((v) => !v)}>{inspectorMaximized ? "Restore" : "Maximize"}</Button>
+            </Group>
           </div>
-          <Group grow>
-            <Select label="Language" value={pack.language} onChange={(v) => setPack((prev) => prev ? { ...prev, language: v || "en" } : prev)} data={[{ value: "en", label: "EN" }, { value: "ru", label: "RU" }]} />
-            <Select label="Level" value={String(pack.level)} onChange={(v) => setPack((prev) => prev ? { ...prev, level: Number(v || 1) } : prev)} data={[1, 2, 3, 4, 5].map((n) => ({ value: String(n), label: String(n) }))} />
-            <Select label="Type" value={pack.type} onChange={(v) => setPack((prev) => prev ? { ...prev, type: (v || "words") as any } : prev)} data={["words", "sentences", "fiction", "code"].map((v) => ({ value: v, label: v }))} />
-          </Group>
-          <Textarea
-            label="Entries (one per line)"
-            value={entries.map((e) => e.text).join("\n")}
-            minRows={10}
-            onChange={(e) => {
-              const rowsRaw = e.currentTarget.value.split(/\n/).map((line) => line.trim()).filter(Boolean);
-              setEntries(rowsRaw.map((text, idx) => ({ id: entries[idx]?.id || `tmp-${idx}`, text, order_index: idx })));
-            }}
+          <SegmentedControl
+            value={inspectorTab}
+            onChange={(value) => setInspectorTab(value as any)}
+            data={[
+              { value: "details", label: "Details" },
+              { value: "entries", label: "Entries" },
+              { value: "history", label: "History" },
+              { value: "diagnostics", label: "Diagnostics" }
+            ]}
           />
-          <Group>
-            <Button onClick={() => void savePack()}>Save (Ctrl+Enter)</Button>
-            <Button variant="light" onClick={() => void publishToggle()}>{pack.status === "published" ? "Unpublish" : "Publish"}</Button>
-            <Button variant="light" onClick={() => void runGenerate()} disabled={!generatorEnabled}>Regenerate draft</Button>
-            <Button variant="light" onClick={() => void exportPack()}>Export JSON</Button>
-            <Button color="red" variant="light" onClick={async () => {
-              await API.deleteVocabularyPack(pack.id);
-              setPack(null);
-              setEntries([]);
-              setVersions([]);
-              setSelectedId("");
-              await loadRows();
-              await loadTree();
-            }}>Delete</Button>
-          </Group>
-          <Divider />
-          <Group grow>
-            <Select
-              label="Version history"
-              value={selectedVersion}
-              onChange={(v) => setSelectedVersion(v || "")}
-              data={versions.map((v) => ({ value: String(v.version), label: `v${v.version} - ${new Date(v.created_at || v.createdAt).toLocaleString()}` }))}
-            />
-            <Button variant="default" onClick={() => void rollbackVersion()} disabled={!selectedVersion}>Rollback</Button>
-          </Group>
-        </>
+          {inspectorTab === "details" && (
+            <Stack>
+              <TextInput label="Pack name" value={pack.name} onChange={(e) => setPack((prev) => prev ? { ...prev, name: e.currentTarget.value } : prev)} />
+              <Group grow>
+                <Select label="Language" value={pack.language} onChange={(v) => setPack((prev) => prev ? { ...prev, language: v || "en" } : prev)} data={[{ value: "en", label: "EN" }, { value: "ru", label: "RU" }]} />
+                <Select label="Level" value={String(pack.level)} onChange={(v) => setPack((prev) => prev ? { ...prev, level: Number(v || 1) } : prev)} data={[1, 2, 3, 4, 5].map((n) => ({ value: String(n), label: String(n) }))} />
+                <Select label="Type" value={pack.type} onChange={(v) => setPack((prev) => prev ? { ...prev, type: (v || "words") as any } : prev)} data={["words", "sentences", "fiction", "code"].map((v) => ({ value: v, label: v }))} />
+              </Group>
+              <Group>
+                <Button onClick={() => void savePack()} disabled={!hasUnsavedInspectorChanges || saveBusy}>{saveBusy ? "Saving..." : "Save (Ctrl+Enter)"}</Button>
+                <Button variant="light" onClick={() => void publishToggle()}>{pack.status === "published" ? "Unpublish" : "Publish"}</Button>
+                <Button variant="light" onClick={() => void runGenerate()} disabled={!generatorEnabled || generateBusy}>{generateBusy ? "Generating..." : "Regenerate"}</Button>
+                <Button variant="light" onClick={() => void exportPack()}>Export JSON</Button>
+                <Button color="red" variant="light" onClick={async () => {
+                  if (!window.confirm("Delete this pack?")) return;
+                  await API.deleteVocabularyPack(pack.id);
+                  setPack(null);
+                  setEntries([]);
+                  setEntriesText("");
+                  setVersions([]);
+                  setSelectedId("");
+                  await refreshAll();
+                }}>Delete</Button>
+              </Group>
+            </Stack>
+          )}
+          {inspectorTab === "entries" && (
+            <Stack>
+              <Group justify="space-between">
+                <Text size="sm">Entries editor (one line = one entry)</Text>
+                <Text size="sm" c="dimmed">{parsedLines.normalized.length} entries</Text>
+              </Group>
+              <Textarea
+                value={entriesText}
+                minRows={20}
+                autosize
+                className="vocab-entries-editor"
+                onChange={(e) => setEntriesText(e.currentTarget.value)}
+              />
+              <Group>
+                <Badge color={parsedLines.emptyCount > 0 ? "yellow" : "gray"}>Empty lines: {parsedLines.emptyCount}</Badge>
+                <Badge color={parsedLines.duplicateCount > 0 ? "yellow" : "gray"}>Duplicates: {parsedLines.duplicateCount}</Badge>
+              </Group>
+            </Stack>
+          )}
+          {inspectorTab === "history" && (
+            <Stack>
+              <Group grow>
+                <Select
+                  label="Version history"
+                  value={selectedVersion}
+                  onChange={(v) => setSelectedVersion(v || "")}
+                  data={versions.map((v) => ({ value: String(v.version), label: `v${v.version} - ${new Date(v.created_at || v.createdAt).toLocaleString()}` }))}
+                />
+                <Button variant="default" onClick={() => void rollbackVersion()} disabled={!selectedVersion}>Rollback</Button>
+              </Group>
+              <div className="vocab-version-list">
+                {versions.map((v) => (
+                  <div key={v.id || v.version} className="vocab-version-item">
+                    <Text fw={600}>v{v.version}</Text>
+                    <Text size="xs" c="dimmed">{new Date(v.created_at || v.createdAt).toLocaleString()}</Text>
+                    <Text size="xs">{v.change_note || "No note"}</Text>
+                  </div>
+                ))}
+              </div>
+            </Stack>
+          )}
+          {inspectorTab === "diagnostics" && (
+            <Stack>
+              {lastGenerationError && (
+                <Alert color="red" title="Generation error">
+                  <div>Code: {lastGenerationError.code}</div>
+                  <div>Request ID: {lastGenerationError.requestId || "n/a"}</div>
+                  <div>{lastGenerationError.message}</div>
+                </Alert>
+              )}
+              {inspectorGenerationMeta ? (
+                <Card withBorder>
+                  <Text size="sm"><strong>Last generation</strong></Text>
+                  <Text size="xs">Code: {inspectorGenerationMeta.code || "n/a"}</Text>
+                  <Text size="xs">Request ID: {inspectorGenerationMeta.requestId || "n/a"}</Text>
+                  <Text size="xs">Parsed: {inspectorGenerationMeta.parsedCount || 0}</Text>
+                  <Text size="xs">Validated: {inspectorGenerationMeta.validatedCount || 0}</Text>
+                  <Textarea minRows={6} readOnly value={String(inspectorGenerationMeta.outputPreview || "")} />
+                </Card>
+              ) : (
+                <Text size="sm" c="dimmed">No diagnostics yet for this pack.</Text>
+              )}
+            </Stack>
+          )}
+        </div>
       )}
-    </div>
+    </aside>
   );
 
   if (!isAdmin) {
@@ -3885,38 +4313,48 @@ function VocabularyCenterScreen({
 
   return (
     <div className="screen settings vocab-center-screen">
-      <div className="vocab-toolbar">
-        <Title order={2}>Vocabulary Center</Title>
+      <div className="vocab-toolbar sticky">
+        <div>
+          <Title order={2}>Vocabulary Center</Title>
+          <Text size="sm" c="dimmed">Manage packs, run generation, publish at scale.</Text>
+        </div>
         <Group>
-          <Button onClick={() => setShowCreateWizard((v) => !v)}>New Pack</Button>
+          <Button onClick={openNewWizard}>New Pack</Button>
+          <Button variant="light" onClick={() => setShowImportPanel((v) => !v)}>Import JSON</Button>
           <Button variant="light" onClick={onBack}>Back</Button>
         </Group>
       </div>
 
       {showCreateWizard && (
         <Card className="vocab-create-wizard" withBorder>
-          <Text fw={700}>Create New Vocabulary - Step {createStep} / 3</Text>
+          <div className="vocab-wizard-head">
+            <Text fw={700}>Create New Pack</Text>
+            <Button variant="subtle" size="xs" onClick={closeNewWizard}>Close</Button>
+          </div>
+          <Text size="sm" c="dimmed">Step {createStep} of 3</Text>
           {createStep === 1 && (
-            <Group grow>
+            <div className="vocab-form-grid">
               <TextInput label="Pack name" value={createDraft.name} onChange={(e) => setCreateDraft((p: any) => ({ ...p, name: e.currentTarget.value }))} />
               <Select label="Language" value={createDraft.language} onChange={(v) => setCreateDraft((p: any) => ({ ...p, language: v || "en" }))} data={[{ value: "en", label: "EN" }, { value: "ru", label: "RU" }]} />
               <Select label="Level" value={String(createDraft.level)} onChange={(v) => setCreateDraft((p: any) => ({ ...p, level: Number(v || 1) }))} data={[1, 2, 3, 4, 5].map((n) => ({ value: String(n), label: String(n) }))} />
               <Select label="Type" value={createDraft.type} onChange={(v) => setCreateDraft((p: any) => ({ ...p, type: v || "words" }))} data={["words", "sentences", "fiction", "code"].map((v) => ({ value: v, label: v }))} />
-            </Group>
+            </div>
           )}
           {createStep === 2 && (
-            <Stack>
-              <Group grow>
-                <NumberInput label="Entry count" min={5} max={500} value={createDraft.count} onChange={(v) => setCreateDraft((p: any) => ({ ...p, count: Number(v) || 30 }))} />
-                <TextInput label="Theme/topic" value={createDraft.theme} onChange={(e) => setCreateDraft((p: any) => ({ ...p, theme: e.currentTarget.value }))} />
-                <Switch label="Enable Advanced" checked={Boolean(createDraft.advanced_on)} onChange={(e) => setCreateDraft((p: any) => ({ ...p, advanced_on: e.currentTarget.checked }))} />
-              </Group>
+            <div className="vocab-form-grid">
+              <NumberInput label="Entry count" min={5} max={500} value={createDraft.count} onChange={(v) => setCreateDraft((p: any) => ({ ...p, count: Number(v) || 30 }))} />
+              <TextInput label="Theme/topic" value={createDraft.theme} onChange={(e) => setCreateDraft((p: any) => ({ ...p, theme: e.currentTarget.value }))} />
+              <Switch label="Enable Advanced" checked={Boolean(createDraft.advanced_on)} onChange={(e) => setCreateDraft((p: any) => ({ ...p, advanced_on: e.currentTarget.checked }))} />
               <Textarea label="Prompt template (optional)" minRows={4} value={createDraft.prompt_template} onChange={(e) => setCreateDraft((p: any) => ({ ...p, prompt_template: e.currentTarget.value }))} />
-            </Stack>
+            </div>
           )}
           {createStep === 3 && (
             <Alert color="blue">
-              Create draft now. You can regenerate and edit entries in inspector.
+              <div><strong>Name:</strong> {createDraft.name || "Untitled Vocabulary"}</div>
+              <div><strong>Language:</strong> {createDraft.language.toUpperCase()}</div>
+              <div><strong>Level:</strong> {createDraft.level}</div>
+              <div><strong>Type:</strong> {createDraft.type}</div>
+              <div><strong>Count:</strong> {createDraft.count}</div>
             </Alert>
           )}
           <Group>
@@ -3930,127 +4368,58 @@ function VocabularyCenterScreen({
         </Card>
       )}
 
-      <div className="vocab-layout">
-        <aside className="vocab-tree-panel">
-          <TextInput placeholder="Search tree..." value={treeSearch} onChange={(e) => setTreeSearch(e.currentTarget.value)} />
-          <div className="vocab-tree">
-            {Object.entries(filteredTree).map(([lang, levelsAny]) => {
-              const collapsed = Boolean(collapsedLangs[lang]);
-              return (
-                <div key={lang} className="vocab-tree-lang">
-                  <button className="vocab-tree-toggle" onClick={() => setCollapsedLangs((prev) => ({ ...prev, [lang]: !prev[lang] }))} type="button">
-                    {collapsed ? "▶" : "▼"} {lang}
-                  </button>
-                  {!collapsed && Object.entries(levelsAny as any).map(([level, packsAny]) => (
-                    <div key={`${lang}-${level}`} className="vocab-tree-level">
-                      <Text size="sm" fw={600}>{level}</Text>
-                      {(packsAny as any[]).map((p) => (
-                        <button
-                          type="button"
-                          key={p.id}
-                          className={`vocab-tree-pack ${selectedId === p.id ? "active" : ""}`}
-                          onClick={() => void loadPackDetail(p.id)}
-                        >
-                          <span>{p.name}</span>
-                          <Badge size="xs" color={p.status === "published" ? "green" : p.status === "archived" ? "gray" : "yellow"}>{p.status}</Badge>
-                          <span className="vocab-tree-version">v{p.version}</span>
-                        </button>
-                      ))}
-                    </div>
-                  ))}
-                </div>
-              );
-            })}
-          </div>
-        </aside>
-
-        <section className="vocab-table-panel">
-          <div className="vocab-filters">
-            <Select label="Language" value={filters.language} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, language: v || "" })); }} data={[{ value: "", label: "All" }, { value: "en", label: "EN" }, { value: "ru", label: "RU" }]} />
-            <Select label="Level" value={String(filters.level)} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, level: v || "" })); }} data={[{ value: "", label: "All" }, ...[1, 2, 3, 4, 5].map((n) => ({ value: String(n), label: String(n) }))]} />
-            <Select label="Type" value={filters.type} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, type: v || "" })); }} data={[{ value: "", label: "All" }, ...["words", "sentences", "fiction", "code"].map((v) => ({ value: v, label: v }))]} />
-            <Select label="Status" value={filters.status} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, status: v || "" })); }} data={[{ value: "", label: "All" }, ...["draft", "published", "archived"].map((v) => ({ value: v, label: v }))]} />
-            <Select label="Source" value={filters.source} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, source: v || "" })); }} data={[{ value: "", label: "All" }, ...["manual", "openai", "imported"].map((v) => ({ value: v, label: v }))]} />
-            <TextInput label="Search" value={filters.search} onChange={(e) => { setPage(1); setFilters((p) => ({ ...p, search: e.currentTarget.value })); }} />
-          </div>
-          <div className="vocab-table-wrap">
-            <table className="vocab-table">
-              <thead>
-                <tr>
-                  {["Name", "Language", "Level", "Type", "Entries", "Status", "Version", "Updated", "Source", "Actions"].map((h) => <th key={h}>{h}</th>)}
-                </tr>
-              </thead>
-              <tbody>
-                {loading && Array.from({ length: 8 }, (_, i) => (
-                  <tr key={`s-${i}`}><td colSpan={10}><div className="lb-skeleton-line" /></td></tr>
-                ))}
-                {!loading && rows.length === 0 && (
-                  <tr>
-                    <td colSpan={10}>
-                      <div className="vocab-empty">
-                        No vocabularies found
-                        <Button size="xs" onClick={() => setShowCreateWizard(true)}>Create new vocabulary</Button>
-                      </div>
-                    </td>
-                  </tr>
-                )}
-                {!loading && rows.map((row) => (
-                  <tr key={row.id}>
-                    <td>{row.name}</td>
-                    <td>{row.language.toUpperCase()}</td>
-                    <td>{row.level}</td>
-                    <td>{row.type}</td>
-                    <td>-</td>
-                    <td>{row.status}</td>
-                    <td>v{row.version}</td>
-                    <td>{new Date(row.updated_at || "").toLocaleDateString()}</td>
-                    <td>{row.source}</td>
-                    <td>
-                      <Group gap={6}>
-                        <Button size="xs" variant="light" onClick={() => void loadPackDetail(row.id)}>View</Button>
-                        <Button size="xs" variant="light" onClick={() => void loadPackDetail(row.id)}>Edit</Button>
-                        <Button size="xs" variant="light" onClick={async () => { const data = await API.exportVocabularyPack(row.id); setImportJson(JSON.stringify(data.payload, null, 2)); }}>Export</Button>
-                      </Group>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          <div className="vocab-pagination">
-            <Group>
-              <Text size="sm">Total: {total}</Text>
-              <Select value={String(pageSize)} onChange={(v) => { setPage(1); setPageSize(Number(v || 20)); }} data={[10, 20, 50].map((n) => ({ value: String(n), label: `${n}/page` }))} />
-            </Group>
-            <Group>
-              <Button size="xs" variant="default" disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>Prev</Button>
-              <Text size="sm">Page {page} / {totalPages}</Text>
-              <Button size="xs" variant="default" disabled={page >= totalPages} onClick={() => setPage((p) => p + 1)}>Next</Button>
-            </Group>
-          </div>
-          <Textarea
-            label="Import pack JSON"
-            value={importJson}
-            onChange={(e) => setImportJson(e.currentTarget.value)}
-            minRows={4}
-          />
+      {showImportPanel && (
+        <Card className="vocab-import-panel" withBorder>
+          <Textarea label="Import pack JSON" value={importJson} onChange={(e) => setImportJson(e.currentTarget.value)} minRows={6} />
           <Group>
             <Button variant="light" onClick={() => void importPack()}>Import JSON</Button>
           </Group>
-        </section>
+        </Card>
+      )}
 
-        {!isMobile && <aside className="vocab-inspector-panel">{inspectorContent}</aside>}
-      </div>
+      {isMobile && (
+        <SegmentedControl
+          value={mobileTab}
+          onChange={(value) => setMobileTab(value as any)}
+          data={[
+            { value: "tree", label: "Tree" },
+            { value: "table", label: "Table" },
+            { value: "inspector", label: "Inspector" }
+          ]}
+        />
+      )}
 
-      <Drawer
-        opened={isMobile && showMobileInspector}
-        onClose={() => setShowMobileInspector(false)}
-        position="bottom"
-        size="85%"
-        title="Vocabulary Inspector"
+      <div
+        ref={containerRef}
+        className="vocab-layout"
+        style={!isMobile ? {
+          gridTemplateColumns: inspectorMaximized
+            ? `minmax(220px, ${leftPanePercent}%) minmax(0, ${100 - leftPanePercent}%)`
+            : `minmax(220px, ${leftPanePercent}%) 10px minmax(0, ${100 - leftPanePercent - rightPanePercent}%) 10px minmax(320px, ${rightPanePercent}%)`
+        } : undefined}
       >
-        {inspectorContent}
-      </Drawer>
+        {(!isMobile || mobileTab === "tree") && renderTreePanel}
+        {!isMobile && !inspectorMaximized && (
+          <div
+            className="vocab-resizer"
+            onMouseDown={(e) => startResize("left", e.clientX)}
+            role="separator"
+            aria-orientation="vertical"
+            tabIndex={0}
+          />
+        )}
+        {(!isMobile || mobileTab === "table") && renderTablePanel}
+        {!isMobile && !inspectorMaximized && (
+          <div
+            className="vocab-resizer"
+            onMouseDown={(e) => startResize("right", e.clientX)}
+            role="separator"
+            aria-orientation="vertical"
+            tabIndex={0}
+          />
+        )}
+        {(!isMobile || mobileTab === "inspector") && renderInspectorPanel}
+      </div>
     </div>
   );
 }

@@ -601,7 +601,14 @@ class SqliteAdapter {
     const pageSize = Math.max(5, Math.min(100, Number(options.pageSize || 20)));
     const offset = (page - 1) * pageSize;
     const total = Number(this.db.prepare(`SELECT COUNT(*) as c FROM vocabulary_packs ${where}`).get(...params)?.c || 0);
-    const rows = this.db.prepare(`SELECT * FROM vocabulary_packs ${where} ORDER BY ${sortBy} ${sortDir}, id ASC LIMIT ? OFFSET ?`).all(...params, pageSize, offset);
+    const rows = this.db.prepare(`
+      SELECT p.*,
+             (SELECT COUNT(*) FROM vocabulary_entries e WHERE e.pack_id = p.id) AS entry_count
+      FROM vocabulary_packs p
+      ${where}
+      ORDER BY ${sortBy} ${sortDir}, id ASC
+      LIMIT ? OFFSET ?
+    `).all(...params, pageSize, offset);
     return { rows, total, page, pageSize };
   }
 

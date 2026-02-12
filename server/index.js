@@ -360,6 +360,111 @@ function safeParseJson(input, fallback) {
   }
 }
 
+function extractFirstJsonArraySubstring(raw) {
+  const text = String(raw || "");
+  const start = text.indexOf("[");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === "\"") {
+      inString = true;
+      continue;
+    }
+    if (ch === "[") depth += 1;
+    if (ch === "]") {
+      depth -= 1;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+function safeParseJsonArrayOfStrings(raw, maxCount = 500) {
+  const normalizedMax = Math.max(1, Math.min(1000, Number(maxCount) || 500));
+  const direct = safeParseJson(raw, null);
+  let arr = Array.isArray(direct) ? direct : null;
+  if (!arr) {
+    const wrapped = direct && Array.isArray(direct.items) ? direct.items : null;
+    if (wrapped) arr = wrapped;
+  }
+  if (!arr) {
+    const fromSubstring = extractFirstJsonArraySubstring(raw);
+    if (fromSubstring) arr = safeParseJson(fromSubstring, null);
+  }
+  if (!Array.isArray(arr)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const item of arr) {
+    if (typeof item !== "string") continue;
+    const cleaned = item.replace(/\s+/g, " ").trim();
+    if (!cleaned) continue;
+    const key = cleaned.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(cleaned);
+    if (out.length >= normalizedMax) break;
+  }
+  return out;
+}
+
+function buildVocabularyGenerationPrompts({ language, level, type, count, theme }) {
+  const safeTheme = String(theme || "").trim();
+  const typeRules = type === "words"
+    ? "Return single vocabulary words. Prefer no spaces. Keep each item concise and age-appropriate."
+    : "Return complete short sentences or chunks. Include spaces and natural punctuation.";
+  const contentRule = safeTheme
+    ? `Theme/topic: ${safeTheme}.`
+    : "Theme/topic: general kid-safe educational content.";
+  const system = [
+    "You are a strict JSON generator for a typing game content pipeline.",
+    "Return ONLY valid JSON.",
+    "No markdown, no explanation, no code fences."
+  ].join(" ");
+  const developer = [
+    `Generate exactly ${count} items for language=${language}, level=${level}, type=${type}.`,
+    typeRules,
+    contentRule,
+    "Each item must be a string.",
+    "Return ONLY a JSON array of strings.",
+    "Never return an object.",
+    "No comments."
+  ].join(" ");
+  return { system, developer };
+}
+
+function validateGeneratedVocabularyItems(items, { type, level }) {
+  const errors = [];
+  const validated = [];
+  const maxLen = level <= 2 ? 24 : level <= 4 ? 48 : 80;
+  for (const raw of items) {
+    const text = String(raw || "").trim();
+    if (!text) continue;
+    if (text.length > maxLen) continue;
+    if (type === "words") {
+      if (text.includes("\n")) continue;
+      validated.push(text);
+      continue;
+    }
+    if (!text.includes(" ")) continue;
+    validated.push(text);
+  }
+  if (!validated.length) errors.push("No valid items after type-level validation.");
+  return { items: validated, errors };
+}
+
 function setSessionCookie(res, token, expiresAt) {
   const expiresDate = new Date(expiresAt || Date.now() + SESSION_TTL_MS);
   const parts = [
@@ -529,9 +634,16 @@ async function generateTasks(level, count, contentMode, language = "en") {
   return tasks.slice(0, count);
 }
 
-async function callOpenAI({ apiKey, prompt }) {
+async function callOpenAI({ apiKey, prompt, systemPrompt = "", model = OPENAI_MODEL, temperature = 0.7, maxTokens = null }) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 20000);
+  const input = [];
+  if (systemPrompt) input.push({ role: "system", content: systemPrompt });
+  input.push({ role: "user", content: String(prompt || "") });
+  if (Array.isArray(prompt)) {
+    input.length = 0;
+    input.push(...prompt);
+  }
   const response = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
@@ -540,9 +652,10 @@ async function callOpenAI({ apiKey, prompt }) {
     },
     signal: controller.signal,
     body: JSON.stringify({
-      model: OPENAI_MODEL,
-      input: prompt,
-      temperature: 0.7
+      model,
+      input,
+      temperature,
+      ...(maxTokens ? { max_output_tokens: Number(maxTokens) } : {})
     })
   });
   clearTimeout(timeout);
@@ -1777,25 +1890,99 @@ app.post("/api/admin/vocabulary/packs/:id/regenerate", requirePermission(Permiss
   if (!keyToUse) throw new AppError("OpenAI key missing", { status: 400, code: "OPENAI_KEY_MISSING", expose: true });
   const body = requireObject(req.body || {}, "body");
   const count = asNumber(body.count || 30, { min: 5, max: 500, field: "count" });
-  const promptTemplate = String(body.prompt_template || `Generate ${count} safe ${pack.type} for ${pack.language} level ${pack.level}. Return STRICT JSON: {"items":["..."]}`);
-  const output = await callOpenAI({ apiKey: keyToUse, prompt: promptTemplate });
-  const parsed = safeParseJson(output, null);
-  if (!parsed || !Array.isArray(parsed.items)) throw new AppError("Generator output is invalid JSON items array", { status: 400, code: "GEN_INVALID_OUTPUT", expose: true });
+  const model = asString(body.model || OPENAI_MODEL, { min: 3, max: 120, field: "model" });
+  const temperature = clampNumber(body.temperature ?? 0.5, 0, 1.2, 0.5);
+  const maxTokens = clampNumber(body.max_tokens ?? 1200, 128, 4000, 1200);
+  const promptTemplate = String(body.prompt_template || "").trim();
+  const prompts = buildVocabularyGenerationPrompts({
+    language: String(pack.language || "en"),
+    level: Number(pack.level || 1),
+    type: normalizeVocabularyType(pack.type),
+    count,
+    theme: body.theme || ""
+  });
+  const promptToRun = promptTemplate || prompts.developer;
+
+  let output = "";
+  let parsedItems = [];
+  let parseError = "";
+  const minRequired = Math.max(3, Math.floor(count * 0.6));
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    output = await callOpenAI({
+      apiKey: keyToUse,
+      model,
+      temperature,
+      maxTokens,
+      systemPrompt: prompts.system,
+      prompt: attempt === 1
+        ? promptToRun
+        : `Convert the following text into a valid JSON array of strings only. Do not add commentary.\n\n${output}`
+    });
+    parsedItems = safeParseJsonArrayOfStrings(output, count);
+    if (parsedItems.length >= minRequired) break;
+    parseError = `Attempt ${attempt}: expected at least ${minRequired} items, got ${parsedItems.length}.`;
+  }
+  const validated = validateGeneratedVocabularyItems(parsedItems, {
+    type: normalizeVocabularyType(pack.type),
+    level: Number(pack.level || 1)
+  });
+  if (validated.items.length < minRequired) {
+    const diagnostics = {
+      at: new Date().toISOString(),
+      requestId: req.requestId || null,
+      code: "GEN_INVALID_OUTPUT",
+      message: parseError || "Generator output is invalid JSON items array",
+      parsedCount: parsedItems.length,
+      validatedCount: validated.items.length,
+      outputPreview: String(output || "").slice(0, 2000),
+      model,
+      requestedCount: count
+    };
+    await repo.updateVocabularyPack(id, {
+      metadata: {
+        ...(safeParseJson(pack.metadata, {}) || {}),
+        generation_last: diagnostics
+      }
+    });
+    throw new AppError("Generator output is invalid JSON items array", {
+      status: 400,
+      code: "GEN_INVALID_OUTPUT",
+      expose: true,
+      metadata: { requestId: req.requestId, parsedCount: parsedItems.length, minRequired }
+    });
+  }
   const now = new Date().toISOString();
+  const priorMetadata = typeof pack.metadata === "string" ? safeParseJson(pack.metadata, {}) : (pack.metadata || {});
+  const generationLast = {
+    at: now,
+    requestId: req.requestId || null,
+    code: "OK",
+    message: "",
+    requestedCount: count,
+    parsedCount: parsedItems.length,
+    validatedCount: validated.items.length,
+    model,
+    outputPreview: String(output || "").slice(0, 2000),
+    parsedPreview: validated.items.slice(0, 15)
+  };
   await repo.updateVocabularyPack(id, {
     source: "openai",
     version: Number(pack.version || 1) + 1,
     generator_config: {
-      model: body.model || OPENAI_MODEL,
+      model,
       prompt_template: promptTemplate,
-      temperature: body.temperature ?? 0.7,
-      max_tokens: body.max_tokens ?? null,
+      temperature,
+      max_tokens: maxTokens,
       theme: body.theme || null,
       random_seed: body.random_seed || null,
       advanced: body.advanced || null
+    },
+    metadata: {
+      ...(priorMetadata || {}),
+      generation_last: generationLast
     }
   });
-  await repo.replaceVocabularyEntries(id, parsed.items.map((text, idx) => ({
+  await repo.replaceVocabularyEntries(id, validated.items.map((text, idx) => ({
     id: randomUUID(),
     text: String(text || "").trim(),
     order_index: idx,
@@ -1816,7 +2003,79 @@ app.post("/api/admin/vocabulary/packs/:id/regenerate", requirePermission(Permiss
     created_at: now
   });
   await audit(req, "vocabulary.pack.regenerate", "vocabulary_pack", id, { count });
-  res.json({ ok: true });
+  res.json({ ok: true, count: validated.items.length, requestId: req.requestId || null });
+}));
+
+app.post("/api/admin/vocabulary/packs/batch", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, generationLimiter, withAsync(async (req, res) => {
+  const body = requireObject(req.body || {}, "body");
+  const action = asEnum(body.action || "", ["publish", "unpublish", "delete", "export", "regenerate"], "action");
+  const ids = Array.isArray(body.ids) ? body.ids.map((id) => String(id || "").trim()).filter(Boolean) : [];
+  if (!ids.length) throw new AppError("No pack IDs provided", { status: 400, code: "BATCH_EMPTY", expose: true });
+  if (ids.length > 100) throw new AppError("Batch size too large", { status: 400, code: "BATCH_TOO_LARGE", expose: true });
+  const results = [];
+  const count = clampNumber(body.count ?? 30, 5, 500, 30);
+  for (const id of ids) {
+    try {
+      if (action === "publish") await repo.updateVocabularyPack(id, { status: "published" });
+      if (action === "unpublish") await repo.updateVocabularyPack(id, { status: "draft" });
+      if (action === "delete") await repo.deleteVocabularyPack(id);
+      if (action === "export") {
+        const pack = await repo.getVocabularyPackById(id);
+        if (!pack) throw new Error("Not found");
+        const entries = await repo.listVocabularyEntries(id);
+        results.push({ id, ok: true, payload: { pack, entries } });
+        continue;
+      }
+      if (action === "regenerate") {
+        const pack = await repo.getVocabularyPackById(id);
+        if (!pack) throw new Error("Not found");
+        const keyToUse = await getOpenAIKeyForActor(req.actor);
+        if (!keyToUse) throw new Error("OpenAI key missing");
+        const prompts = buildVocabularyGenerationPrompts({
+          language: String(pack.language || "en"),
+          level: Number(pack.level || 1),
+          type: normalizeVocabularyType(pack.type),
+          count,
+          theme: body.theme || ""
+        });
+        const output = await callOpenAI({ apiKey: keyToUse, systemPrompt: prompts.system, prompt: prompts.developer });
+        const parsedItems = safeParseJsonArrayOfStrings(output, count);
+        const validated = validateGeneratedVocabularyItems(parsedItems, {
+          type: normalizeVocabularyType(pack.type),
+          level: Number(pack.level || 1)
+        });
+        if (!validated.items.length) throw new Error("No valid generated items");
+        await repo.updateVocabularyPack(id, {
+          source: "openai",
+          version: Number(pack.version || 1) + 1,
+          metadata: {
+            ...(typeof pack.metadata === "string" ? safeParseJson(pack.metadata, {}) : (pack.metadata || {})),
+            generation_last: {
+              at: new Date().toISOString(),
+              requestId: req.requestId || null,
+              code: "OK",
+              parsedCount: parsedItems.length,
+              validatedCount: validated.items.length,
+              outputPreview: String(output || "").slice(0, 2000)
+            }
+          }
+        });
+        await repo.replaceVocabularyEntries(id, validated.items.map((text, idx) => ({
+          id: randomUUID(),
+          text,
+          order_index: idx,
+          difficulty_score: null,
+          tags: null,
+          created_at: new Date().toISOString()
+        })));
+      }
+      results.push({ id, ok: true });
+    } catch (err) {
+      results.push({ id, ok: false, error: String(err?.message || err || "Unknown error") });
+    }
+  }
+  await audit(req, "vocabulary.pack.batch", "vocabulary_pack", action, { count: ids.length, action });
+  res.json({ ok: true, action, results, requestId: req.requestId || null });
 }));
 
 app.get("/api/live/stats", requirePermission(Permissions.TASKS_GENERATE), withAsync(async (req, res) => {
