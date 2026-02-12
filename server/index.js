@@ -1317,13 +1317,47 @@ app.post("/api/results", requirePermission(Permissions.RESULTS_WRITE), requireNo
 }));
 
 app.get("/api/leaderboard", requirePermission(Permissions.LEADERBOARD_READ), withAsync(async (req, res) => {
-  const entries = await repo.queryLeaderboard({ ...(req.query || {}), onlyAuthorized: true });
+  const raw = req.query || {};
+  const contestType = raw.contestType === "tasks" ? "tasks" : "time";
+  const level = clampNumber(raw.level, 1, 5, 1);
+  const contentMode = raw.contentMode === "vocab" ? "vocab" : "default";
+  const duration = contestType === "time" ? clampNumber(raw.duration, 30, 120, 60) : null;
+  const taskTarget = contestType === "tasks" ? clampNumber(raw.taskTarget, 10, 50, 20) : null;
+  const language = raw.language ? String(raw.language).toLowerCase() : "";
+  const sortBy = ["score", "accuracy", "cpm", "date", "createdAt"].includes(String(raw.sort || "")) ? String(raw.sort) : "score";
+  const sortDir = String(raw.order || "desc").toLowerCase() === "asc" ? "asc" : "desc";
+  const page = clampNumber(raw.page, 1, 5000, 1);
+  const pageSize = clampNumber(raw.pageSize, 5, 100, 20);
+  const dateRange = String(raw.dateRange || "all");
+  const createdAfter = dateRange === "7d"
+    ? new Date(Date.now() - 7 * 86400000).toISOString()
+    : dateRange === "30d"
+      ? new Date(Date.now() - 30 * 86400000).toISOString()
+      : "";
+
+  const filters = {
+    contestType,
+    level,
+    contentMode,
+    duration,
+    taskTarget,
+    language,
+    createdAfter,
+    onlyAuthorized: true
+  };
+  const options = { sortBy, sortDir, page, pageSize };
+  const pageResult = repo.queryLeaderboardPage
+    ? await repo.queryLeaderboardPage(filters, options)
+    : { rows: await repo.queryLeaderboard(filters), total: 0, page, pageSize };
+  const rows = pageResult.rows || [];
+  const total = Number(pageResult.total || rows.length);
+
   let myRank = null;
   if (req.actor?.isAuthenticated) {
-    const idx = entries.findIndex((entry) => Number(entry.userid || entry.userId) === Number(req.actor.id));
-    if (idx >= 0) myRank = idx + 1;
+    const idx = rows.findIndex((entry) => Number(entry.userid || entry.userId) === Number(req.actor.id));
+    if (idx >= 0) myRank = (page - 1) * pageSize + idx + 1;
   }
-  res.json({ entries, myRank });
+  res.json({ rows, total, page, pageSize, myRank, entries: rows });
 }));
 
 app.get("/api/packs/languages", requirePermission(Permissions.TASKS_GENERATE), withAsync(async (req, res) => {

@@ -520,13 +520,16 @@ const API = {
     if (!res.ok) throw await parseApiError(res, "Failed to save result");
     return res.json();
   },
-  async getLeaderboard(filters: any): Promise<{ entries: LeaderboardEntry[]; myRank: number | null }> {
+  async getLeaderboard(filters: any): Promise<{ rows: LeaderboardEntry[]; total: number; page: number; pageSize: number; myRank: number | null }> {
     const params = new URLSearchParams(filters).toString();
     const res = await fetch(`/api/leaderboard?${params}`, { headers: withAuthHeaders() });
     if (!res.ok) throw await parseApiError(res, "Failed to load leaderboard");
     const data = await res.json();
     return {
-      entries: data.entries as LeaderboardEntry[],
+      rows: (data.rows || data.entries || []) as LeaderboardEntry[],
+      total: Number(data.total || 0),
+      page: Number(data.page || 1),
+      pageSize: Number(data.pageSize || 20),
       myRank: typeof data.myRank === "number" ? data.myRank : null
     };
   },
@@ -2233,16 +2236,18 @@ function App() {
     }
   }, [allowedLevels, settings.level]);
 
-  const loadLeaderboard = async (filters: any) => {
+  const loadLeaderboard = useCallback(async (filters: any) => {
     setStatusMessage("");
     try {
       const data = await API.getLeaderboard(filters);
-      setLeaderboard(data.entries);
+      setLeaderboard(data.rows);
       setMyRank(data.myRank);
+      return data;
     } catch (err) {
       setStatusMessage("Could not load leaderboard.");
+      return { rows: [], total: 0, page: 1, pageSize: 20, myRank: null };
     }
-  };
+  }, []);
 
   const loadPacks = async () => {
     try {
@@ -2342,9 +2347,6 @@ function App() {
   };
 
   useEffect(() => {
-    if (screen === "leaderboard") {
-      loadLeaderboard({ contestType: "time", level: 1, contentMode: "default" });
-    }
     if (screen === "settings") {
       loadPacks();
     }
@@ -2999,6 +3001,7 @@ function App() {
           entries={leaderboard}
           myRank={myRank}
           statusMessage={statusMessage}
+          availableLanguages={availableLanguages}
         />
       )}
 
@@ -3086,108 +3089,350 @@ function LeaderboardScreen({
   onLoad,
   entries,
   myRank,
-  statusMessage
+  statusMessage,
+  availableLanguages
 }: {
   onBack: () => void;
-  onLoad: (filters: any) => void;
+  onLoad: (filters: any) => Promise<{ rows: LeaderboardEntry[]; total: number; page: number; pageSize: number; myRank: number | null }>;
   entries: LeaderboardEntry[];
   myRank: number | null;
   statusMessage: string;
+  availableLanguages: string[];
 }) {
+  const query = useMemo(() => new URLSearchParams(window.location.search), []);
   const [filters, setFilters] = useState({
-    contestType: "time",
-    level: 1,
-    contentMode: "default",
-    duration: "60",
-    taskTarget: "20"
+    contestType: query.get("contestType") === "tasks" ? "tasks" : "time",
+    level: Math.max(1, Math.min(5, Number(query.get("level") || 1))),
+    contentMode: query.get("contentMode") === "vocab" ? "vocab" : "default",
+    duration: query.get("duration") || "60",
+    taskTarget: query.get("taskTarget") || "20",
+    language: query.get("language") || "all",
+    dateRange: query.get("dateRange") || "all"
   });
+  const [sortBy, setSortBy] = useState<"score" | "accuracy" | "cpm" | "date">(
+    (query.get("sort") as any) || "score"
+  );
+  const [sortDir, setSortDir] = useState<"asc" | "desc">(query.get("order") === "asc" ? "asc" : "desc");
+  const [page, setPage] = useState(Math.max(1, Number(query.get("page") || 1)));
+  const [pageSize, setPageSize] = useState(Math.max(5, Math.min(100, Number(query.get("pageSize") || 20))));
+  const [rows, setRows] = useState<LeaderboardEntry[]>(entries || []);
+  const [total, setTotal] = useState(0);
+  const [rankForUser, setRankForUser] = useState<number | null>(myRank);
+  const [loading, setLoading] = useState(false);
+  const [errorText, setErrorText] = useState(statusMessage || "");
+  const [shareStatus, setShareStatus] = useState("");
+  const [expandedRows, setExpandedRows] = useState<Record<number, boolean>>({});
+  const [viewportWidth, setViewportWidth] = useState(typeof window !== "undefined" ? window.innerWidth : 1280);
+
+  const isMobile = viewportWidth <= 720;
+  const isTablet = viewportWidth > 720 && viewportWidth <= 1024;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
   useEffect(() => {
-    onLoad(filters);
+    const onResize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
   }, []);
 
+  const fetchRows = useCallback(async () => {
+    setLoading(true);
+    setErrorText("");
+    try {
+      const payload: any = {
+        contestType: filters.contestType,
+        level: filters.level,
+        contentMode: filters.contentMode,
+        sort: sortBy,
+        order: sortDir,
+        page,
+        pageSize,
+        dateRange: filters.dateRange
+      };
+      if (filters.contestType === "time") payload.duration = filters.duration;
+      else payload.taskTarget = filters.taskTarget;
+      if (filters.language !== "all") payload.language = filters.language;
+
+      const data = await onLoad(payload);
+      setRows(data.rows || []);
+      setTotal(Number(data.total || 0));
+      setRankForUser(typeof data.myRank === "number" ? data.myRank : null);
+    } catch (err: any) {
+      setRows([]);
+      setTotal(0);
+      setErrorText(err?.message || "Could not load leaderboard.");
+    } finally {
+      setLoading(false);
+    }
+  }, [filters, sortBy, sortDir, page, pageSize, onLoad]);
+
+  useEffect(() => {
+    void fetchRows();
+  }, [fetchRows]);
+
+  useEffect(() => {
+    const params = new URLSearchParams();
+    params.set("contestType", filters.contestType);
+    params.set("level", String(filters.level));
+    params.set("contentMode", filters.contentMode);
+    if (filters.contestType === "time") params.set("duration", filters.duration);
+    else params.set("taskTarget", filters.taskTarget);
+    params.set("language", filters.language);
+    params.set("dateRange", filters.dateRange);
+    params.set("sort", sortBy);
+    params.set("order", sortDir);
+    params.set("page", String(page));
+    params.set("pageSize", String(pageSize));
+    window.history.replaceState({}, "", `/?${params.toString()}`);
+  }, [filters, sortBy, sortDir, page, pageSize]);
+
   const handleFilter = (key: string, value: string | number) => {
-    const next = { ...filters, [key]: value };
-    setFilters(next);
-    onLoad(next);
+    setPage(1);
+    setFilters((prev) => ({ ...prev, [key]: value }));
   };
+
+  const resetFilters = () => {
+    setFilters({
+      contestType: "time",
+      level: 1,
+      contentMode: "default",
+      duration: "60",
+      taskTarget: "20",
+      language: "all",
+      dateRange: "all"
+    });
+    setSortBy("score");
+    setSortDir("desc");
+    setPage(1);
+    setPageSize(20);
+  };
+
+  const toggleSort = (col: "score" | "accuracy" | "cpm" | "date") => {
+    if (sortBy === col) {
+      setSortDir((prev) => (prev === "asc" ? "desc" : "asc"));
+      return;
+    }
+    setSortBy(col);
+    setSortDir("desc");
+  };
+
+  const sortGlyph = (col: "score" | "accuracy" | "cpm" | "date") => {
+    if (sortBy !== col) return "↕";
+    return sortDir === "asc" ? "↑" : "↓";
+  };
+
+  const copyShareUrl = async () => {
+    try {
+      await navigator.clipboard.writeText(window.location.href);
+      setShareStatus("Share URL copied.");
+      setTimeout(() => setShareStatus(""), 2000);
+    } catch {
+      setShareStatus("Could not copy URL.");
+      setTimeout(() => setShareStatus(""), 2000);
+    }
+  };
+
+  const renderSkeletonRows = () => Array.from({ length: Math.min(8, pageSize) }, (_, i) => (
+    <tr key={`skeleton-${i}`} className="lb-row-skeleton">
+      <td colSpan={isTablet ? 5 : 7}>
+        <div className="lb-skeleton-line" />
+      </td>
+    </tr>
+  ));
+
+  const renderDesktopTable = () => (
+    <div className="lb-table-shell">
+      <table className="lb-table" aria-label="Leaderboard results">
+        <thead>
+          <tr>
+            <th className="col-rank">#</th>
+            <th className="col-player">Player</th>
+            <th className="col-num">
+              <button className="lb-sort-btn" onClick={() => toggleSort("score")} type="button">Score <span>{sortGlyph("score")}</span></button>
+            </th>
+            <th className="col-num">
+              <button className="lb-sort-btn" onClick={() => toggleSort("accuracy")} type="button">Accuracy <span>{sortGlyph("accuracy")}</span></button>
+            </th>
+            <th className="col-num">
+              <button className="lb-sort-btn" onClick={() => toggleSort("cpm")} type="button">CPM <span>{sortGlyph("cpm")}</span></button>
+            </th>
+            {!isTablet && <th className="col-num">Streak</th>}
+            {!isTablet && (
+              <th className="col-date">
+                <button className="lb-sort-btn" onClick={() => toggleSort("date")} type="button">Date <span>{sortGlyph("date")}</span></button>
+              </th>
+            )}
+          </tr>
+        </thead>
+        <tbody>
+          {loading && renderSkeletonRows()}
+          {!loading && rows.length === 0 && (
+            <tr>
+              <td colSpan={isTablet ? 5 : 7}>
+                <div className="lb-empty">
+                  <Text>No results for current filters.</Text>
+                  <Button size="xs" variant="light" onClick={resetFilters}>Reset filters</Button>
+                </div>
+              </td>
+            </tr>
+          )}
+          {!loading && rows.map((entry, idx) => (
+            <tr key={entry.id}>
+              <td className="col-rank">{(page - 1) * pageSize + idx + 1}</td>
+              <td className="col-player">{entry.playerName}</td>
+              <td className="col-num">{entry.score}</td>
+              <td className="col-num">{Math.round(entry.accuracy)}%</td>
+              <td className="col-num">{entry.cpm}</td>
+              {!isTablet && <td className="col-num">{entry.maxStreak}</td>}
+              {!isTablet && <td className="col-date">{new Date(entry.createdAt).toLocaleDateString()}</td>}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+
+  const renderMobileList = () => (
+    <div className="lb-mobile-list">
+      {loading && Array.from({ length: 6 }, (_, i) => (
+        <div className="lb-mobile-item lb-mobile-skeleton" key={`m-s-${i}`}><div className="lb-skeleton-line" /></div>
+      ))}
+      {!loading && rows.length === 0 && (
+        <div className="lb-empty">
+          <Text>No results for current filters.</Text>
+          <Button size="xs" variant="light" onClick={resetFilters}>Reset filters</Button>
+        </div>
+      )}
+      {!loading && rows.map((entry, idx) => {
+        const key = Number(entry.id);
+        const open = Boolean(expandedRows[key]);
+        return (
+          <Card className="lb-mobile-item" key={entry.id} withBorder>
+            <button
+              type="button"
+              className="lb-mobile-head"
+              onClick={() => setExpandedRows((prev) => ({ ...prev, [key]: !open }))}
+            >
+              <span>#{(page - 1) * pageSize + idx + 1}</span>
+              <span className="lb-mobile-player">{entry.playerName}</span>
+              <span className="lb-mobile-score">{entry.score}</span>
+            </button>
+            {open && (
+              <div className="lb-mobile-details">
+                <span>Accuracy: {Math.round(entry.accuracy)}%</span>
+                <span>CPM: {entry.cpm}</span>
+                <span>Streak: {entry.maxStreak}</span>
+                <span>Date: {new Date(entry.createdAt).toLocaleDateString()}</span>
+              </div>
+            )}
+          </Card>
+        );
+      })}
+    </div>
+  );
 
   return (
     <div className="screen leaderboard">
-      <h2>Leaderboard</h2>
-      {typeof myRank === "number" && <Text size="sm">My rank: #{myRank}</Text>}
-      <div className="card">
-        <div className="filters">
-          <Select
-            label="Contest"
-            value={filters.contestType}
-            onChange={(value) => handleFilter("contestType", value || "time")}
-            data={[
-              { value: "time", label: "Time" },
-              { value: "tasks", label: "Tasks" }
-            ]}
-          />
-          <Select
-            label="Level"
-            value={String(filters.level)}
-            onChange={(value) => handleFilter("level", Number(value || 1))}
-            data={[1, 2, 3, 4, 5].map((lvl) => ({ value: String(lvl), label: String(lvl) }))}
-          />
-          <Select
-            label="Content"
-            value={filters.contentMode}
-            onChange={(value) => handleFilter("contentMode", value || "default")}
-            data={[
-              { value: "default", label: "Default" },
-              { value: "vocab", label: "Vocab Pack" }
-            ]}
-          />
-          {filters.contestType === "time" ? (
+      <div className="lb-heading">
+        <h2>Leaderboard</h2>
+        <Text size="sm" c="dimmed">Filter runs, sort columns, and compare performance at scale.</Text>
+        {typeof rankForUser === "number" && <Text size="sm">My rank: #{rankForUser}</Text>}
+      </div>
+      <div className="card lb-card">
+        <div className="lb-filter-bar">
+          <div className="lb-filter-grid">
             <Select
-              label="Duration"
-              value={String(filters.duration)}
-              onChange={(value) => handleFilter("duration", value || "60")}
+              label="Contest type"
+              value={filters.contestType}
+              onChange={(value) => handleFilter("contestType", value || "time")}
               data={[
-                { value: "30", label: "30" },
-                { value: "60", label: "60" },
-                { value: "120", label: "120" }
+                { value: "time", label: "Time" },
+                { value: "tasks", label: "Tasks" }
               ]}
             />
-          ) : (
+            {filters.contestType === "time" ? (
+              <Select
+                label="Duration"
+                value={String(filters.duration)}
+                onChange={(value) => handleFilter("duration", value || "60")}
+                data={[
+                  { value: "30", label: "30" },
+                  { value: "60", label: "60" },
+                  { value: "120", label: "120" }
+                ]}
+              />
+            ) : (
+              <Select
+                label="Task target"
+                value={String(filters.taskTarget)}
+                onChange={(value) => handleFilter("taskTarget", value || "20")}
+                data={[
+                  { value: "10", label: "10" },
+                  { value: "20", label: "20" },
+                  { value: "50", label: "50" }
+                ]}
+              />
+            )}
             <Select
-              label="Tasks"
-              value={String(filters.taskTarget)}
-              onChange={(value) => handleFilter("taskTarget", value || "20")}
+              label="Level"
+              value={String(filters.level)}
+              onChange={(value) => handleFilter("level", Number(value || 1))}
+              data={[1, 2, 3, 4, 5].map((lvl) => ({ value: String(lvl), label: String(lvl) }))}
+            />
+            <Select
+              label="Content"
+              value={filters.contentMode}
+              onChange={(value) => handleFilter("contentMode", value || "default")}
               data={[
-                { value: "10", label: "10" },
-                { value: "20", label: "20" },
-                { value: "50", label: "50" }
+                { value: "default", label: "Default" },
+                { value: "vocab", label: "Vocab Pack" }
               ]}
             />
-          )}
-        </div>
-        <div className="leaderboard-table">
-          <div className="row header">
-            <div>Rank</div>
-            <div>Name</div>
-            <div>Score</div>
-            <div>Accuracy</div>
-            <div>CPM</div>
-            <div>Streak</div>
+            <Select
+              label="Language"
+              value={filters.language}
+              onChange={(value) => handleFilter("language", value || "all")}
+              data={[
+                { value: "all", label: "All" },
+                ...availableLanguages.map((lang) => ({ value: lang, label: lang.toUpperCase() }))
+              ]}
+            />
+            <Select
+              label="Date range"
+              value={filters.dateRange}
+              onChange={(value) => handleFilter("dateRange", value || "all")}
+              data={[
+                { value: "all", label: "All time" },
+                { value: "7d", label: "Last 7 days" },
+                { value: "30d", label: "Last 30 days" }
+              ]}
+            />
           </div>
-          {entries.map((entry, idx) => (
-            <div className="row" key={entry.id}>
-              <div>#{idx + 1}</div>
-              <div>{entry.playerName}</div>
-              <div>{entry.score}</div>
-              <div>{Math.round(entry.accuracy)}%</div>
-              <div>{entry.cpm}</div>
-              <div>{entry.maxStreak}</div>
-            </div>
-          ))}
+          <div className="lb-filter-actions">
+            <Button variant="default" onClick={resetFilters}>Reset filters</Button>
+            <Button variant="light" onClick={() => void copyShareUrl()}>Share</Button>
+          </div>
+        </div>
+
+        {!isMobile ? renderDesktopTable() : renderMobileList()}
+
+        <div className="lb-pagination">
+          <div className="lb-pagination-left">
+            <span>Total: {total}</span>
+            <Select
+              label="Rows per page"
+              value={String(pageSize)}
+              onChange={(value) => { setPageSize(Number(value || 20)); setPage(1); }}
+              data={[10, 20, 50].map((n) => ({ value: String(n), label: String(n) }))}
+            />
+          </div>
+          <div className="lb-pagination-right">
+            <Button size="xs" variant="default" disabled={page <= 1} onClick={() => setPage((p) => Math.max(1, p - 1))}>Prev</Button>
+            <span>Page {Math.min(page, totalPages)} / {totalPages}</span>
+            <Button size="xs" variant="default" disabled={page >= totalPages} onClick={() => setPage((p) => Math.min(totalPages, p + 1))}>Next</Button>
+          </div>
         </div>
       </div>
-      {statusMessage && <div className="status">{statusMessage}</div>}
+      {(errorText || shareStatus) && <div className="status">{errorText || shareStatus}</div>}
       <Button variant="light" onClick={onBack}>Back</Button>
     </div>
   );
