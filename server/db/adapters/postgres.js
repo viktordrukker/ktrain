@@ -681,7 +681,11 @@ class PostgresAdapter {
     const totalResult = await this.pool.query(`SELECT COUNT(*)::int as c FROM vocabulary_packs ${where}`, params);
     const total = Number(totalResult.rows[0]?.c || 0);
     const { rows } = await this.pool.query(
-      `SELECT * FROM vocabulary_packs ${where} ORDER BY ${sortBy} ${sortDir}, id ASC LIMIT $${i++} OFFSET $${i++}`,
+      `SELECT p.*,
+              (SELECT COUNT(*)::int FROM vocabulary_entries e WHERE e.pack_id = p.id) AS entry_count
+       FROM vocabulary_packs p
+       ${where.replace(/WHERE /, "WHERE ")}
+       ORDER BY ${sortBy} ${sortDir}, id ASC LIMIT $${i++} OFFSET $${i++}`,
       [...params, pageSize, offset]
     );
     return { rows, total, page, pageSize };
