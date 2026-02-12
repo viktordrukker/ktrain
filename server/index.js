@@ -16,6 +16,7 @@ const path = require("path");
 const fs = require("fs");
 const { exec } = require("child_process");
 const { promisify } = require("util");
+const { randomUUID } = require("crypto");
 const { initDb, createAdapter, resolveDriver, DB_DRIVER_ENV, resolveDbConfig, sanitizeDbConfig, testPostgresConfig, getMigrationStatus, rollbackLastMigration } = require("./db");
 const { loadSettings, saveSettings } = require("./settings");
 const { readRuntimeConfig, writeRuntimeConfig, RUNTIME_CONFIG_PATH } = require("./db/runtime-config");
@@ -332,6 +333,31 @@ function dayDiffUtc(aKey, bKey) {
   const a = new Date(`${aKey}T00:00:00.000Z`).getTime();
   const b = new Date(`${bKey}T00:00:00.000Z`).getTime();
   return Math.round((a - b) / 86400000);
+}
+
+function normalizeVocabularyType(input = "words") {
+  const value = String(input || "words").toLowerCase();
+  if (["words", "sentences", "fiction", "code"].includes(value)) return value;
+  if (value === "level2" || value === "level3") return "words";
+  if (value === "sentence_words") return "sentences";
+  return "words";
+}
+
+function normalizeVocabularyStatus(input = "draft") {
+  const value = String(input || "draft").toLowerCase();
+  if (["draft", "published", "archived"].includes(value)) return value;
+  if (value === "DRAFT") return "draft";
+  if (value === "PUBLISHED") return "published";
+  if (value === "ARCHIVED") return "archived";
+  return "draft";
+}
+
+function safeParseJson(input, fallback) {
+  try {
+    return input ? JSON.parse(input) : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 function setSessionCookie(res, token, expiresAt) {
@@ -1454,6 +1480,343 @@ app.post("/api/admin/language-packs/generate", requirePermission(Permissions.VOC
   await repo.replaceLanguagePackItems(packId, items.map((text) => ({ text, difficulty: null, metadataJson: { source: "openai" } })));
   await audit(req, "language_pack.generate", "pack", String(packId), { language, type, count: items.length });
   res.json({ ok: true, packId, status: "DRAFT", count: items.length });
+}));
+
+app.get("/api/admin/vocabulary/generator/status", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const key = await getOpenAIKeyForActor(req.actor);
+  res.json({ ok: true, enabled: Boolean(key), defaultModel: OPENAI_MODEL });
+}));
+
+app.get("/api/admin/vocabulary/tree", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const language = req.query.language ? String(req.query.language).toLowerCase() : "";
+  const status = req.query.status ? String(req.query.status).toLowerCase() : "";
+  const packs = await repo.listVocabularyPacks({ language, status }, { page: 1, pageSize: 5000, sortBy: "updated_at", sortDir: "desc" });
+  const tree = {};
+  for (const row of packs.rows || []) {
+    const lang = String(row.language || "en").toUpperCase();
+    const levelKey = `Level ${Number(row.level || 1)}`;
+    tree[lang] = tree[lang] || {};
+    tree[lang][levelKey] = tree[lang][levelKey] || [];
+    tree[lang][levelKey].push({
+      id: row.id,
+      name: row.name,
+      status: normalizeVocabularyStatus(row.status),
+      version: Number(row.version || 1),
+      type: normalizeVocabularyType(row.type),
+      updatedAt: row.updated_at || row.updatedAt
+    });
+  }
+  res.json({ ok: true, tree });
+}));
+
+app.get("/api/admin/vocabulary/packs", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const filters = {
+    language: req.query.language ? String(req.query.language).toLowerCase() : "",
+    level: req.query.level ? clampNumber(req.query.level, 1, 5, 1) : 0,
+    type: req.query.type ? normalizeVocabularyType(req.query.type) : "",
+    status: req.query.status ? normalizeVocabularyStatus(req.query.status) : "",
+    source: req.query.source ? String(req.query.source).toLowerCase() : "",
+    search: req.query.search ? String(req.query.search) : ""
+  };
+  const options = {
+    sortBy: req.query.sort ? String(req.query.sort) : "updated_at",
+    sortDir: req.query.order ? String(req.query.order) : "desc",
+    page: clampNumber(req.query.page, 1, 10000, 1),
+    pageSize: clampNumber(req.query.pageSize, 5, 100, 20)
+  };
+  const result = await repo.listVocabularyPacks(filters, options);
+  const rows = (result.rows || []).map((row) => ({
+    id: row.id,
+    name: row.name,
+    language: String(row.language || "en").toLowerCase(),
+    level: Number(row.level || 1),
+    type: normalizeVocabularyType(row.type),
+    status: normalizeVocabularyStatus(row.status),
+    source: String(row.source || "manual").toLowerCase(),
+    version: Number(row.version || 1),
+    generator_config: typeof row.generator_config === "string" ? safeParseJson(row.generator_config, null) : (row.generator_config || null),
+    metadata: typeof row.metadata === "string" ? safeParseJson(row.metadata, null) : (row.metadata || null),
+    created_at: row.created_at || row.createdAt,
+    updated_at: row.updated_at || row.updatedAt
+  }));
+  res.json({ ok: true, rows, total: Number(result.total || rows.length), page: Number(result.page || options.page), pageSize: Number(result.pageSize || options.pageSize) });
+}));
+
+app.get("/api/admin/vocabulary/packs/:id", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const id = String(req.params.id || "");
+  const pack = await repo.getVocabularyPackById(id);
+  if (!pack) throw new AppError("Not found", { status: 404, code: "NOT_FOUND", expose: true });
+  const entries = await repo.listVocabularyEntries(id);
+  const versions = await repo.listVocabularyVersions(id);
+  res.json({
+    ok: true,
+    pack: {
+      ...pack,
+      type: normalizeVocabularyType(pack.type),
+      status: normalizeVocabularyStatus(pack.status),
+      generator_config: typeof pack.generator_config === "string" ? safeParseJson(pack.generator_config, null) : pack.generator_config,
+      metadata: typeof pack.metadata === "string" ? safeParseJson(pack.metadata, null) : pack.metadata
+    },
+    entries,
+    versions
+  });
+}));
+
+app.post("/api/admin/vocabulary/packs", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const body = requireObject(req.body || {}, "body");
+  const now = new Date().toISOString();
+  const id = randomUUID();
+  const pack = {
+    id,
+    name: asString(body.name || "Untitled Pack", { min: 2, max: 120, field: "name" }),
+    language: asString(body.language || "en", { min: 2, max: 10, field: "language" }).toLowerCase(),
+    level: asNumber(body.level || 1, { min: 1, max: 5, field: "level" }),
+    type: normalizeVocabularyType(body.type),
+    status: normalizeVocabularyStatus(body.status || "draft"),
+    source: ["manual", "openai", "imported"].includes(String(body.source || "").toLowerCase()) ? String(body.source).toLowerCase() : "manual",
+    version: 1,
+    generator_config: body.generator_config || null,
+    metadata: body.metadata || null,
+    created_at: now,
+    updated_at: now
+  };
+  const entries = Array.isArray(body.entries) ? body.entries : [];
+  await repo.createVocabularyPack(pack);
+  await repo.replaceVocabularyEntries(id, entries.map((entry, idx) => ({
+    id: randomUUID(),
+    text: String(entry.text || "").trim(),
+    order_index: idx,
+    difficulty_score: entry.difficulty_score ?? null,
+    tags: entry.tags || null,
+    created_at: now
+  })).filter((e) => e.text));
+  const versionSnapshot = {
+    pack,
+    entries: await repo.listVocabularyEntries(id)
+  };
+  await repo.createVocabularyVersion({
+    id: randomUUID(),
+    pack_id: id,
+    version: 1,
+    snapshot_json: versionSnapshot,
+    change_note: "initial create",
+    created_by: String(req.actor?.id || ""),
+    created_at: now
+  });
+  await audit(req, "vocabulary.pack.create", "vocabulary_pack", id, { language: pack.language, level: pack.level, type: pack.type, status: pack.status });
+  res.json({ ok: true, id });
+}));
+
+app.put("/api/admin/vocabulary/packs/:id", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const id = String(req.params.id || "");
+  const body = requireObject(req.body || {}, "body");
+  const existing = await repo.getVocabularyPackById(id);
+  if (!existing) throw new AppError("Not found", { status: 404, code: "NOT_FOUND", expose: true });
+  const nextVersion = Number(existing.version || 1) + 1;
+  const patch = {
+    name: body.name ? asString(body.name, { min: 2, max: 120, field: "name" }) : existing.name,
+    language: body.language ? asString(body.language, { min: 2, max: 10, field: "language" }).toLowerCase() : existing.language,
+    level: body.level ? asNumber(body.level, { min: 1, max: 5, field: "level" }) : existing.level,
+    type: body.type ? normalizeVocabularyType(body.type) : existing.type,
+    status: body.status ? normalizeVocabularyStatus(body.status) : existing.status,
+    source: body.source ? String(body.source).toLowerCase() : existing.source,
+    generator_config: body.generator_config !== undefined ? body.generator_config : safeParseJson(existing.generator_config, null),
+    metadata: body.metadata !== undefined ? body.metadata : safeParseJson(existing.metadata, null),
+    version: nextVersion
+  };
+  await repo.updateVocabularyPack(id, patch);
+  if (Array.isArray(body.entries)) {
+    const now = new Date().toISOString();
+    await repo.replaceVocabularyEntries(id, body.entries.map((entry, idx) => ({
+      id: entry.id || randomUUID(),
+      text: String(entry.text || "").trim(),
+      order_index: idx,
+      difficulty_score: entry.difficulty_score ?? null,
+      tags: entry.tags || null,
+      created_at: entry.created_at || now
+    })).filter((e) => e.text));
+  }
+  const snapshot = {
+    pack: await repo.getVocabularyPackById(id),
+    entries: await repo.listVocabularyEntries(id)
+  };
+  await repo.createVocabularyVersion({
+    id: randomUUID(),
+    pack_id: id,
+    version: nextVersion,
+    snapshot_json: snapshot,
+    change_note: String(body.change_note || "edited"),
+    created_by: String(req.actor?.id || ""),
+    created_at: new Date().toISOString()
+  });
+  await audit(req, "vocabulary.pack.update", "vocabulary_pack", id, { version: nextVersion });
+  res.json({ ok: true });
+}));
+
+app.post("/api/admin/vocabulary/packs/:id/publish", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const id = String(req.params.id || "");
+  const pack = await repo.getVocabularyPackById(id);
+  if (!pack) throw new AppError("Not found", { status: 404, code: "NOT_FOUND", expose: true });
+  await repo.updateVocabularyPack(id, { status: "published", version: Number(pack.version || 1) + 1 });
+  await audit(req, "vocabulary.pack.publish", "vocabulary_pack", id);
+  res.json({ ok: true });
+}));
+
+app.post("/api/admin/vocabulary/packs/:id/unpublish", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const id = String(req.params.id || "");
+  const pack = await repo.getVocabularyPackById(id);
+  if (!pack) throw new AppError("Not found", { status: 404, code: "NOT_FOUND", expose: true });
+  await repo.updateVocabularyPack(id, { status: "draft", version: Number(pack.version || 1) + 1 });
+  await audit(req, "vocabulary.pack.unpublish", "vocabulary_pack", id);
+  res.json({ ok: true });
+}));
+
+app.post("/api/admin/vocabulary/packs/:id/rollback", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const id = String(req.params.id || "");
+  const targetVersion = asNumber(req.body?.version || 0, { min: 1, max: 100000, field: "version" });
+  const versions = await repo.listVocabularyVersions(id);
+  const selected = versions.find((v) => Number(v.version) === Number(targetVersion));
+  if (!selected) throw new AppError("Version not found", { status: 404, code: "NOT_FOUND", expose: true });
+  const snap = selected.snapshot_json || {};
+  if (!snap.pack) throw new AppError("Snapshot invalid", { status: 400, code: "INVALID_SNAPSHOT", expose: true });
+  await repo.updateVocabularyPack(id, {
+    name: snap.pack.name,
+    language: snap.pack.language,
+    level: snap.pack.level,
+    type: normalizeVocabularyType(snap.pack.type),
+    status: normalizeVocabularyStatus(snap.pack.status || "draft"),
+    source: snap.pack.source || "manual",
+    generator_config: snap.pack.generator_config || null,
+    metadata: snap.pack.metadata || null,
+    version: Number((await repo.getVocabularyPackById(id)).version || 1) + 1
+  });
+  const now = new Date().toISOString();
+  await repo.replaceVocabularyEntries(id, (snap.entries || []).map((entry, idx) => ({
+    id: randomUUID(),
+    text: String(entry.text || "").trim(),
+    order_index: idx,
+    difficulty_score: entry.difficulty_score ?? null,
+    tags: entry.tags || null,
+    created_at: now
+  })).filter((e) => e.text));
+  await audit(req, "vocabulary.pack.rollback", "vocabulary_pack", id, { version: targetVersion });
+  res.json({ ok: true });
+}));
+
+app.delete("/api/admin/vocabulary/packs/:id", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const id = String(req.params.id || "");
+  await repo.deleteVocabularyPack(id);
+  await audit(req, "vocabulary.pack.delete", "vocabulary_pack", id);
+  res.json({ ok: true });
+}));
+
+app.get("/api/admin/vocabulary/packs/:id/export", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const id = String(req.params.id || "");
+  const pack = await repo.getVocabularyPackById(id);
+  if (!pack) throw new AppError("Not found", { status: 404, code: "NOT_FOUND", expose: true });
+  const entries = await repo.listVocabularyEntries(id);
+  const payload = {
+    pack: {
+      ...pack,
+      generator_config: typeof pack.generator_config === "string" ? safeParseJson(pack.generator_config, null) : pack.generator_config,
+      metadata: typeof pack.metadata === "string" ? safeParseJson(pack.metadata, null) : pack.metadata
+    },
+    entries
+  };
+  res.json({ ok: true, payload });
+}));
+
+app.post("/api/admin/vocabulary/import", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const body = requireObject(req.body || {}, "body");
+  const payload = requireObject(body.payload || {}, "payload");
+  const incomingPack = requireObject(payload.pack || {}, "pack");
+  const now = new Date().toISOString();
+  const id = randomUUID();
+  const pack = {
+    id,
+    name: asString(incomingPack.name || "Imported Pack", { min: 2, max: 120, field: "name" }),
+    language: asString(incomingPack.language || "en", { min: 2, max: 10, field: "language" }).toLowerCase(),
+    level: asNumber(incomingPack.level || 1, { min: 1, max: 5, field: "level" }),
+    type: normalizeVocabularyType(incomingPack.type),
+    status: normalizeVocabularyStatus(incomingPack.status || "draft"),
+    source: "imported",
+    version: 1,
+    generator_config: incomingPack.generator_config || null,
+    metadata: incomingPack.metadata || null,
+    created_at: now,
+    updated_at: now
+  };
+  const entries = Array.isArray(payload.entries) ? payload.entries : [];
+  await repo.createVocabularyPack(pack);
+  await repo.replaceVocabularyEntries(id, entries.map((entry, idx) => ({
+    id: randomUUID(),
+    text: String(entry.text || "").trim(),
+    order_index: idx,
+    difficulty_score: entry.difficulty_score ?? null,
+    tags: entry.tags || null,
+    created_at: now
+  })).filter((e) => e.text));
+  await repo.createVocabularyVersion({
+    id: randomUUID(),
+    pack_id: id,
+    version: 1,
+    snapshot_json: { pack, entries: await repo.listVocabularyEntries(id) },
+    change_note: "import",
+    created_by: String(req.actor?.id || ""),
+    created_at: now
+  });
+  await audit(req, "vocabulary.pack.import", "vocabulary_pack", id, { source: "imported" });
+  res.json({ ok: true, id });
+}));
+
+app.post("/api/admin/vocabulary/packs/:id/regenerate", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, generationLimiter, withAsync(async (req, res) => {
+  const id = String(req.params.id || "");
+  const pack = await repo.getVocabularyPackById(id);
+  if (!pack) throw new AppError("Not found", { status: 404, code: "NOT_FOUND", expose: true });
+  const keyToUse = await getOpenAIKeyForActor(req.actor);
+  if (!keyToUse) throw new AppError("OpenAI key missing", { status: 400, code: "OPENAI_KEY_MISSING", expose: true });
+  const body = requireObject(req.body || {}, "body");
+  const count = asNumber(body.count || 30, { min: 5, max: 500, field: "count" });
+  const promptTemplate = String(body.prompt_template || `Generate ${count} safe ${pack.type} for ${pack.language} level ${pack.level}. Return STRICT JSON: {"items":["..."]}`);
+  const output = await callOpenAI({ apiKey: keyToUse, prompt: promptTemplate });
+  const parsed = safeParseJson(output, null);
+  if (!parsed || !Array.isArray(parsed.items)) throw new AppError("Generator output is invalid JSON items array", { status: 400, code: "GEN_INVALID_OUTPUT", expose: true });
+  const now = new Date().toISOString();
+  await repo.updateVocabularyPack(id, {
+    source: "openai",
+    version: Number(pack.version || 1) + 1,
+    generator_config: {
+      model: body.model || OPENAI_MODEL,
+      prompt_template: promptTemplate,
+      temperature: body.temperature ?? 0.7,
+      max_tokens: body.max_tokens ?? null,
+      theme: body.theme || null,
+      random_seed: body.random_seed || null,
+      advanced: body.advanced || null
+    }
+  });
+  await repo.replaceVocabularyEntries(id, parsed.items.map((text, idx) => ({
+    id: randomUUID(),
+    text: String(text || "").trim(),
+    order_index: idx,
+    difficulty_score: null,
+    tags: null,
+    created_at: now
+  })).filter((e) => e.text));
+  await repo.createVocabularyVersion({
+    id: randomUUID(),
+    pack_id: id,
+    version: Number(pack.version || 1) + 1,
+    snapshot_json: {
+      pack: await repo.getVocabularyPackById(id),
+      entries: await repo.listVocabularyEntries(id)
+    },
+    change_note: "regenerate draft",
+    created_by: String(req.actor?.id || ""),
+    created_at: now
+  });
+  await audit(req, "vocabulary.pack.regenerate", "vocabulary_pack", id, { count });
+  res.json({ ok: true });
 }));
 
 app.get("/api/live/stats", requirePermission(Permissions.TASKS_GENERATE), withAsync(async (req, res) => {

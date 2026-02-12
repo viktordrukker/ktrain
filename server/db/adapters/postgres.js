@@ -652,6 +652,149 @@ class PostgresAdapter {
     return rows.map((row) => ({ ...row, metadataJson: row.metadatajson ? JSON.parse(row.metadatajson) : null }));
   }
 
+  async listVocabularyPacks(filters = {}, options = {}) {
+    const params = [];
+    let i = 1;
+    let where = "WHERE 1=1";
+    if (filters.language) { where += ` AND language = $${i++}`; params.push(filters.language); }
+    if (filters.level) { where += ` AND level = $${i++}`; params.push(Number(filters.level)); }
+    if (filters.type) { where += ` AND type = $${i++}`; params.push(filters.type); }
+    if (filters.status) { where += ` AND status = $${i++}`; params.push(filters.status); }
+    if (filters.source) { where += ` AND source = $${i++}`; params.push(filters.source); }
+    if (filters.search) { where += ` AND (name ILIKE $${i++} OR id ILIKE $${i++})`; params.push(`%${filters.search}%`, `%${filters.search}%`); }
+    const sortable = {
+      name: "name",
+      language: "language",
+      level: "level",
+      type: "type",
+      status: "status",
+      source: "source",
+      version: "version",
+      updated: "updated_at",
+      updated_at: "updated_at"
+    };
+    const sortBy = sortable[options.sortBy] || "updated_at";
+    const sortDir = String(options.sortDir || "desc").toLowerCase() === "asc" ? "ASC" : "DESC";
+    const page = Math.max(1, Number(options.page || 1));
+    const pageSize = Math.max(5, Math.min(100, Number(options.pageSize || 20)));
+    const offset = (page - 1) * pageSize;
+    const totalResult = await this.pool.query(`SELECT COUNT(*)::int as c FROM vocabulary_packs ${where}`, params);
+    const total = Number(totalResult.rows[0]?.c || 0);
+    const { rows } = await this.pool.query(
+      `SELECT * FROM vocabulary_packs ${where} ORDER BY ${sortBy} ${sortDir}, id ASC LIMIT $${i++} OFFSET $${i++}`,
+      [...params, pageSize, offset]
+    );
+    return { rows, total, page, pageSize };
+  }
+
+  async getVocabularyPackById(id) {
+    const { rows } = await this.pool.query("SELECT * FROM vocabulary_packs WHERE id = $1 LIMIT 1", [id]);
+    return rows[0] || null;
+  }
+
+  async createVocabularyPack(payload) {
+    await this.pool.query(
+      `INSERT INTO vocabulary_packs
+      (id, name, language, level, type, status, source, version, generator_config, metadata, created_at, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      [
+        payload.id,
+        payload.name,
+        payload.language,
+        payload.level,
+        payload.type,
+        payload.status,
+        payload.source,
+        payload.version || 1,
+        payload.generator_config ? JSON.stringify(payload.generator_config) : null,
+        payload.metadata ? JSON.stringify(payload.metadata) : null,
+        payload.created_at,
+        payload.updated_at
+      ]
+    );
+  }
+
+  async updateVocabularyPack(id, patch = {}) {
+    const current = await this.getVocabularyPackById(id);
+    if (!current) return null;
+    const next = {
+      ...current,
+      ...patch,
+      updated_at: nowIso()
+    };
+    await this.pool.query(
+      `UPDATE vocabulary_packs
+       SET name = $1, language = $2, level = $3, type = $4, status = $5, source = $6, version = $7, generator_config = $8, metadata = $9, updated_at = $10
+       WHERE id = $11`,
+      [
+        next.name,
+        next.language,
+        next.level,
+        next.type,
+        next.status,
+        next.source,
+        next.version,
+        next.generator_config ? JSON.stringify(next.generator_config) : null,
+        next.metadata ? JSON.stringify(next.metadata) : null,
+        next.updated_at,
+        id
+      ]
+    );
+    return this.getVocabularyPackById(id);
+  }
+
+  async deleteVocabularyPack(id) {
+    await this.pool.query("DELETE FROM vocabulary_packs WHERE id = $1", [id]);
+  }
+
+  async replaceVocabularyEntries(packId, entries = []) {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("DELETE FROM vocabulary_entries WHERE pack_id = $1", [packId]);
+      for (const row of entries) {
+        await client.query(
+          `INSERT INTO vocabulary_entries (id, pack_id, text, order_index, difficulty_score, tags, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+          [row.id, packId, row.text, row.order_index, row.difficulty_score ?? null, row.tags ? JSON.stringify(row.tags) : null, row.created_at]
+        );
+      }
+      await client.query("UPDATE vocabulary_packs SET updated_at = $1 WHERE id = $2", [nowIso(), packId]);
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async listVocabularyEntries(packId) {
+    const { rows } = await this.pool.query("SELECT * FROM vocabulary_entries WHERE pack_id = $1 ORDER BY order_index ASC, created_at ASC", [packId]);
+    return rows.map((row) => ({ ...row, tags: row.tags ? JSON.parse(row.tags) : null }));
+  }
+
+  async createVocabularyVersion(versionRow) {
+    await this.pool.query(
+      `INSERT INTO vocabulary_pack_versions (id, pack_id, version, snapshot_json, change_note, created_by, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [
+        versionRow.id,
+        versionRow.pack_id,
+        versionRow.version,
+        JSON.stringify(versionRow.snapshot_json),
+        versionRow.change_note || null,
+        versionRow.created_by || null,
+        versionRow.created_at
+      ]
+    );
+  }
+
+  async listVocabularyVersions(packId) {
+    const { rows } = await this.pool.query("SELECT * FROM vocabulary_pack_versions WHERE pack_id = $1 ORDER BY version DESC, created_at DESC", [packId]);
+    return rows.map((row) => ({ ...row, snapshot_json: row.snapshot_json ? JSON.parse(row.snapshot_json) : null }));
+  }
+
   async upsertActiveSession({ sessionId, userId, mode, isAuthorized }) {
     const now = nowIso();
     await this.pool.query(

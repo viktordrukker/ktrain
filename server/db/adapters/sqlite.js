@@ -575,6 +575,143 @@ class SqliteAdapter {
     `).all(language, type).map((row) => ({ ...row, metadataJson: row.metadataJson ? JSON.parse(row.metadataJson) : null }));
   }
 
+  async listVocabularyPacks(filters = {}, options = {}) {
+    const params = [];
+    let where = "WHERE 1=1";
+    if (filters.language) { where += " AND language = ?"; params.push(filters.language); }
+    if (filters.level) { where += " AND level = ?"; params.push(Number(filters.level)); }
+    if (filters.type) { where += " AND type = ?"; params.push(filters.type); }
+    if (filters.status) { where += " AND status = ?"; params.push(filters.status); }
+    if (filters.source) { where += " AND source = ?"; params.push(filters.source); }
+    if (filters.search) { where += " AND (name LIKE ? OR id LIKE ?)"; params.push(`%${filters.search}%`, `%${filters.search}%`); }
+    const sortable = {
+      name: "name",
+      language: "language",
+      level: "level",
+      type: "type",
+      status: "status",
+      source: "source",
+      version: "version",
+      updated: "updated_at",
+      updated_at: "updated_at"
+    };
+    const sortBy = sortable[options.sortBy] || "updated_at";
+    const sortDir = String(options.sortDir || "desc").toLowerCase() === "asc" ? "ASC" : "DESC";
+    const page = Math.max(1, Number(options.page || 1));
+    const pageSize = Math.max(5, Math.min(100, Number(options.pageSize || 20)));
+    const offset = (page - 1) * pageSize;
+    const total = Number(this.db.prepare(`SELECT COUNT(*) as c FROM vocabulary_packs ${where}`).get(...params)?.c || 0);
+    const rows = this.db.prepare(`SELECT * FROM vocabulary_packs ${where} ORDER BY ${sortBy} ${sortDir}, id ASC LIMIT ? OFFSET ?`).all(...params, pageSize, offset);
+    return { rows, total, page, pageSize };
+  }
+
+  async getVocabularyPackById(id) {
+    return this.db.prepare("SELECT * FROM vocabulary_packs WHERE id = ? LIMIT 1").get(id) || null;
+  }
+
+  async createVocabularyPack(payload) {
+    this.db.prepare(`
+      INSERT INTO vocabulary_packs
+      (id, name, language, level, type, status, source, version, generator_config, metadata, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      payload.id,
+      payload.name,
+      payload.language,
+      payload.level,
+      payload.type,
+      payload.status,
+      payload.source,
+      payload.version || 1,
+      payload.generator_config ? JSON.stringify(payload.generator_config) : null,
+      payload.metadata ? JSON.stringify(payload.metadata) : null,
+      payload.created_at,
+      payload.updated_at
+    );
+  }
+
+  async updateVocabularyPack(id, patch = {}) {
+    const current = await this.getVocabularyPackById(id);
+    if (!current) return null;
+    const next = {
+      ...current,
+      ...patch,
+      generator_config: patch.generator_config === undefined ? current.generator_config : JSON.stringify(patch.generator_config || null),
+      metadata: patch.metadata === undefined ? current.metadata : JSON.stringify(patch.metadata || null),
+      updated_at: nowIso()
+    };
+    this.db.prepare(`
+      UPDATE vocabulary_packs
+      SET name = ?, language = ?, level = ?, type = ?, status = ?, source = ?, version = ?, generator_config = ?, metadata = ?, updated_at = ?
+      WHERE id = ?
+    `).run(
+      next.name,
+      next.language,
+      next.level,
+      next.type,
+      next.status,
+      next.source,
+      next.version,
+      next.generator_config,
+      next.metadata,
+      next.updated_at,
+      id
+    );
+    return this.getVocabularyPackById(id);
+  }
+
+  async deleteVocabularyPack(id) {
+    this.db.prepare("DELETE FROM vocabulary_packs WHERE id = ?").run(id);
+  }
+
+  async replaceVocabularyEntries(packId, entries = []) {
+    const tx = this.db.transaction(() => {
+      this.db.prepare("DELETE FROM vocabulary_entries WHERE pack_id = ?").run(packId);
+      const stmt = this.db.prepare(`
+        INSERT INTO vocabulary_entries (id, pack_id, text, order_index, difficulty_score, tags, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const row of entries) {
+        stmt.run(
+          row.id,
+          packId,
+          row.text,
+          row.order_index,
+          row.difficulty_score ?? null,
+          row.tags ? JSON.stringify(row.tags) : null,
+          row.created_at
+        );
+      }
+      this.db.prepare("UPDATE vocabulary_packs SET updated_at = ? WHERE id = ?").run(nowIso(), packId);
+    });
+    tx();
+  }
+
+  async listVocabularyEntries(packId) {
+    return this.db.prepare("SELECT * FROM vocabulary_entries WHERE pack_id = ? ORDER BY order_index ASC, created_at ASC").all(packId)
+      .map((row) => ({ ...row, tags: row.tags ? JSON.parse(row.tags) : null }));
+  }
+
+  async createVocabularyVersion(versionRow) {
+    this.db.prepare(`
+      INSERT INTO vocabulary_pack_versions (id, pack_id, version, snapshot_json, change_note, created_by, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      versionRow.id,
+      versionRow.pack_id,
+      versionRow.version,
+      JSON.stringify(versionRow.snapshot_json),
+      versionRow.change_note || null,
+      versionRow.created_by || null,
+      versionRow.created_at
+    );
+  }
+
+  async listVocabularyVersions(packId) {
+    return this.db.prepare("SELECT * FROM vocabulary_pack_versions WHERE pack_id = ? ORDER BY version DESC, created_at DESC").all(packId)
+      .map((row) => ({ ...row, snapshot_json: row.snapshot_json ? JSON.parse(row.snapshot_json) : null }));
+  }
+
   async upsertActiveSession({ sessionId, userId, mode, isAuthorized }) {
     const now = nowIso();
     this.db.prepare(`
