@@ -148,6 +148,43 @@ class PostgresAdapter {
     return rows;
   }
 
+  async queryLeaderboardPage(filters = {}, options = {}) {
+    const params = [];
+    let i = 1;
+    let where = "WHERE 1=1";
+    if (filters.contestType) { where += ` AND contestType = $${i++}`; params.push(filters.contestType); }
+    if (filters.level) { where += ` AND level = $${i++}`; params.push(Number(filters.level)); }
+    if (filters.contentMode) { where += ` AND contentMode = $${i++}`; params.push(filters.contentMode); }
+    if (filters.duration && filters.contestType === "time") { where += ` AND duration = $${i++}`; params.push(Number(filters.duration)); }
+    if (filters.taskTarget && filters.contestType === "tasks") { where += ` AND taskTarget = $${i++}`; params.push(Number(filters.taskTarget)); }
+    if (filters.onlyAuthorized) { where += " AND isGuest = 0"; }
+    if (filters.language) { where += ` AND language = $${i++}`; params.push(filters.language); }
+    if (filters.createdAfter) { where += ` AND createdAt >= $${i++}`; params.push(filters.createdAfter); }
+
+    const sortable = {
+      score: "score",
+      accuracy: "accuracy",
+      cpm: "cpm",
+      date: "createdAt",
+      createdAt: "createdAt"
+    };
+    const sortBy = sortable[options.sortBy] || "score";
+    const sortDir = String(options.sortDir || "desc").toLowerCase() === "asc" ? "ASC" : "DESC";
+    const page = Math.max(1, Number(options.page || 1));
+    const pageSize = Math.max(5, Math.min(100, Number(options.pageSize || 20)));
+    const offset = (page - 1) * pageSize;
+
+    const countResult = await this.pool.query(`SELECT COUNT(*)::int as c FROM leaderboard ${where}`, params);
+    const total = Number(countResult.rows[0]?.c || 0);
+
+    const { rows } = await this.pool.query(
+      `SELECT * FROM leaderboard ${where}
+       ORDER BY ${sortBy} ${sortDir}, id ASC
+       LIMIT $${i++} OFFSET $${i++}`,
+      [...params, pageSize, offset]
+    );
+    return { rows, total, page, pageSize };
+  }
   async getGamePreferences(userId) {
     const { rows } = await this.pool.query("SELECT * FROM game_preferences WHERE userId = $1 LIMIT 1", [userId]);
     return rows[0] || null;
