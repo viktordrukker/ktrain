@@ -148,7 +148,7 @@ type ClientErrorTrace = {
   details?: any;
 };
 
-type Screen = "home" | "game" | "results" | "leaderboard" | "settings" | "about";
+type Screen = "home" | "game" | "results" | "leaderboard" | "settings" | "about" | "vocabulary";
 
 type GameSettings = {
   mode: Mode;
@@ -260,6 +260,30 @@ type PublicVersion = {
   website?: string;
   contact?: string;
   appMode?: string;
+};
+
+type VocabularyPackRow = {
+  id: string;
+  name: string;
+  language: string;
+  level: number;
+  type: "words" | "sentences" | "fiction" | "code";
+  status: "draft" | "published" | "archived";
+  source: "manual" | "openai" | "imported";
+  version: number;
+  generator_config?: any;
+  metadata?: any;
+  created_at?: string;
+  updated_at?: string;
+};
+
+type VocabularyEntryRow = {
+  id: string;
+  text: string;
+  order_index: number;
+  difficulty_score?: number | null;
+  tags?: any;
+  created_at?: string;
 };
 
 const SOUND_PREF_KEY = "ktrain_sound_enabled";
@@ -929,6 +953,93 @@ const API = {
     if (!res.ok) throw await parseApiError(res, "Failed to save Google auth settings");
     return res.json();
   },
+  async getVocabularyGeneratorStatus() {
+    const res = await fetch("/api/admin/vocabulary/generator/status", { headers: withAuthHeaders() });
+    if (!res.ok) throw await parseApiError(res, "Failed to load generator status");
+    return res.json();
+  },
+  async getVocabularyTree(filters: any = {}) {
+    const params = new URLSearchParams(filters).toString();
+    const res = await fetch(`/api/admin/vocabulary/tree?${params}`, { headers: withAuthHeaders() });
+    if (!res.ok) throw await parseApiError(res, "Failed to load vocabulary tree");
+    return res.json();
+  },
+  async listVocabularyPacks(filters: any = {}) {
+    const params = new URLSearchParams(filters).toString();
+    const res = await fetch(`/api/admin/vocabulary/packs?${params}`, { headers: withAuthHeaders() });
+    if (!res.ok) throw await parseApiError(res, "Failed to load vocabulary packs");
+    return res.json();
+  },
+  async getVocabularyPack(id: string) {
+    const res = await fetch(`/api/admin/vocabulary/packs/${id}`, { headers: withAuthHeaders() });
+    if (!res.ok) throw await parseApiError(res, "Failed to load vocabulary pack");
+    return res.json();
+  },
+  async createVocabularyPack(payload: any) {
+    const res = await fetch("/api/admin/vocabulary/packs", {
+      method: "POST",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw await parseApiError(res, "Failed to create vocabulary pack");
+    return res.json();
+  },
+  async updateVocabularyPack(id: string, payload: any) {
+    const res = await fetch(`/api/admin/vocabulary/packs/${id}`, {
+      method: "PUT",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw await parseApiError(res, "Failed to update vocabulary pack");
+    return res.json();
+  },
+  async publishVocabularyPack(id: string) {
+    const res = await fetch(`/api/admin/vocabulary/packs/${id}/publish`, { method: "POST", headers: withAuthHeaders() });
+    if (!res.ok) throw await parseApiError(res, "Failed to publish vocabulary pack");
+    return res.json();
+  },
+  async unpublishVocabularyPack(id: string) {
+    const res = await fetch(`/api/admin/vocabulary/packs/${id}/unpublish`, { method: "POST", headers: withAuthHeaders() });
+    if (!res.ok) throw await parseApiError(res, "Failed to unpublish vocabulary pack");
+    return res.json();
+  },
+  async rollbackVocabularyPack(id: string, version: number) {
+    const res = await fetch(`/api/admin/vocabulary/packs/${id}/rollback`, {
+      method: "POST",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ version })
+    });
+    if (!res.ok) throw await parseApiError(res, "Failed to rollback vocabulary pack");
+    return res.json();
+  },
+  async regenerateVocabularyPack(id: string, payload: any) {
+    const res = await fetch(`/api/admin/vocabulary/packs/${id}/regenerate`, {
+      method: "POST",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw await parseApiError(res, "Failed to regenerate vocabulary pack");
+    return res.json();
+  },
+  async deleteVocabularyPack(id: string) {
+    const res = await fetch(`/api/admin/vocabulary/packs/${id}`, { method: "DELETE", headers: withAuthHeaders() });
+    if (!res.ok) throw await parseApiError(res, "Failed to delete vocabulary pack");
+    return res.json();
+  },
+  async exportVocabularyPack(id: string) {
+    const res = await fetch(`/api/admin/vocabulary/packs/${id}/export`, { headers: withAuthHeaders() });
+    if (!res.ok) throw await parseApiError(res, "Failed to export vocabulary pack");
+    return res.json();
+  },
+  async importVocabularyPack(payload: any) {
+    const res = await fetch("/api/admin/vocabulary/import", {
+      method: "POST",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ payload })
+    });
+    if (!res.ok) throw await parseApiError(res, "Failed to import vocabulary pack");
+    return res.json();
+  },
   async sendTestEmail(to: string) {
     const res = await fetch("/api/admin/service-settings/email/test", {
       method: "POST",
@@ -1474,11 +1585,21 @@ function App() {
   useEffect(() => {
     if (window.location.pathname === "/about") {
       setScreen("about");
+      return;
+    }
+    if (window.location.pathname === "/admin/vocabulary") {
+      setScreen("vocabulary");
     }
   }, []);
 
   useEffect(() => {
-    if (screen !== "about" && window.location.pathname === "/about") {
+    if (screen !== "about" && screen !== "vocabulary" && window.location.pathname === "/about") {
+      window.history.replaceState({}, "", "/");
+    }
+    if (screen === "vocabulary" && window.location.pathname !== "/admin/vocabulary") {
+      window.history.replaceState({}, "", "/admin/vocabulary");
+    }
+    if (screen !== "vocabulary" && window.location.pathname === "/admin/vocabulary") {
       window.history.replaceState({}, "", "/");
     }
   }, [screen]);
@@ -3076,8 +3197,20 @@ function App() {
             loadPacks();
             return result;
           }}
+          onOpenVocabulary={() => {
+            window.history.pushState({}, "", "/admin/vocabulary");
+            setScreen("vocabulary");
+          }}
           onTestKey={async (payload) => API.testOpenAI(payload, adminPin)}
           statusMessage={statusMessage}
+        />
+      )}
+
+      {screen === "vocabulary" && (
+        <VocabularyCenterScreen
+          isAdmin={isAdminUser}
+          onBack={() => navigateFromSettings("settings")}
+          onStatus={(msg) => setStatusMessage(msg)}
         />
       )}
     </div>
@@ -3438,6 +3571,490 @@ function LeaderboardScreen({
   );
 }
 
+function VocabularyCenterScreen({
+  isAdmin,
+  onBack,
+  onStatus
+}: {
+  isAdmin: boolean;
+  onBack: () => void;
+  onStatus: (msg: string) => void;
+}) {
+  const query = useMemo(() => new URLSearchParams(window.location.search), []);
+  const [tree, setTree] = useState<any>({});
+  const [treeSearch, setTreeSearch] = useState("");
+  const [collapsedLangs, setCollapsedLangs] = useState<Record<string, boolean>>({});
+  const [rows, setRows] = useState<VocabularyPackRow[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(Math.max(1, Number(query.get("page") || 1)));
+  const [pageSize, setPageSize] = useState(Math.max(5, Math.min(100, Number(query.get("pageSize") || 20))));
+  const [sortBy, setSortBy] = useState(query.get("sort") || "updated_at");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">(query.get("order") === "asc" ? "asc" : "desc");
+  const [filters, setFilters] = useState({
+    language: query.get("language") || "",
+    level: query.get("level") || "",
+    type: query.get("type") || "",
+    status: query.get("status") || "",
+    source: query.get("source") || "",
+    search: query.get("search") || ""
+  });
+  const [loading, setLoading] = useState(false);
+  const [selectedId, setSelectedId] = useState<string>("");
+  const [pack, setPack] = useState<VocabularyPackRow | null>(null);
+  const [entries, setEntries] = useState<VocabularyEntryRow[]>([]);
+  const [versions, setVersions] = useState<any[]>([]);
+  const [selectedVersion, setSelectedVersion] = useState("");
+  const [generatorEnabled, setGeneratorEnabled] = useState(false);
+  const [showCreateWizard, setShowCreateWizard] = useState(false);
+  const [createStep, setCreateStep] = useState(1);
+  const [createDraft, setCreateDraft] = useState<any>({
+    language: "en",
+    level: 1,
+    type: "words",
+    name: "",
+    count: 30,
+    prompt_template: "",
+    advanced_on: false,
+    theme: "",
+    temperature: 0.7,
+    max_tokens: 500,
+    random_seed: ""
+  });
+  const [isMobile, setIsMobile] = useState(window.innerWidth <= 720);
+  const [showMobileInspector, setShowMobileInspector] = useState(false);
+  const [importJson, setImportJson] = useState("");
+
+  useEffect(() => {
+    const onResize = () => setIsMobile(window.innerWidth <= 720);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  const persistQuery = useCallback((next: any) => {
+    const params = new URLSearchParams();
+    Object.entries(next).forEach(([k, v]) => {
+      if (v !== "" && v !== null && v !== undefined) params.set(k, String(v));
+    });
+    window.history.replaceState({}, "", `/admin/vocabulary?${params.toString()}`);
+  }, []);
+
+  const loadTree = useCallback(async () => {
+    const data = await API.getVocabularyTree({ language: filters.language, status: filters.status });
+    setTree(data.tree || {});
+  }, [filters.language, filters.status]);
+
+  const loadRows = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await API.listVocabularyPacks({
+        ...filters,
+        page,
+        pageSize,
+        sort: sortBy,
+        order: sortDir
+      });
+      setRows(data.rows || []);
+      setTotal(Number(data.total || 0));
+    } catch (err: any) {
+      onStatus(err?.message || "Failed to load vocabulary packs.");
+    } finally {
+      setLoading(false);
+    }
+  }, [filters, page, pageSize, sortBy, sortDir, onStatus]);
+
+  const loadPackDetail = useCallback(async (id: string) => {
+    if (!id) return;
+    const data = await API.getVocabularyPack(id);
+    setPack(data.pack || null);
+    setEntries(data.entries || []);
+    setVersions(data.versions || []);
+    setSelectedVersion(data.versions?.[0] ? String(data.versions[0].version) : "");
+    setSelectedId(id);
+    if (isMobile) setShowMobileInspector(true);
+  }, [isMobile]);
+
+  useEffect(() => {
+    if (!isAdmin) return;
+    API.getVocabularyGeneratorStatus()
+      .then((s) => setGeneratorEnabled(Boolean(s.enabled)))
+      .catch(() => setGeneratorEnabled(false));
+  }, [isAdmin]);
+
+  useEffect(() => {
+    if (!isAdmin) return;
+    void loadTree();
+    void loadRows();
+    persistQuery({ ...filters, page, pageSize, sort: sortBy, order: sortDir });
+  }, [isAdmin, loadTree, loadRows, persistQuery, filters, page, pageSize, sortBy, sortDir]);
+
+  const filteredTree = useMemo(() => {
+    if (!treeSearch.trim()) return tree;
+    const q = treeSearch.toLowerCase();
+    const out: any = {};
+    Object.entries(tree || {}).forEach(([lang, levelsAny]) => {
+      const levels = levelsAny as any;
+      Object.entries(levels || {}).forEach(([levelKey, packsAny]) => {
+        const packs = (packsAny as any[]).filter((p) => String(p.name || "").toLowerCase().includes(q));
+        if (packs.length > 0) {
+          out[lang] = out[lang] || {};
+          out[lang][levelKey] = packs;
+        }
+      });
+    });
+    return out;
+  }, [tree, treeSearch]);
+
+  const savePack = async () => {
+    if (!pack) return;
+    await API.updateVocabularyPack(pack.id, { ...pack, entries, change_note: "manual edit" });
+    await loadPackDetail(pack.id);
+    await loadRows();
+    await loadTree();
+    onStatus("Pack saved.");
+  };
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+        event.preventDefault();
+        void savePack();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [pack, entries]);
+
+  const publishToggle = async () => {
+    if (!pack) return;
+    if (pack.status === "published") await API.unpublishVocabularyPack(pack.id);
+    else await API.publishVocabularyPack(pack.id);
+    await loadPackDetail(pack.id);
+    await loadRows();
+    await loadTree();
+  };
+
+  const rollbackVersion = async () => {
+    if (!pack || !selectedVersion) return;
+    await API.rollbackVocabularyPack(pack.id, Number(selectedVersion));
+    await loadPackDetail(pack.id);
+    await loadRows();
+    await loadTree();
+  };
+
+  const exportPack = async () => {
+    if (!pack) return;
+    const data = await API.exportVocabularyPack(pack.id);
+    const asText = JSON.stringify(data.payload, null, 2);
+    await navigator.clipboard.writeText(asText);
+    onStatus("Pack JSON copied to clipboard.");
+  };
+
+  const importPack = async () => {
+    const payload = JSON.parse(importJson || "{}");
+    const data = await API.importVocabularyPack(payload);
+    await loadRows();
+    await loadTree();
+    await loadPackDetail(data.id);
+    onStatus("Pack imported.");
+  };
+
+  const runGenerate = async () => {
+    if (!pack) return;
+    await API.regenerateVocabularyPack(pack.id, {
+      count: createDraft.count,
+      prompt_template: createDraft.prompt_template || undefined,
+      model: "gpt-4o-mini",
+      theme: createDraft.theme || undefined,
+      temperature: Number(createDraft.temperature || 0.7),
+      max_tokens: Number(createDraft.max_tokens || 500),
+      random_seed: createDraft.random_seed || undefined,
+      advanced: createDraft.advanced_on ? {
+        story_constraints: createDraft.story_constraints || "",
+        sentence_complexity: createDraft.sentence_complexity || 50
+      } : null
+    });
+    await loadPackDetail(pack.id);
+    await loadRows();
+    await loadTree();
+    onStatus("Draft regenerated.");
+  };
+
+  const createPackWizard = async () => {
+    const payload = {
+      name: createDraft.name || "Untitled Vocabulary",
+      language: createDraft.language,
+      level: Number(createDraft.level || 1),
+      type: createDraft.type,
+      status: "draft",
+      source: createDraft.prompt_template ? "openai" : "manual",
+      generator_config: createDraft.prompt_template ? {
+        model: "gpt-4o-mini",
+        prompt_template: createDraft.prompt_template,
+        temperature: Number(createDraft.temperature || 0.7),
+        max_tokens: Number(createDraft.max_tokens || 500),
+        theme: createDraft.theme || null,
+        random_seed: createDraft.random_seed || null
+      } : null,
+      metadata: { wizard: true },
+      entries: []
+    };
+    const created = await API.createVocabularyPack(payload);
+    setShowCreateWizard(false);
+    setCreateStep(1);
+    await loadRows();
+    await loadTree();
+    await loadPackDetail(created.id);
+    onStatus("New draft pack created.");
+  };
+
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+
+  const inspectorContent = (
+    <div className="vocab-inspector">
+      {!pack ? (
+        <div className="vocab-empty">Select a pack to inspect and edit details.</div>
+      ) : (
+        <>
+          <div className="vocab-inspector-header">
+            <TextInput
+              label="Pack name"
+              value={pack.name}
+              onChange={(e) => setPack((prev) => prev ? { ...prev, name: e.currentTarget.value } : prev)}
+            />
+            <Group>
+              <Badge>{pack.language.toUpperCase()}</Badge>
+              <Badge>{pack.type}</Badge>
+              <Badge>{pack.status}</Badge>
+              <Badge>v{pack.version}</Badge>
+            </Group>
+          </div>
+          <Group grow>
+            <Select label="Language" value={pack.language} onChange={(v) => setPack((prev) => prev ? { ...prev, language: v || "en" } : prev)} data={[{ value: "en", label: "EN" }, { value: "ru", label: "RU" }]} />
+            <Select label="Level" value={String(pack.level)} onChange={(v) => setPack((prev) => prev ? { ...prev, level: Number(v || 1) } : prev)} data={[1, 2, 3, 4, 5].map((n) => ({ value: String(n), label: String(n) }))} />
+            <Select label="Type" value={pack.type} onChange={(v) => setPack((prev) => prev ? { ...prev, type: (v || "words") as any } : prev)} data={["words", "sentences", "fiction", "code"].map((v) => ({ value: v, label: v }))} />
+          </Group>
+          <Textarea
+            label="Entries (one per line)"
+            value={entries.map((e) => e.text).join("\n")}
+            minRows={10}
+            onChange={(e) => {
+              const rowsRaw = e.currentTarget.value.split(/\n/).map((line) => line.trim()).filter(Boolean);
+              setEntries(rowsRaw.map((text, idx) => ({ id: entries[idx]?.id || `tmp-${idx}`, text, order_index: idx })));
+            }}
+          />
+          <Group>
+            <Button onClick={() => void savePack()}>Save (Ctrl+Enter)</Button>
+            <Button variant="light" onClick={() => void publishToggle()}>{pack.status === "published" ? "Unpublish" : "Publish"}</Button>
+            <Button variant="light" onClick={() => void runGenerate()} disabled={!generatorEnabled}>Regenerate draft</Button>
+            <Button variant="light" onClick={() => void exportPack()}>Export JSON</Button>
+            <Button color="red" variant="light" onClick={async () => {
+              await API.deleteVocabularyPack(pack.id);
+              setPack(null);
+              setEntries([]);
+              setVersions([]);
+              setSelectedId("");
+              await loadRows();
+              await loadTree();
+            }}>Delete</Button>
+          </Group>
+          <Divider />
+          <Group grow>
+            <Select
+              label="Version history"
+              value={selectedVersion}
+              onChange={(v) => setSelectedVersion(v || "")}
+              data={versions.map((v) => ({ value: String(v.version), label: `v${v.version} - ${new Date(v.created_at || v.createdAt).toLocaleString()}` }))}
+            />
+            <Button variant="default" onClick={() => void rollbackVersion()} disabled={!selectedVersion}>Rollback</Button>
+          </Group>
+        </>
+      )}
+    </div>
+  );
+
+  if (!isAdmin) {
+    return (
+      <div className="screen settings">
+        <Card className="form-card" withBorder>
+          <Alert color="red" title="Admin only">Vocabulary Center requires ADMIN or OWNER role.</Alert>
+          <Button variant="light" onClick={onBack}>Back</Button>
+        </Card>
+      </div>
+    );
+  }
+
+  return (
+    <div className="screen settings vocab-center-screen">
+      <div className="vocab-toolbar">
+        <Title order={2}>Vocabulary Center</Title>
+        <Group>
+          <Button onClick={() => setShowCreateWizard((v) => !v)}>New Pack</Button>
+          <Button variant="light" onClick={onBack}>Back</Button>
+        </Group>
+      </div>
+
+      {showCreateWizard && (
+        <Card className="vocab-create-wizard" withBorder>
+          <Text fw={700}>Create New Vocabulary - Step {createStep} / 3</Text>
+          {createStep === 1 && (
+            <Group grow>
+              <TextInput label="Pack name" value={createDraft.name} onChange={(e) => setCreateDraft((p: any) => ({ ...p, name: e.currentTarget.value }))} />
+              <Select label="Language" value={createDraft.language} onChange={(v) => setCreateDraft((p: any) => ({ ...p, language: v || "en" }))} data={[{ value: "en", label: "EN" }, { value: "ru", label: "RU" }]} />
+              <Select label="Level" value={String(createDraft.level)} onChange={(v) => setCreateDraft((p: any) => ({ ...p, level: Number(v || 1) }))} data={[1, 2, 3, 4, 5].map((n) => ({ value: String(n), label: String(n) }))} />
+              <Select label="Type" value={createDraft.type} onChange={(v) => setCreateDraft((p: any) => ({ ...p, type: v || "words" }))} data={["words", "sentences", "fiction", "code"].map((v) => ({ value: v, label: v }))} />
+            </Group>
+          )}
+          {createStep === 2 && (
+            <Stack>
+              <Group grow>
+                <NumberInput label="Entry count" min={5} max={500} value={createDraft.count} onChange={(v) => setCreateDraft((p: any) => ({ ...p, count: Number(v) || 30 }))} />
+                <TextInput label="Theme/topic" value={createDraft.theme} onChange={(e) => setCreateDraft((p: any) => ({ ...p, theme: e.currentTarget.value }))} />
+                <Switch label="Enable Advanced" checked={Boolean(createDraft.advanced_on)} onChange={(e) => setCreateDraft((p: any) => ({ ...p, advanced_on: e.currentTarget.checked }))} />
+              </Group>
+              <Textarea label="Prompt template (optional)" minRows={4} value={createDraft.prompt_template} onChange={(e) => setCreateDraft((p: any) => ({ ...p, prompt_template: e.currentTarget.value }))} />
+            </Stack>
+          )}
+          {createStep === 3 && (
+            <Alert color="blue">
+              Create draft now. You can regenerate and edit entries in inspector.
+            </Alert>
+          )}
+          <Group>
+            <Button variant="default" disabled={createStep <= 1} onClick={() => setCreateStep((s) => Math.max(1, s - 1))}>Back</Button>
+            {createStep < 3 ? (
+              <Button onClick={() => setCreateStep((s) => Math.min(3, s + 1))}>Next</Button>
+            ) : (
+              <Button onClick={() => void createPackWizard()}>Create Draft</Button>
+            )}
+          </Group>
+        </Card>
+      )}
+
+      <div className="vocab-layout">
+        <aside className="vocab-tree-panel">
+          <TextInput placeholder="Search tree..." value={treeSearch} onChange={(e) => setTreeSearch(e.currentTarget.value)} />
+          <div className="vocab-tree">
+            {Object.entries(filteredTree).map(([lang, levelsAny]) => {
+              const collapsed = Boolean(collapsedLangs[lang]);
+              return (
+                <div key={lang} className="vocab-tree-lang">
+                  <button className="vocab-tree-toggle" onClick={() => setCollapsedLangs((prev) => ({ ...prev, [lang]: !prev[lang] }))} type="button">
+                    {collapsed ? "▶" : "▼"} {lang}
+                  </button>
+                  {!collapsed && Object.entries(levelsAny as any).map(([level, packsAny]) => (
+                    <div key={`${lang}-${level}`} className="vocab-tree-level">
+                      <Text size="sm" fw={600}>{level}</Text>
+                      {(packsAny as any[]).map((p) => (
+                        <button
+                          type="button"
+                          key={p.id}
+                          className={`vocab-tree-pack ${selectedId === p.id ? "active" : ""}`}
+                          onClick={() => void loadPackDetail(p.id)}
+                        >
+                          <span>{p.name}</span>
+                          <Badge size="xs" color={p.status === "published" ? "green" : p.status === "archived" ? "gray" : "yellow"}>{p.status}</Badge>
+                          <span className="vocab-tree-version">v{p.version}</span>
+                        </button>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              );
+            })}
+          </div>
+        </aside>
+
+        <section className="vocab-table-panel">
+          <div className="vocab-filters">
+            <Select label="Language" value={filters.language} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, language: v || "" })); }} data={[{ value: "", label: "All" }, { value: "en", label: "EN" }, { value: "ru", label: "RU" }]} />
+            <Select label="Level" value={String(filters.level)} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, level: v || "" })); }} data={[{ value: "", label: "All" }, ...[1, 2, 3, 4, 5].map((n) => ({ value: String(n), label: String(n) }))]} />
+            <Select label="Type" value={filters.type} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, type: v || "" })); }} data={[{ value: "", label: "All" }, ...["words", "sentences", "fiction", "code"].map((v) => ({ value: v, label: v }))]} />
+            <Select label="Status" value={filters.status} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, status: v || "" })); }} data={[{ value: "", label: "All" }, ...["draft", "published", "archived"].map((v) => ({ value: v, label: v }))]} />
+            <Select label="Source" value={filters.source} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, source: v || "" })); }} data={[{ value: "", label: "All" }, ...["manual", "openai", "imported"].map((v) => ({ value: v, label: v }))]} />
+            <TextInput label="Search" value={filters.search} onChange={(e) => { setPage(1); setFilters((p) => ({ ...p, search: e.currentTarget.value })); }} />
+          </div>
+          <div className="vocab-table-wrap">
+            <table className="vocab-table">
+              <thead>
+                <tr>
+                  {["Name", "Language", "Level", "Type", "Entries", "Status", "Version", "Updated", "Source", "Actions"].map((h) => <th key={h}>{h}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {loading && Array.from({ length: 8 }, (_, i) => (
+                  <tr key={`s-${i}`}><td colSpan={10}><div className="lb-skeleton-line" /></td></tr>
+                ))}
+                {!loading && rows.length === 0 && (
+                  <tr>
+                    <td colSpan={10}>
+                      <div className="vocab-empty">
+                        No vocabularies found
+                        <Button size="xs" onClick={() => setShowCreateWizard(true)}>Create new vocabulary</Button>
+                      </div>
+                    </td>
+                  </tr>
+                )}
+                {!loading && rows.map((row) => (
+                  <tr key={row.id}>
+                    <td>{row.name}</td>
+                    <td>{row.language.toUpperCase()}</td>
+                    <td>{row.level}</td>
+                    <td>{row.type}</td>
+                    <td>-</td>
+                    <td>{row.status}</td>
+                    <td>v{row.version}</td>
+                    <td>{new Date(row.updated_at || "").toLocaleDateString()}</td>
+                    <td>{row.source}</td>
+                    <td>
+                      <Group gap={6}>
+                        <Button size="xs" variant="light" onClick={() => void loadPackDetail(row.id)}>View</Button>
+                        <Button size="xs" variant="light" onClick={() => void loadPackDetail(row.id)}>Edit</Button>
+                        <Button size="xs" variant="light" onClick={async () => { const data = await API.exportVocabularyPack(row.id); setImportJson(JSON.stringify(data.payload, null, 2)); }}>Export</Button>
+                      </Group>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="vocab-pagination">
+            <Group>
+              <Text size="sm">Total: {total}</Text>
+              <Select value={String(pageSize)} onChange={(v) => { setPage(1); setPageSize(Number(v || 20)); }} data={[10, 20, 50].map((n) => ({ value: String(n), label: `${n}/page` }))} />
+            </Group>
+            <Group>
+              <Button size="xs" variant="default" disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>Prev</Button>
+              <Text size="sm">Page {page} / {totalPages}</Text>
+              <Button size="xs" variant="default" disabled={page >= totalPages} onClick={() => setPage((p) => p + 1)}>Next</Button>
+            </Group>
+          </div>
+          <Textarea
+            label="Import pack JSON"
+            value={importJson}
+            onChange={(e) => setImportJson(e.currentTarget.value)}
+            minRows={4}
+          />
+          <Group>
+            <Button variant="light" onClick={() => void importPack()}>Import JSON</Button>
+          </Group>
+        </section>
+
+        {!isMobile && <aside className="vocab-inspector-panel">{inspectorContent}</aside>}
+      </div>
+
+      <Drawer
+        opened={isMobile && showMobileInspector}
+        onClose={() => setShowMobileInspector(false)}
+        position="bottom"
+        size="85%"
+        title="Vocabulary Inspector"
+      >
+        {inspectorContent}
+      </Drawer>
+    </div>
+  );
+}
+
 function SettingsSection({
   id,
   title,
@@ -3567,6 +4184,7 @@ function SettingsScreen({
   onActivatePack,
   onUpdatePack,
   onGenerate,
+  onOpenVocabulary,
   onTestKey,
   statusMessage,
   onApplySettings,
@@ -3594,6 +4212,7 @@ function SettingsScreen({
   onActivatePack: (id: number) => void;
   onUpdatePack: (id: number, payload: any) => void;
   onGenerate: (payload: any) => Promise<any>;
+  onOpenVocabulary: () => void;
   onTestKey: (payload: any) => Promise<any>;
   statusMessage: string;
   onApplySettings: () => Promise<boolean>;
@@ -3659,7 +4278,6 @@ function SettingsScreen({
   const [selectedCrash, setSelectedCrash] = useState<CrashEvent | null>(null);
   const [crashBusy, setCrashBusy] = useState(false);
   const [crashMessage, setCrashMessage] = useState("");
-  const [languagePackModalOpen, setLanguagePackModalOpen] = useState(false);
   const [configStatus, setConfigStatus] = useState<ConfigStatus | null>(null);
   const [configStatusMessage, setConfigStatusMessage] = useState("");
   const [openaiConfigured, setOpenaiConfigured] = useState(false);
@@ -4719,118 +5337,19 @@ function SettingsScreen({
             description="Manage vocabulary packs and generation."
           >
             {isAdmin ? (
-              <>
-                <div className="setting-row full">
-                  <Button variant="light" onClick={() => setLanguagePackModalOpen(true)}>Open Language Packs</Button>
-                </div>
-                <Modal opened={languagePackModalOpen} onClose={() => setLanguagePackModalOpen(false)} title="Language Packs" size="xl" centered>
-                  <div className="vocab-manager">
-                    <Group justify="space-between" mb="sm">
-                      <Button
-                        variant="light"
-                        onClick={async () => {
-                          const exported = await API.exportLanguagePacks();
-                          setPackJson(JSON.stringify(exported, null, 2));
-                        }}
-                      >
-                        Export JSON
-                      </Button>
-                      <Button
-                        variant="light"
-                        onClick={async () => {
-                          try {
-                            const parsed = JSON.parse(packJson || "{}");
-                            await API.importLanguagePacks(parsed);
-                            onReloadPacks();
-                            setOpenaiStatus("Pack JSON imported.");
-                          } catch {
-                            setOpenaiStatus("Invalid JSON for import.");
-                          }
-                        }}
-                      >
-                        Import JSON
-                      </Button>
-                    </Group>
-                    <Textarea
-                      label="Import / Export JSON"
-                      value={packJson}
-                      onChange={(e) => setPackJson(e.currentTarget.value)}
-                      minRows={4}
-                    />
-                    <Group align="flex-end" style={{ flexWrap: "wrap" }}>
-                      <TextInput
-                        label="Topic"
-                        value={generateName}
-                        onChange={(e) => setGenerateName(e.currentTarget.value)}
-                        placeholder="e.g. animals"
-                      />
-                      <Select
-                        label="Pack type"
-                        value={generateType}
-                        onChange={(value) => setGenerateType((value || "level2") as any)}
-                        data={[
-                          { value: "level2", label: "Level 2 words" },
-                          { value: "level3", label: "Level 3 words" },
-                          { value: "sentence_words", label: "Sentence words" }
-                        ]}
-                      />
-                      <NumberInput
-                        label="Count"
-                        min={10}
-                        max={200}
-                        value={generateCount}
-                        onChange={(value) => setGenerateCount(Number(value) || 10)}
-                      />
-                      <Button
-                        disabled={!openaiGenerationReady}
-                        onClick={async () => {
-                          await onGenerate({ topic: generateName, count: generateCount, type: generateType, language: selectedLanguage });
-                          onReloadPacks();
-                        }}
-                      >
-                        Generate Draft
-                      </Button>
-                    </Group>
-                    {!openaiGenerationReady && (
-                      <Alert color="yellow" title="OpenAI generation unavailable">
-                        {openaiDirty
-                          ? "Apply settings to enable generation."
-                          : "Configure your OpenAI key to enable generation. Built-in EN/RU packs remain available."}
-                      </Alert>
-                    )}
-
-                    <div className="pack-list">
-                      {packs.map((pack) => (
-                        <div className="pack" key={pack.id}>
-                          <div className="pack-header">
-                            <strong>{pack.name}</strong>
-                            <span>{pack.packType}</span>
-                            <span>{pack.active ? "PUBLISHED" : "DRAFT"}</span>
-                          </div>
-                          <Textarea
-                            value={manualEdit[pack.id] ?? pack.items.join(", ")}
-                            onChange={(e) => setManualEdit({ ...manualEdit, [pack.id]: e.currentTarget.value })}
-                            minRows={3}
-                          />
-                          <div className="row">
-                            <Button variant="light" onClick={() => onActivatePack(pack.id)}>Publish</Button>
-                            <Button
-                              variant="light"
-                              onClick={() => {
-                                const raw = manualEdit[pack.id] ?? pack.items.join(", ");
-                                onUpdatePack(pack.id, { items: raw.split(/\s*,\s*/).filter(Boolean) });
-                              }}
-                            >
-                              Save
-                            </Button>
-                            <Button variant="light" onClick={() => onDeletePack(pack.id)}>Unpublish</Button>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                </Modal>
-              </>
+              <div className="setting-row full">
+                <Group>
+                  <Button
+                    variant="light"
+                    onClick={onOpenVocabulary}
+                  >
+                    Open Vocabulary Center
+                  </Button>
+                  <Text size="sm" c="dimmed">
+                    Full-page content workspace with tree explorer, table, inspector, versioning, and AI generation.
+                  </Text>
+                </Group>
+              </div>
             ) : (
               <div className="setting-row full">
                 <Alert color="yellow" title="Admin access required">
