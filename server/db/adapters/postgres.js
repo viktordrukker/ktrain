@@ -185,7 +185,6 @@ class PostgresAdapter {
     );
     return { rows, total, page, pageSize };
   }
-
   async getGamePreferences(userId) {
     const { rows } = await this.pool.query("SELECT * FROM game_preferences WHERE userId = $1 LIMIT 1", [userId]);
     return rows[0] || null;

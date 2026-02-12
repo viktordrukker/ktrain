@@ -145,7 +145,6 @@ class SqliteAdapter {
       .all(...params, pageSize, offset);
     return { rows, total, page, pageSize };
   }
-
   async getGamePreferences(userId) {
     return this.db.prepare("SELECT * FROM game_preferences WHERE userId = ? LIMIT 1").get(userId) || null;
   }
