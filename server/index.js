@@ -64,6 +64,11 @@ let shuttingDown = false;
 let setupModeActive = false;
 let configStatusSnapshot = null;
 let configStatusExpiresAt = 0;
+const OPENAI_EPHEMERAL_TTL_MS = 12 * 60 * 60 * 1000;
+const openaiEphemeralKeys = new Map();
+const defaultModeSessionState = new Map();
+const defaultModeGenerationInFlight = new Map();
+const DEFAULT_MODE_SESSION_TTL_MS = 2 * 60 * 60 * 1000;
 
 const BUILD_INFO = {
   version: process.env.APP_VERSION || "0.0.0",
@@ -352,6 +357,12 @@ function normalizeVocabularyStatus(input = "draft") {
   return "draft";
 }
 
+function normalizeVocabularySource(input = "manual") {
+  const value = String(input || "manual").toLowerCase();
+  if (["manual", "openai", "imported", "online_generated"].includes(value)) return value;
+  return "manual";
+}
+
 function safeParseJson(input, fallback) {
   try {
     return input ? JSON.parse(input) : fallback;
@@ -423,42 +434,69 @@ function safeParseJsonArrayOfStrings(raw, maxCount = 500) {
 function buildVocabularyGenerationPrompts({ language, level, type, count, theme }) {
   const safeTheme = String(theme || "").trim();
   const typeRules = type === "words"
-    ? "Return single vocabulary words. Prefer no spaces. Keep each item concise and age-appropriate."
+    ? "Return single vocabulary words only. No spaces, no numbering, no markdown."
     : "Return complete short sentences or chunks. Include spaces and natural punctuation.";
+  const levelRules = {
+    1: "Very short and basic items only.",
+    2: "Beginner level. Keep words/sentences simple and easy to type.",
+    3: "Intermediate beginner level with slightly longer vocabulary.",
+    4: "Intermediate level with richer sentence structure and punctuation.",
+    5: "Advanced learner-friendly level with longer and more complex content."
+  };
+  const languageRule = String(language || "en").toLowerCase() === "ru"
+    ? "Use only Russian Cyrillic letters. Do not use transliteration or Latin words."
+    : "Use only English Latin letters and standard punctuation.";
   const contentRule = safeTheme
     ? `Theme/topic: ${safeTheme}.`
     : "Theme/topic: general kid-safe educational content.";
   const system = [
     "You are a strict JSON generator for a typing game content pipeline.",
-    "Return ONLY valid JSON.",
+    "Return ONLY valid JSON array syntax.",
     "No markdown, no explanation, no code fences."
   ].join(" ");
   const developer = [
     `Generate exactly ${count} items for language=${language}, level=${level}, type=${type}.`,
+    languageRule,
+    levelRules[Number(level)] || levelRules[3],
     typeRules,
     contentRule,
     "Each item must be a string.",
-    "Return ONLY a JSON array of strings.",
-    "Never return an object.",
+    "Return ONLY a JSON array of strings with exactly the requested item count.",
+    "Never return an object, key-value wrapper, or prose.",
     "No comments."
   ].join(" ");
   return { system, developer };
 }
 
-function validateGeneratedVocabularyItems(items, { type, level }) {
+function validateGeneratedVocabularyItems(items, { type, level, language = "en" }) {
   const errors = [];
   const validated = [];
-  const maxLen = level <= 2 ? 24 : level <= 4 ? 48 : 80;
+  const numericLevel = clampNumber(level, 1, 5, 1);
+  const wordMaxByLevel = { 1: 2, 2: 4, 3: 7, 4: 10, 5: 14 };
+  const sentenceMaxByLevel = { 1: 24, 2: 36, 3: 52, 4: 72, 5: 96 };
+  const wordMaxLen = wordMaxByLevel[numericLevel] || 7;
+  const sentenceMaxLen = sentenceMaxByLevel[numericLevel] || 52;
+  const lang = String(language || "en").toLowerCase();
+  const ruWordPattern = /^[\u0400-\u04FF-]+$/;
+  const ruSentencePattern = /^[\u0400-\u04FF0-9\s.,!?;:()\-"'«»]+$/;
+  const enWordPattern = /^[A-Za-z-]+$/;
+  const enSentencePattern = /^[A-Za-z0-9\s.,!?;:()\-'"`]+$/;
   for (const raw of items) {
     const text = String(raw || "").trim();
     if (!text) continue;
-    if (text.length > maxLen) continue;
+    if (text.includes("\n")) continue;
     if (type === "words") {
-      if (text.includes("\n")) continue;
+      if (text.length > wordMaxLen) continue;
+      if (text.includes(" ")) continue;
+      if (lang === "ru" && !ruWordPattern.test(text)) continue;
+      if (lang !== "ru" && !enWordPattern.test(text)) continue;
       validated.push(text);
       continue;
     }
     if (!text.includes(" ")) continue;
+    if (text.length > sentenceMaxLen) continue;
+    if (lang === "ru" && !ruSentencePattern.test(text)) continue;
+    if (lang !== "ru" && !enSentencePattern.test(text)) continue;
     validated.push(text);
   }
   if (!validated.length) errors.push("No valid items after type-level validation.");
@@ -536,7 +574,299 @@ async function setSetting(key, value) {
   await repo.setSetting(key, value);
 }
 
-async function storeOpenAIKeyForActor(actor, apiKey) {
+function openAIEphemeralActorKey(actor) {
+  if (!actor?.isAuthenticated || !actor?.id) return null;
+  return `user:${actor.id}`;
+}
+
+function cleanupOpenAIEphemeralKeys() {
+  const cutoff = Date.now() - OPENAI_EPHEMERAL_TTL_MS;
+  for (const [key, value] of openaiEphemeralKeys.entries()) {
+    if (!value || Number(value.updatedAtMs || 0) < cutoff) {
+      openaiEphemeralKeys.delete(key);
+    }
+  }
+}
+
+function setOpenAIEphemeralKey(actor, apiKey, model = OPENAI_MODEL) {
+  const actorKey = openAIEphemeralActorKey(actor);
+  if (!actorKey || !apiKey) return;
+  openaiEphemeralKeys.set(actorKey, {
+    apiKey: String(apiKey),
+    model: String(model || OPENAI_MODEL),
+    updatedAtMs: Date.now()
+  });
+}
+
+function getOpenAIEphemeralKey(actor) {
+  cleanupOpenAIEphemeralKeys();
+  const actorKey = openAIEphemeralActorKey(actor);
+  if (!actorKey) return null;
+  const value = openaiEphemeralKeys.get(actorKey);
+  return value || null;
+}
+
+function clearOpenAIEphemeralKey(actor) {
+  const actorKey = openAIEphemeralActorKey(actor);
+  if (!actorKey) return;
+  openaiEphemeralKeys.delete(actorKey);
+}
+
+function hasEncryptedOpenAIKey(enc) {
+  return Boolean(enc?.ciphertext && enc?.iv && (enc?.authTag || enc?.authtag));
+}
+
+function decryptOpenAIEncryptedKey(enc) {
+  if (!enc || !hasEncryptedOpenAIKey(enc)) return null;
+  if (!encryptionService?.isConfigured()) return null;
+  try {
+    return encryptionService.decrypt({
+      ciphertext: enc.ciphertext,
+      iv: enc.iv,
+      authTag: enc.authTag || enc.authtag
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function getOpenAIServiceConfig() {
+  return configStore.get("service.openai", {
+    scope: "global",
+    scopeId: "global",
+    fallback: {
+      enabled: false,
+      storeInDb: true,
+      model: OPENAI_MODEL,
+      apiKeyEnc: null,
+      lastTestAt: null,
+      lastTestOk: false,
+      lastTestError: null,
+      lastTestCode: null,
+      updatedAt: null
+    }
+  });
+}
+
+async function saveOpenAIServiceConfig(nextValue, updatedBy = "system") {
+  const payload = {
+    enabled: Boolean(nextValue?.enabled),
+    storeInDb: nextValue?.storeInDb !== false,
+    model: String(nextValue?.model || OPENAI_MODEL),
+    apiKeyEnc: nextValue?.apiKeyEnc || null,
+    lastTestAt: nextValue?.lastTestAt || null,
+    lastTestOk: Boolean(nextValue?.lastTestOk),
+    lastTestError: nextValue?.lastTestError ? String(nextValue.lastTestError).slice(0, 400) : null,
+    lastTestCode: nextValue?.lastTestCode ? String(nextValue.lastTestCode).slice(0, 64) : null,
+    updatedAt: new Date().toISOString()
+  };
+  await configStore.setSafe("service.openai", payload, {
+    scope: "global",
+    scopeId: "global",
+    updatedBy
+  });
+  return payload;
+}
+
+function summarizeOpenAIServiceStatus(config) {
+  const cfg = config || {};
+  return {
+    enabled: Boolean(cfg.enabled),
+    storeInDb: cfg.storeInDb !== false,
+    configured: cfg.storeInDb === false
+      ? false
+      : hasEncryptedOpenAIKey(cfg.apiKeyEnc),
+    model: String(cfg.model || OPENAI_MODEL),
+    lastTestAt: cfg.lastTestAt || null,
+    lastTestOk: Boolean(cfg.lastTestOk),
+    lastTestError: cfg.lastTestError || null,
+    lastTestCode: cfg.lastTestCode || null
+  };
+}
+
+function classifyOpenAITestError(err) {
+  const status = Number(err?.status || 0);
+  const message = String(err?.message || err?.body || "OpenAI request failed");
+  if (status === 401 || status === 403 || /invalid api key|incorrect api key|unauthorized|forbidden/i.test(message)) {
+    return { code: "unauthorized", message: "Unauthorized key or access denied." };
+  }
+  if (status === 404 || /model .*does not exist|not found|permission/i.test(message)) {
+    return { code: "invalid_model_permission", message: "Model not available for this key." };
+  }
+  if (status === 429 || /rate limit|quota/i.test(message)) {
+    return { code: "rate_limited", message: "Rate limited or quota exceeded." };
+  }
+  if (err?.name === "AbortError" || /timed out|network|fetch failed|ENOTFOUND|ECONN/i.test(message)) {
+    return { code: "network", message: "Network error while contacting OpenAI." };
+  }
+  return { code: "unknown", message: "OpenAI test failed." };
+}
+
+async function resolveOpenAIExecutionContext(actor, { includeLegacy = true } = {}) {
+  const serviceConfig = await getOpenAIServiceConfig();
+  const serviceModel = String(serviceConfig?.model || OPENAI_MODEL);
+  if (Boolean(serviceConfig?.enabled)) {
+    if (serviceConfig?.storeInDb !== false) {
+      const keyFromDb = decryptOpenAIEncryptedKey(serviceConfig?.apiKeyEnc);
+      if (keyFromDb) {
+        return {
+          apiKey: keyFromDb,
+          source: "service.openai.db",
+          model: serviceModel,
+          persisted: true
+        };
+      }
+    } else {
+      const ephemeral = getOpenAIEphemeralKey(actor);
+      if (ephemeral?.apiKey) {
+        return {
+          apiKey: String(ephemeral.apiKey),
+          source: "service.openai.ephemeral",
+          model: String(ephemeral.model || serviceModel),
+          persisted: false
+        };
+      }
+    }
+  }
+
+  if (!includeLegacy) return null;
+
+  if (actor?.id && encryptionService?.isConfigured()) {
+    const row = await repo.getUserSecret(actor.id, "openai_api_key");
+    if (row) {
+      return {
+        apiKey: encryptionService.decrypt({
+          ciphertext: row.ciphertext,
+          iv: row.iv,
+          authTag: row.authtag || row.authTag
+        }),
+        source: "legacy.user_secret",
+        model: serviceModel,
+        persisted: true
+      };
+    }
+  }
+  const oldKey = await getSetting("openai_key");
+  if (oldKey) {
+    return {
+      apiKey: String(oldKey),
+      source: "legacy.settings",
+      model: serviceModel,
+      persisted: true
+    };
+  }
+  return null;
+}
+
+async function applyOpenAIServiceSettings({
+  actor,
+  apiKey,
+  storeKey,
+  enabled,
+  model
+}) {
+  const current = await getOpenAIServiceConfig();
+  const next = {
+    ...(current || {}),
+    enabled: enabled === undefined ? Boolean(current?.enabled) : Boolean(enabled),
+    storeInDb: storeKey === undefined ? (current?.storeInDb !== false) : Boolean(storeKey),
+    model: String(model || current?.model || OPENAI_MODEL)
+  };
+
+  let trimmedKey = String(apiKey || "").trim();
+  if (!trimmedKey && next.storeInDb && storeKey !== undefined) {
+    const ephemeral = getOpenAIEphemeralKey(actor);
+    if (ephemeral?.apiKey) {
+      trimmedKey = String(ephemeral.apiKey);
+    }
+  }
+  if (!trimmedKey && next.storeInDb === false && storeKey !== undefined && hasEncryptedOpenAIKey(current?.apiKeyEnc)) {
+    const fromDb = decryptOpenAIEncryptedKey(current?.apiKeyEnc);
+    if (fromDb) {
+      trimmedKey = fromDb;
+    }
+  }
+
+  if (trimmedKey) {
+    next.enabled = true;
+    next.lastTestOk = false;
+    next.lastTestError = null;
+    next.lastTestCode = null;
+    next.lastTestAt = null;
+    if (next.storeInDb) {
+      if (!encryptionService?.isConfigured()) {
+        throw new AppError("Encryption is not configured for DB key storage", {
+          status: 400,
+          code: "ENCRYPTION_NOT_CONFIGURED",
+          expose: true
+        });
+      }
+      next.apiKeyEnc = encryptionService.encrypt(trimmedKey);
+      clearOpenAIEphemeralKey(actor);
+    } else {
+      setOpenAIEphemeralKey(actor, trimmedKey, next.model);
+      next.apiKeyEnc = null;
+    }
+  } else if (storeKey !== undefined && next.storeInDb === false) {
+    // WHY: explicit DB-storage disable switches the active source to ephemeral-only.
+    if (hasEncryptedOpenAIKey(current?.apiKeyEnc)) {
+      const fromDb = decryptOpenAIEncryptedKey(current.apiKeyEnc);
+      if (fromDb) setOpenAIEphemeralKey(actor, fromDb, next.model);
+    }
+    next.apiKeyEnc = null;
+  } else if (storeKey !== undefined && next.storeInDb === true && !hasEncryptedOpenAIKey(current?.apiKeyEnc)) {
+    throw new AppError("API key is required to enable DB storage", {
+      status: 400,
+      code: "OPENAI_KEY_REQUIRED",
+      expose: true
+    });
+  }
+
+  const saved = await saveOpenAIServiceConfig(next, actor?.externalSubject || "admin");
+  return summarizeOpenAIServiceStatus(saved);
+}
+
+async function runOpenAIConnectivityTest(actor, requestId) {
+  const startedAt = new Date().toISOString();
+  const resolved = await resolveOpenAIExecutionContext(actor, { includeLegacy: true });
+  if (!resolved?.apiKey) {
+    throw new AppError("OpenAI key is not configured", {
+      status: 400,
+      code: "OPENAI_KEY_MISSING",
+      expose: true,
+      metadata: { requestId }
+    });
+  }
+  const model = String(resolved.model || OPENAI_MODEL);
+  await callOpenAI({
+    apiKey: resolved.apiKey,
+    model,
+    temperature: 0,
+    maxTokens: 64,
+    systemPrompt: "Return only JSON.",
+    prompt: "Return ONLY this JSON object: {\"ok\":true}"
+  });
+  return {
+    ok: true,
+    source: resolved.source,
+    model,
+    requestId: requestId || null,
+    testedAt: startedAt
+  };
+}
+
+async function persistOpenAITestStatus({ ok, code = null, errorMessage = null }) {
+  const current = await getOpenAIServiceConfig();
+  await saveOpenAIServiceConfig({
+    ...(current || {}),
+    lastTestAt: new Date().toISOString(),
+    lastTestOk: Boolean(ok),
+    lastTestCode: code ? String(code) : null,
+    lastTestError: errorMessage ? String(errorMessage).slice(0, 400) : null
+  }, "openai-test");
+}
+
+async function storeLegacyOpenAIKeyForActor(actor, apiKey) {
   if (!apiKey) return;
   if (actor?.id && encryptionService?.isConfigured()) {
     // SECURITY: OpenAI keys are encrypted at rest with AES-256-GCM and never logged.
@@ -547,18 +877,13 @@ async function storeOpenAIKeyForActor(actor, apiKey) {
   await setSetting("openai_key", apiKey);
 }
 
+async function storeOpenAIKeyForActor(actor, apiKey) {
+  return storeLegacyOpenAIKeyForActor(actor, apiKey);
+}
+
 async function getOpenAIKeyForActor(actor) {
-  if (actor?.id && encryptionService?.isConfigured()) {
-    const row = await repo.getUserSecret(actor.id, "openai_api_key");
-    if (row) {
-      return encryptionService.decrypt({
-        ciphertext: row.ciphertext,
-        iv: row.iv,
-        authTag: row.authtag || row.authTag
-      });
-    }
-  }
-  return getSetting("openai_key");
+  const ctx = await resolveOpenAIExecutionContext(actor, { includeLegacy: true });
+  return ctx?.apiKey || null;
 }
 
 async function getActivePack(type) {
@@ -570,57 +895,432 @@ async function getActivePack(type) {
   };
 }
 
-async function generateTasks(level, count, contentMode, language = "en") {
+function getVocabularyTypeForLevel(level) {
+  return level >= 4 ? "sentences" : "words";
+}
+
+function normalizeGameSessionId(raw, actor, ip) {
+  const text = String(raw || "").trim();
+  if (text && text.length <= 128) return text;
+  if (actor?.isAuthenticated && actor?.id) return `user:${actor.id}`;
+  return `guest:${String(ip || "unknown").slice(0, 64)}`;
+}
+
+function makeDefaultModeChannelKey(language, level, type) {
+  return `${String(language || "en").toLowerCase()}|${Number(level || 1)}|${type}|default`;
+}
+
+function cleanupDefaultModeSessions() {
+  const cutoff = Date.now() - DEFAULT_MODE_SESSION_TTL_MS;
+  for (const [sessionId, state] of defaultModeSessionState.entries()) {
+    if (!state || Number(state.lastTouchedAtMs || 0) < cutoff) {
+      defaultModeSessionState.delete(sessionId);
+    }
+  }
+}
+
+function ensureDefaultModeSession(sessionId) {
+  cleanupDefaultModeSessions();
+  if (!defaultModeSessionState.has(sessionId)) {
+    defaultModeSessionState.set(sessionId, {
+      channels: new Map(),
+      lastTouchedAtMs: Date.now()
+    });
+  }
+  const session = defaultModeSessionState.get(sessionId);
+  session.lastTouchedAtMs = Date.now();
+  return session;
+}
+
+function ensureDefaultModeChannel(sessionState, channelKey) {
+  if (!sessionState.channels.has(channelKey)) {
+    sessionState.channels.set(channelKey, {
+      activePackId: null,
+      usedPackIds: new Set(),
+      usedEntryIndicesByPack: new Map(),
+      lastTelemetryCpm: 0,
+      lastServedAtMs: 0
+    });
+  }
+  return sessionState.channels.get(channelKey);
+}
+
+function buildFallbackTasks(level, count, language) {
   const tasks = [];
-
-  const level2PackItems = contentMode === "vocab" ? await repo.getPublishedPackItems({ language, type: "level2" }) : [];
-  const level3PackItems = contentMode === "vocab" ? await repo.getPublishedPackItems({ language, type: "level3" }) : [];
-  const sentencePackItems = contentMode === "vocab" ? await repo.getPublishedPackItems({ language, type: "sentence_words" }) : [];
-
   const useRuDefaults = language === "ru";
-  const level2Words = level2PackItems.length
-    ? level2PackItems.map((row) => row.text)
-    : (useRuDefaults ? defaults.level2WordsRu : defaults.level2Words);
-  const level3Words = level3PackItems.length
-    ? level3PackItems.map((row) => row.text)
-    : (useRuDefaults ? defaults.level3WordsRu : defaults.level3Words);
-  const sentenceWords = sentencePackItems.length
-    ? sentencePackItems.map((row) => row.text)
-    : (useRuDefaults ? defaults.sentenceWordsRu : defaults.sentenceWords);
+  const level2Words = useRuDefaults ? defaults.level2WordsRu : defaults.level2Words;
+  const level3Words = useRuDefaults ? defaults.level3WordsRu : defaults.level3Words;
+  const sentenceWords = useRuDefaults ? defaults.sentenceWordsRu : defaults.sentenceWords;
 
   if (level === 1) {
-    for (let i = 0; i < count; i++) {
+    for (let i = 0; i < count; i += 1) {
       const pool = [...(language === "ru" ? defaults.lettersRu : defaults.letters), ...defaults.digits];
       const letter = chooseRandom(pool);
       tasks.push({ id: `${level}-c-${Date.now()}-${i}`, level, prompt: letter, answer: letter });
     }
+    return tasks;
   }
 
   if (level === 2) {
-    for (let i = 0; i < count; i++) {
+    for (let i = 0; i < count; i += 1) {
       const word = chooseRandom(level2Words);
       tasks.push({ id: `${level}-w-${Date.now()}-${i}`, level, prompt: word, answer: word });
     }
+    return tasks;
   }
 
   if (level === 3) {
-    for (let i = 0; i < count; i++) {
+    for (let i = 0; i < count; i += 1) {
       const word = chooseRandom(level3Words);
       tasks.push({ id: `${level}-w-${Date.now()}-${i}`, level, prompt: word, answer: word });
     }
+    return tasks;
   }
 
-  if (level === 4 || level === 5) {
-    while (tasks.length < count) {
-      const maxWords = level === 4 ? 3 : 9;
-      const minWords = level === 4 ? 2 : 4;
+  while (tasks.length < count) {
+    const maxWords = level === 4 ? 3 : 9;
+    const minWords = level === 4 ? 2 : 4;
+    const length = Math.floor(Math.random() * (maxWords - minWords + 1)) + minWords;
+    const words = Array.from({ length }, () => chooseRandom(sentenceWords));
+    const sentence = words.join(" ");
+    words.forEach((word, idx) => {
+      tasks.push({
+        id: `${level}-s-${Date.now()}-${tasks.length}`,
+        level,
+        prompt: word,
+        answer: word,
+        sentence,
+        wordIndex: idx,
+        words
+      });
+    });
+  }
+  return tasks.slice(0, count);
+}
+
+function buildTasksFromVocabularyEntries({ level, count, entries, channelState, packId }) {
+  const tasks = [];
+  if (!Array.isArray(entries) || entries.length === 0) return { tasks, depleted: true, remainingEntries: 0 };
+  const total = entries.length;
+  const usedSet = channelState.usedEntryIndicesByPack.get(packId) || new Set();
+  if (!channelState.usedEntryIndicesByPack.has(packId)) {
+    channelState.usedEntryIndicesByPack.set(packId, usedSet);
+  }
+  const unservedIndices = [];
+  for (let i = 0; i < total; i += 1) {
+    if (!usedSet.has(i)) unservedIndices.push(i);
+  }
+
+  if (level <= 3) {
+    const candidate = [...unservedIndices];
+    while (candidate.length < count) {
+      candidate.push(Math.floor(Math.random() * total));
+    }
+    for (let i = 0; i < candidate.length && tasks.length < count; i += 1) {
+      const idx = candidate[i];
+      usedSet.add(idx);
+      const text = String(entries[idx] || "").trim();
+      if (!text) continue;
+      tasks.push({
+        id: `${level}-w-${packId}-${Date.now()}-${tasks.length}`,
+        level,
+        prompt: text,
+        answer: text
+      });
+    }
+  } else {
+    const candidate = [...unservedIndices];
+    while (candidate.length < total * 3 && tasks.length < count) {
+      candidate.push(Math.floor(Math.random() * total));
+      if (candidate.length > count * 4) break;
+    }
+    for (let i = 0; i < candidate.length && tasks.length < count; i += 1) {
+      const idx = candidate[i];
+      usedSet.add(idx);
+      const sentence = String(entries[idx] || "").replace(/\s+/g, " ").trim();
+      if (!sentence) continue;
+      const words = sentence.split(" ").filter(Boolean);
+      if (!words.length) continue;
+      for (let wordIndex = 0; wordIndex < words.length && tasks.length < count; wordIndex += 1) {
+        const word = words[wordIndex];
+        tasks.push({
+          id: `${level}-s-${packId}-${Date.now()}-${tasks.length}`,
+          level,
+          prompt: word,
+          answer: word,
+          sentence,
+          wordIndex,
+          words
+        });
+      }
+    }
+  }
+
+  const remainingEntries = Math.max(0, total - usedSet.size);
+  const depleted = remainingEntries <= 0;
+  if (depleted) channelState.activePackId = null;
+  return { tasks: tasks.slice(0, count), depleted, remainingEntries };
+}
+
+async function generateStrictVocabularyItems({
+  apiKey,
+  model,
+  language,
+  level,
+  type,
+  count,
+  requestId,
+  theme = "general educational typing content"
+}) {
+  const prompts = buildVocabularyGenerationPrompts({ language, level, type, count, theme });
+  let lastRaw = "";
+  let best = [];
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const prompt = attempt === 1
+      ? prompts.developer
+      : `Fix this model output. Return ONLY a valid JSON array of strings with exactly ${count} items.\n\n${lastRaw}`;
+    lastRaw = await callOpenAI({
+      apiKey,
+      model,
+      temperature: 0.4,
+      maxTokens: 1400,
+      systemPrompt: prompts.system,
+      prompt
+    });
+    const parsed = safeParseJsonArrayOfStrings(lastRaw, count * 3);
+    const validated = validateGeneratedVocabularyItems(parsed, { type, level, language });
+    const deduped = Array.from(new Set(validated.items.map((x) => String(x || "").trim()).filter(Boolean)));
+    if (deduped.length >= count) {
+      return { items: deduped.slice(0, count), raw: lastRaw, attempts: attempt };
+    }
+    if (deduped.length > best.length) best = deduped;
+  }
+  throw new AppError("Generator output is invalid JSON items array", {
+    status: 400,
+    code: "GEN_INVALID_OUTPUT",
+    expose: true,
+    metadata: { requestId, parsedCount: best.length, minRequired: count }
+  });
+}
+
+async function persistGeneratedPack({ language, level, type, items, model, metadata = {}, createdBy = null }) {
+  const now = new Date().toISOString();
+  const id = randomUUID();
+  const normalizedType = normalizeVocabularyType(type);
+  await repo.createVocabularyPack({
+    id,
+    name: `Auto ${String(language || "en").toUpperCase()} L${level} ${normalizedType} ${now.slice(0, 16).replace("T", " ")}`,
+    language: String(language || "en").toLowerCase(),
+    level: clampNumber(level, 1, 5, 1),
+    type: normalizedType,
+    status: "published",
+    source: "online_generated",
+    version: 1,
+    generator_config: {
+      model: String(model || OPENAI_MODEL),
+      prompt_template: "default_mode_auto_generation",
+      temperature: 0.4
+    },
+    metadata: {
+      generated_for_default_mode: true,
+      ...metadata
+    },
+    created_at: now,
+    updated_at: now
+  });
+  const entries = items.map((text, idx) => ({
+    id: randomUUID(),
+    text: String(text || "").trim(),
+    order_index: idx,
+    difficulty_score: null,
+    tags: null,
+    created_at: now
+  })).filter((row) => row.text);
+  await repo.replaceVocabularyEntries(id, entries);
+  await repo.createVocabularyVersion({
+    id: randomUUID(),
+    pack_id: id,
+    version: 1,
+    snapshot_json: {
+      pack: await repo.getVocabularyPackById(id),
+      entries: await repo.listVocabularyEntries(id)
+    },
+    change_note: "online generated for default mode",
+    created_by: createdBy ? String(createdBy) : null,
+    created_at: now
+  });
+  return id;
+}
+
+async function scheduleBackgroundGenerationIfNeeded({
+  actor,
+  requestId,
+  language,
+  level,
+  type,
+  triggerReason,
+  requestCount = 60
+}) {
+  const lockKey = `${String(language || "en").toLowerCase()}|${level}|${normalizeVocabularyType(type)}|default`;
+  if (defaultModeGenerationInFlight.has(lockKey)) return false;
+  const openaiCtx = await resolveOpenAIExecutionContext(actor, { includeLegacy: true });
+  if (!openaiCtx?.apiKey) return false;
+
+  const run = (async () => {
+    try {
+      const generated = await generateStrictVocabularyItems({
+        apiKey: openaiCtx.apiKey,
+        model: openaiCtx.model || OPENAI_MODEL,
+        language,
+        level,
+        type: normalizeVocabularyType(type),
+        count: clampNumber(requestCount, 10, 200, 60),
+        requestId,
+        theme: "default gameplay rotation"
+      });
+      const packId = await persistGeneratedPack({
+        language,
+        level,
+        type: normalizeVocabularyType(type),
+        items: generated.items,
+        model: openaiCtx.model || OPENAI_MODEL,
+        createdBy: actor?.id || null,
+        metadata: {
+          source_hint: openaiCtx.source,
+          request_id: requestId || null,
+          trigger_reason: triggerReason
+        }
+      });
+      logger.info("default_mode_background_generation_ok", {
+        requestId: requestId || null,
+        language,
+        level,
+        type: normalizeVocabularyType(type),
+        packId,
+        source: openaiCtx.source
+      });
+    } catch (err) {
+      logger.warn("default_mode_background_generation_failed", {
+        requestId: requestId || null,
+        language,
+        level,
+        type: normalizeVocabularyType(type),
+        error: String(err?.message || err || "unknown")
+      });
+    } finally {
+      defaultModeGenerationInFlight.delete(lockKey);
+    }
+  })();
+  defaultModeGenerationInFlight.set(lockKey, run);
+  return true;
+}
+
+async function selectNextContentPack(sessionCtx, playerSettings) {
+  const { channelState } = sessionCtx;
+  const language = String(playerSettings?.language || "en").toLowerCase();
+  const level = clampNumber(playerSettings?.level, 1, 5, 1);
+  const type = normalizeVocabularyType(playerSettings?.type || "words");
+  const packResult = await repo.listVocabularyPacks(
+    {
+      language,
+      level,
+      type,
+      status: "published"
+    },
+    {
+      page: 1,
+      pageSize: 500,
+      sortBy: "updated_at",
+      sortDir: "desc"
+    }
+  );
+  const packs = Array.isArray(packResult?.rows) ? packResult.rows : [];
+  const packsById = new Map(packs.map((pack) => [String(pack.id), pack]));
+  let selectedPack = null;
+  let reason = "none";
+
+  if (channelState.activePackId && packsById.has(String(channelState.activePackId))) {
+    selectedPack = packsById.get(String(channelState.activePackId));
+    const usedSet = channelState.usedEntryIndicesByPack.get(String(selectedPack.id));
+    const total = Number(selectedPack.entry_count || 0);
+    if (usedSet && total > 0 && usedSet.size >= total) {
+      channelState.activePackId = null;
+      selectedPack = null;
+    } else {
+      reason = "active_pack";
+    }
+  } else if (channelState.activePackId) {
+    channelState.activePackId = null;
+  }
+
+  if (!selectedPack) {
+    const unused = packs.filter((pack) => !channelState.usedPackIds.has(String(pack.id)));
+    if (unused.length > 0) {
+      selectedPack = chooseRandom(unused);
+      channelState.activePackId = String(selectedPack.id);
+      channelState.usedPackIds.add(String(selectedPack.id));
+      reason = "unused_pack";
+    }
+  }
+
+  const allUsed = !selectedPack && packs.length > 0;
+  if (allUsed) {
+    selectedPack = chooseRandom(packs);
+    reason = "fallback_reuse_pack";
+  }
+  const unusedPacksExist = packs.some((pack) => !channelState.usedPackIds.has(String(pack.id)));
+  return { selectedPack, packs, reason, allUsed, unusedPacksExist };
+}
+
+const contentService = {
+  selectNextContentPack,
+  scheduleBackgroundGenerationIfNeeded,
+  persistGeneratedPack
+};
+
+async function generateTasks(level, count, contentMode, language = "en", runtimeCtx = {}) {
+  const safeLevel = clampNumber(level, 1, 5, 1);
+  const safeCount = clampNumber(count, 5, 200, 10);
+  const safeLanguage = String(language || "en").toLowerCase();
+
+  // Legacy published packs path remains unchanged for explicit vocab mode.
+  if (contentMode === "vocab") {
+    const tasks = [];
+    const level2PackItems = await repo.getPublishedPackItems({ language: safeLanguage, type: "level2" });
+    const level3PackItems = await repo.getPublishedPackItems({ language: safeLanguage, type: "level3" });
+    const sentencePackItems = await repo.getPublishedPackItems({ language: safeLanguage, type: "sentence_words" });
+    const useRuDefaults = safeLanguage === "ru";
+    const level2Words = level2PackItems.length ? level2PackItems.map((row) => row.text) : (useRuDefaults ? defaults.level2WordsRu : defaults.level2Words);
+    const level3Words = level3PackItems.length ? level3PackItems.map((row) => row.text) : (useRuDefaults ? defaults.level3WordsRu : defaults.level3Words);
+    const sentenceWords = sentencePackItems.length ? sentencePackItems.map((row) => row.text) : (useRuDefaults ? defaults.sentenceWordsRu : defaults.sentenceWords);
+
+    if (safeLevel === 1) {
+      return buildFallbackTasks(1, safeCount, safeLanguage);
+    }
+    if (safeLevel === 2) {
+      for (let i = 0; i < safeCount; i += 1) {
+        const word = chooseRandom(level2Words);
+        tasks.push({ id: `${safeLevel}-w-${Date.now()}-${i}`, level: safeLevel, prompt: word, answer: word });
+      }
+      return tasks;
+    }
+    if (safeLevel === 3) {
+      for (let i = 0; i < safeCount; i += 1) {
+        const word = chooseRandom(level3Words);
+        tasks.push({ id: `${safeLevel}-w-${Date.now()}-${i}`, level: safeLevel, prompt: word, answer: word });
+      }
+      return tasks;
+    }
+    while (tasks.length < safeCount) {
+      const maxWords = safeLevel === 4 ? 3 : 9;
+      const minWords = safeLevel === 4 ? 2 : 4;
       const length = Math.floor(Math.random() * (maxWords - minWords + 1)) + minWords;
       const words = Array.from({ length }, () => chooseRandom(sentenceWords));
       const sentence = words.join(" ");
       words.forEach((word, idx) => {
         tasks.push({
-          id: `${level}-s-${Date.now()}-${tasks.length}`,
-          level,
+          id: `${safeLevel}-s-${Date.now()}-${tasks.length}`,
+          level: safeLevel,
           prompt: word,
           answer: word,
           sentence,
@@ -629,9 +1329,93 @@ async function generateTasks(level, count, contentMode, language = "en") {
         });
       });
     }
+    return tasks.slice(0, safeCount);
   }
 
-  return tasks.slice(0, count);
+  if (safeLevel === 1) {
+    return buildFallbackTasks(1, safeCount, safeLanguage);
+  }
+
+  const sessionId = normalizeGameSessionId(runtimeCtx.sessionId, runtimeCtx.actor, runtimeCtx.ip);
+  const sessionState = ensureDefaultModeSession(sessionId);
+  const contentType = getVocabularyTypeForLevel(safeLevel);
+  const channelKey = makeDefaultModeChannelKey(safeLanguage, safeLevel, contentType);
+  const channelState = ensureDefaultModeChannel(sessionState, channelKey);
+  const selection = await contentService.selectNextContentPack(
+    { sessionId, channelKey, channelState },
+    { language: safeLanguage, level: safeLevel, type: contentType }
+  );
+  let selectedPack = selection.selectedPack;
+
+  if (selection.allUsed) {
+    void contentService.scheduleBackgroundGenerationIfNeeded({
+      actor: runtimeCtx.actor,
+      requestId: runtimeCtx.requestId,
+      language: safeLanguage,
+      level: safeLevel,
+      type: contentType,
+      triggerReason: "all_packs_used",
+      requestCount: Math.max(40, safeCount)
+    });
+  }
+
+  if (!selectedPack && selection.packs.length > 0) {
+    selectedPack = selection.selectedPack;
+  }
+
+  if (!selectedPack) {
+    void contentService.scheduleBackgroundGenerationIfNeeded({
+      actor: runtimeCtx.actor,
+      requestId: runtimeCtx.requestId,
+      language: safeLanguage,
+      level: safeLevel,
+      type: contentType,
+      triggerReason: "no_matching_packs",
+      requestCount: Math.max(40, safeCount)
+    });
+    return buildFallbackTasks(safeLevel, safeCount, safeLanguage);
+  }
+
+  const selectedPackId = String(selectedPack.id);
+  const packEntries = (await repo.listVocabularyEntries(selectedPackId))
+    .map((row) => String(row.text || "").trim())
+    .filter(Boolean);
+  if (!packEntries.length) {
+    channelState.activePackId = null;
+    return buildFallbackTasks(safeLevel, safeCount, safeLanguage);
+  }
+  const result = buildTasksFromVocabularyEntries({
+    level: safeLevel,
+    count: safeCount,
+    entries: packEntries,
+    channelState,
+    packId: selectedPackId
+  });
+  channelState.lastServedAtMs = Date.now();
+
+  const telemetryCpm = clampNumber(runtimeCtx?.telemetry?.cpm, 0, 10_000, 0);
+  if (telemetryCpm > 0) channelState.lastTelemetryCpm = telemetryCpm;
+  const effectiveCpm = telemetryCpm > 0 ? telemetryCpm : channelState.lastTelemetryCpm;
+  const averageChars = Math.max(1, Math.round(packEntries.reduce((acc, item) => acc + item.length, 0) / Math.max(1, packEntries.length)));
+  const remainingChars = result.remainingEntries * averageChars;
+  const charsPerSec = effectiveCpm > 0 ? (effectiveCpm / 60) : 0;
+  const remainingSeconds = charsPerSec > 0 ? (remainingChars / charsPerSec) : Number.POSITIVE_INFINITY;
+  if (!selection.unusedPacksExist && remainingSeconds < 10) {
+    void contentService.scheduleBackgroundGenerationIfNeeded({
+      actor: runtimeCtx.actor,
+      requestId: runtimeCtx.requestId,
+      language: safeLanguage,
+      level: safeLevel,
+      type: contentType,
+      triggerReason: "low_buffer",
+      requestCount: Math.max(40, safeCount)
+    });
+  }
+
+  if (!result.tasks.length) {
+    return buildFallbackTasks(safeLevel, safeCount, safeLanguage);
+  }
+  return result.tasks;
 }
 
 async function callOpenAI({ apiKey, prompt, systemPrompt = "", model = OPENAI_MODEL, temperature = 0.7, maxTokens = null }) {
@@ -662,7 +1446,10 @@ async function callOpenAI({ apiKey, prompt, systemPrompt = "", model = OPENAI_MO
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(text);
+    const err = new Error(`OpenAI request failed (${response.status})`);
+    err.status = response.status;
+    err.body = text;
+    throw err;
   }
 
   const data = await response.json();
@@ -1223,9 +2010,19 @@ app.put("/api/user/password", requirePermission(Permissions.SESSION_READ), authL
 }));
 
 app.get("/api/user/openai-key/status", requirePermission(Permissions.SESSION_READ), withAsync(async (req, res) => {
-  if (!req.actor?.isAuthenticated) return res.json({ ok: true, configured: false });
-  const existing = await repo.getUserSecret(req.actor.id, "openai_api_key");
-  res.json({ ok: true, configured: Boolean(existing) });
+  if (!req.actor?.isAuthenticated) return res.json({ ok: true, configured: false, source: null });
+  const serviceSummary = summarizeOpenAIServiceStatus(await getOpenAIServiceConfig());
+  const resolved = await resolveOpenAIExecutionContext(req.actor, { includeLegacy: true });
+  res.json({
+    ok: true,
+    configured: Boolean(resolved?.apiKey),
+    source: resolved?.source || null,
+    storeInDb: serviceSummary.storeInDb,
+    verified: Boolean(serviceSummary.lastTestOk),
+    lastTestAt: serviceSummary.lastTestAt || null,
+    lastTestError: serviceSummary.lastTestError || null,
+    model: serviceSummary.model
+  });
 }));
 
 app.put("/api/user/openai-key", requirePermission(Permissions.SESSION_READ), withAsync(async (req, res) => {
@@ -1397,7 +2194,23 @@ app.post("/api/tasks/generate", requirePermission(Permissions.TASKS_GENERATE), r
   const safeCount = asNumber(body.count ?? 10, { min: 5, max: 100, field: "count" });
   const safeContentMode = body.contentMode === "vocab" ? "vocab" : "default";
   const requestedLanguage = String(body.language || "en").toLowerCase();
-  const languages = await repo.listPublishedLanguagesByType(safeLevel === 2 ? "level2" : safeLevel === 3 ? "level3" : "sentence_words");
+  const telemetry = body.telemetry && typeof body.telemetry === "object" ? body.telemetry : {};
+  const sessionId = normalizeGameSessionId(body.sessionId, req.actor, req.ip);
+  const languages = safeContentMode === "vocab"
+    ? await repo.listPublishedLanguagesByType(safeLevel === 2 ? "level2" : safeLevel === 3 ? "level3" : "sentence_words")
+    : await (async () => {
+      const type = getVocabularyTypeForLevel(safeLevel);
+      const packResult = await repo.listVocabularyPacks({ level: safeLevel, type, status: "published" }, {
+        page: 1,
+        pageSize: 500,
+        sortBy: "updated_at",
+        sortDir: "desc"
+      });
+      const dynamic = Array.isArray(packResult?.rows)
+        ? packResult.rows.map((row) => String(row.language || "").toLowerCase()).filter(Boolean)
+        : [];
+      return Array.from(new Set(["en", "ru", ...dynamic]));
+    })();
   let fallbackNotice = null;
   let language = requestedLanguage;
   if (!languages.includes(language)) {
@@ -1410,7 +2223,15 @@ app.post("/api/tasks/generate", requirePermission(Permissions.TASKS_GENERATE), r
       language = requestedLanguage === "ru" ? "ru" : "en";
     }
   }
-  const tasks = await generateTasks(safeLevel, safeCount, safeContentMode, language);
+  const tasks = await generateTasks(safeLevel, safeCount, safeContentMode, language, {
+    sessionId,
+    telemetry: {
+      cpm: clampNumber(telemetry.cpm, 0, 10_000, 0)
+    },
+    actor: req.actor,
+    ip: req.ip,
+    requestId: req.requestId || null
+  });
   res.json({ tasks, language, fallbackNotice, safeDefaultsApplied: !actorIsAuthorized });
 }));
 
@@ -1501,9 +2322,28 @@ app.get("/api/leaderboard", requirePermission(Permissions.LEADERBOARD_READ), wit
 
 app.get("/api/packs/languages", requirePermission(Permissions.TASKS_GENERATE), withAsync(async (req, res) => {
   const level = asNumber(req.query.level || 2, { min: 1, max: 5, field: "level" });
-  const type = level === 2 ? "level2" : level === 3 ? "level3" : "sentence_words";
-  const languages = await repo.listPublishedLanguagesByType(type);
-  res.json({ ok: true, level, type, languages });
+  const contentMode = req.query.contentMode === "vocab" ? "vocab" : "default";
+  if (contentMode === "vocab") {
+    const type = level === 2 ? "level2" : level === 3 ? "level3" : "sentence_words";
+    const languages = await repo.listPublishedLanguagesByType(type);
+    return res.json({ ok: true, level, type, contentMode, languages });
+  }
+  const vocabType = getVocabularyTypeForLevel(level);
+  const packResult = await repo.listVocabularyPacks({
+    level,
+    type: vocabType,
+    status: "published"
+  }, {
+    page: 1,
+    pageSize: 500,
+    sortBy: "updated_at",
+    sortDir: "desc"
+  });
+  const dynamic = Array.isArray(packResult?.rows)
+    ? packResult.rows.map((row) => String(row.language || "").toLowerCase()).filter(Boolean)
+    : [];
+  const languages = Array.from(new Set(["en", "ru", ...dynamic])).sort();
+  return res.json({ ok: true, level, type: vocabType, contentMode, languages });
 }));
 
 app.get("/api/packs/items", requirePermission(Permissions.TASKS_GENERATE), withAsync(async (req, res) => {
@@ -1578,15 +2418,14 @@ app.post("/api/admin/language-packs/import", requirePermission(Permissions.VOCAB
 
 app.post("/api/admin/language-packs/generate", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, generationLimiter, withAsync(async (req, res) => {
   if (!req.actor?.isAuthenticated) throw badRequest("Authentication required");
-  const existing = await repo.getUserSecret(req.actor.id, "openai_api_key");
-  if (!existing) throw badRequest("OpenAI key is required for generation");
-  const apiKey = await getOpenAIKeyForActor(req.actor);
+  const openaiCtx = await resolveOpenAIExecutionContext(req.actor, { includeLegacy: true });
+  if (!openaiCtx?.apiKey) throw badRequest("OpenAI key is required for generation");
   const language = asString(req.body?.language || "en", { min: 2, max: 10, field: "language" }).toLowerCase();
   const type = asEnum(req.body?.type || "level2", ["level2", "level3", "sentence_words"], "type");
   const count = asNumber(req.body?.count || 30, { min: 5, max: 200, field: "count" });
   const topic = String(req.body?.topic || "general toddler-safe learning");
   const prompt = strictPrompt({ language, type, count, topic });
-  const output = await callOpenAI({ apiKey, prompt });
+  const output = await callOpenAI({ apiKey: openaiCtx.apiKey, model: openaiCtx.model || OPENAI_MODEL, prompt });
   const parsed = JSON.parse(output);
   const items = parseJsonArrayOfStrings(parsed.items || [], "items", 500);
   const packId = await repo.createLanguagePack({ language, type, topic, status: "DRAFT", createdBy: req.actor.id });
@@ -1596,8 +2435,19 @@ app.post("/api/admin/language-packs/generate", requirePermission(Permissions.VOC
 }));
 
 app.get("/api/admin/vocabulary/generator/status", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, withAsync(async (req, res) => {
-  const key = await getOpenAIKeyForActor(req.actor);
-  res.json({ ok: true, enabled: Boolean(key), defaultModel: OPENAI_MODEL });
+  const serviceConfig = await getOpenAIServiceConfig();
+  const summary = summarizeOpenAIServiceStatus(serviceConfig);
+  const resolved = await resolveOpenAIExecutionContext(req.actor, { includeLegacy: true });
+  res.json({
+    ok: true,
+    enabled: Boolean(resolved?.apiKey),
+    configured: summary.configured || Boolean(resolved?.apiKey),
+    source: resolved?.source || null,
+    defaultModel: String(summary.model || OPENAI_MODEL),
+    verified: Boolean(summary.lastTestOk),
+    lastTestAt: summary.lastTestAt || null,
+    lastTestError: summary.lastTestError || null
+  });
 }));
 
 app.get("/api/admin/vocabulary/tree", requirePermission(Permissions.VOCAB_MANAGE), adminLimiter, withAsync(async (req, res) => {
@@ -1686,7 +2536,7 @@ app.post("/api/admin/vocabulary/packs", requirePermission(Permissions.VOCAB_MANA
     level: asNumber(body.level || 1, { min: 1, max: 5, field: "level" }),
     type: normalizeVocabularyType(body.type),
     status: normalizeVocabularyStatus(body.status || "draft"),
-    source: ["manual", "openai", "imported"].includes(String(body.source || "").toLowerCase()) ? String(body.source).toLowerCase() : "manual",
+    source: normalizeVocabularySource(body.source || "manual"),
     version: 1,
     generator_config: body.generator_config || null,
     metadata: body.metadata || null,
@@ -1732,7 +2582,7 @@ app.put("/api/admin/vocabulary/packs/:id", requirePermission(Permissions.VOCAB_M
     level: body.level ? asNumber(body.level, { min: 1, max: 5, field: "level" }) : existing.level,
     type: body.type ? normalizeVocabularyType(body.type) : existing.type,
     status: body.status ? normalizeVocabularyStatus(body.status) : existing.status,
-    source: body.source ? String(body.source).toLowerCase() : existing.source,
+    source: body.source ? normalizeVocabularySource(body.source) : normalizeVocabularySource(existing.source),
     generator_config: body.generator_config !== undefined ? body.generator_config : safeParseJson(existing.generator_config, null),
     metadata: body.metadata !== undefined ? body.metadata : safeParseJson(existing.metadata, null),
     version: nextVersion
@@ -1886,11 +2736,11 @@ app.post("/api/admin/vocabulary/packs/:id/regenerate", requirePermission(Permiss
   const id = String(req.params.id || "");
   const pack = await repo.getVocabularyPackById(id);
   if (!pack) throw new AppError("Not found", { status: 404, code: "NOT_FOUND", expose: true });
-  const keyToUse = await getOpenAIKeyForActor(req.actor);
-  if (!keyToUse) throw new AppError("OpenAI key missing", { status: 400, code: "OPENAI_KEY_MISSING", expose: true });
+  const openaiCtx = await resolveOpenAIExecutionContext(req.actor, { includeLegacy: true });
+  if (!openaiCtx?.apiKey) throw new AppError("OpenAI key missing", { status: 400, code: "OPENAI_KEY_MISSING", expose: true });
   const body = requireObject(req.body || {}, "body");
   const count = asNumber(body.count || 30, { min: 5, max: 500, field: "count" });
-  const model = asString(body.model || OPENAI_MODEL, { min: 3, max: 120, field: "model" });
+  const model = asString(body.model || openaiCtx.model || OPENAI_MODEL, { min: 3, max: 120, field: "model" });
   const temperature = clampNumber(body.temperature ?? 0.5, 0, 1.2, 0.5);
   const maxTokens = clampNumber(body.max_tokens ?? 1200, 128, 4000, 1200);
   const promptTemplate = String(body.prompt_template || "").trim();
@@ -1909,7 +2759,7 @@ app.post("/api/admin/vocabulary/packs/:id/regenerate", requirePermission(Permiss
   const minRequired = Math.max(3, Math.floor(count * 0.6));
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     output = await callOpenAI({
-      apiKey: keyToUse,
+      apiKey: openaiCtx.apiKey,
       model,
       temperature,
       maxTokens,
@@ -1924,7 +2774,8 @@ app.post("/api/admin/vocabulary/packs/:id/regenerate", requirePermission(Permiss
   }
   const validated = validateGeneratedVocabularyItems(parsedItems, {
     type: normalizeVocabularyType(pack.type),
-    level: Number(pack.level || 1)
+    level: Number(pack.level || 1),
+    language: String(pack.language || "en")
   });
   if (validated.items.length < minRequired) {
     const diagnostics = {
@@ -2014,6 +2865,9 @@ app.post("/api/admin/vocabulary/packs/batch", requirePermission(Permissions.VOCA
   if (ids.length > 100) throw new AppError("Batch size too large", { status: 400, code: "BATCH_TOO_LARGE", expose: true });
   const results = [];
   const count = clampNumber(body.count ?? 30, 5, 500, 30);
+  const batchOpenAICtx = action === "regenerate"
+    ? await resolveOpenAIExecutionContext(req.actor, { includeLegacy: true })
+    : null;
   for (const id of ids) {
     try {
       if (action === "publish") await repo.updateVocabularyPack(id, { status: "published" });
@@ -2029,8 +2883,7 @@ app.post("/api/admin/vocabulary/packs/batch", requirePermission(Permissions.VOCA
       if (action === "regenerate") {
         const pack = await repo.getVocabularyPackById(id);
         if (!pack) throw new Error("Not found");
-        const keyToUse = await getOpenAIKeyForActor(req.actor);
-        if (!keyToUse) throw new Error("OpenAI key missing");
+        if (!batchOpenAICtx?.apiKey) throw new Error("OpenAI key missing");
         const prompts = buildVocabularyGenerationPrompts({
           language: String(pack.language || "en"),
           level: Number(pack.level || 1),
@@ -2038,11 +2891,17 @@ app.post("/api/admin/vocabulary/packs/batch", requirePermission(Permissions.VOCA
           count,
           theme: body.theme || ""
         });
-        const output = await callOpenAI({ apiKey: keyToUse, systemPrompt: prompts.system, prompt: prompts.developer });
+        const output = await callOpenAI({
+          apiKey: batchOpenAICtx.apiKey,
+          model: batchOpenAICtx.model || OPENAI_MODEL,
+          systemPrompt: prompts.system,
+          prompt: prompts.developer
+        });
         const parsedItems = safeParseJsonArrayOfStrings(output, count);
         const validated = validateGeneratedVocabularyItems(parsedItems, {
           type: normalizeVocabularyType(pack.type),
-          level: Number(pack.level || 1)
+          level: Number(pack.level || 1),
+          language: String(pack.language || "en")
         });
         if (!validated.items.length) throw new Error("No valid generated items");
         await repo.updateVocabularyPack(id, {
@@ -2144,16 +3003,22 @@ app.post("/api/vocab/generate", requirePermission(Permissions.VOCAB_MANAGE), adm
   const safeCount = asNumber(body.count ?? 20, { min: 10, max: 200, field: "count" });
   const safeType = asEnum(body.packType || "level2", ["level2", "level3", "sentence_words"], "packType");
 
-  let keyToUse = body.apiKey || null;
-  if (body.storeKey && body.apiKey) {
-    await storeOpenAIKeyForActor(req.actor, String(body.apiKey));
+  const rawApiKey = String(body.apiKey || "").trim();
+  if (rawApiKey) {
+    await applyOpenAIServiceSettings({
+      actor: req.actor,
+      apiKey: rawApiKey,
+      storeKey: Boolean(body.storeKey),
+      enabled: true,
+      model: body.model || OPENAI_MODEL
+    });
   }
-  if (!keyToUse && body.storeKey) {
-    keyToUse = await getOpenAIKeyForActor(req.actor);
-  }
-  if (!keyToUse) throw badRequest("OpenAI key required");
+  const openaiCtx = rawApiKey
+    ? { apiKey: rawApiKey, source: body.storeKey ? "service.openai.db" : "service.openai.ephemeral", model: OPENAI_MODEL }
+    : await resolveOpenAIExecutionContext(req.actor, { includeLegacy: true });
+  if (!openaiCtx?.apiKey) throw badRequest("OpenAI key required");
 
-  const words = await generateWithRetry({ apiKey: keyToUse, packType: safeType, count: safeCount });
+  const words = await generateWithRetry({ apiKey: openaiCtx.apiKey, packType: safeType, count: safeCount });
   await repo.insertPack({
     name: body.name || "Generated Pack",
     packType: safeType,
@@ -2167,15 +3032,107 @@ app.post("/api/vocab/generate", requirePermission(Permissions.VOCAB_MANAGE), adm
 
 app.post("/api/admin/openai/test", requirePermission(Permissions.ADMIN_SECRET_MANAGE), adminLimiter, generationLimiter, withAsync(async (req, res) => {
   const body = requireObject(req.body || {}, "body");
-  let keyToUse = body.apiKey || null;
-  if (body.storeKey && body.apiKey) {
-    await storeOpenAIKeyForActor(req.actor, String(body.apiKey));
+  const rawApiKey = String(body.apiKey || "").trim();
+  if (rawApiKey || body.storeKey !== undefined || body.enabled !== undefined || body.model) {
+    await applyOpenAIServiceSettings({
+      actor: req.actor,
+      apiKey: rawApiKey || null,
+      storeKey: body.storeKey === undefined ? undefined : Boolean(body.storeKey),
+      enabled: body.enabled === undefined ? undefined : Boolean(body.enabled),
+      model: body.model ? String(body.model) : undefined
+    });
   }
-  if (!keyToUse && body.storeKey) keyToUse = await getOpenAIKeyForActor(req.actor);
-  if (!keyToUse) throw badRequest("Key required");
-  await callOpenAI({ apiKey: keyToUse, prompt: "Return STRICT JSON: {\"ok\": true}" });
-  await audit(req, "secret.openai.test", "secret", "openai_api_key");
-  res.json({ ok: true });
+  try {
+    const result = await runOpenAIConnectivityTest(req.actor, req.requestId || null);
+    await persistOpenAITestStatus({ ok: true, code: "ok", errorMessage: null });
+    await audit(req, "secret.openai.test", "secret", "service.openai", {
+      source: result.source,
+      model: result.model,
+      requestId: result.requestId
+    });
+    return res.json(result);
+  } catch (err) {
+    const classified = classifyOpenAITestError(err);
+    await persistOpenAITestStatus({ ok: false, code: classified.code, errorMessage: classified.message });
+    throw new AppError(classified.message, {
+      status: err?.status && Number(err.status) >= 400 ? Number(err.status) : 400,
+      code: "OPENAI_TEST_FAILED",
+      expose: true,
+      metadata: {
+        requestId: req.requestId || null,
+        reason: classified.code
+      }
+    });
+  }
+}));
+
+app.get("/api/admin/service/openai/status", requirePermission(Permissions.ADMIN_SECRET_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const serviceConfig = await getOpenAIServiceConfig();
+  const summary = summarizeOpenAIServiceStatus(serviceConfig);
+  const resolved = await resolveOpenAIExecutionContext(req.actor, { includeLegacy: true });
+  const ephemeralActive = Boolean(getOpenAIEphemeralKey(req.actor)?.apiKey);
+  res.json({
+    ok: true,
+    status: {
+      ...summary,
+      configured: Boolean(resolved?.apiKey) || Boolean(summary.configured),
+      activeSource: resolved?.source || (summary.storeInDb ? (summary.configured ? "service.openai.db" : null) : (ephemeralActive ? "service.openai.ephemeral" : null)),
+      persisted: summary.storeInDb && summary.configured,
+      requestId: req.requestId || null
+    }
+  });
+}));
+
+app.post("/api/admin/service/openai", requirePermission(Permissions.ADMIN_SECRET_MANAGE), adminLimiter, withAsync(async (req, res) => {
+  const body = requireObject(req.body || {}, "body");
+  const apiKey = body.apiKey === undefined ? undefined : String(body.apiKey || "");
+  const status = await applyOpenAIServiceSettings({
+    actor: req.actor,
+    apiKey,
+    storeKey: body.storeKey === undefined ? undefined : Boolean(body.storeKey),
+    enabled: body.enabled === undefined ? undefined : Boolean(body.enabled),
+    model: body.model ? String(body.model) : undefined
+  });
+  await audit(req, "service.openai.update", "config", "service.openai", {
+    enabled: status.enabled,
+    storeInDb: status.storeInDb,
+    model: status.model
+  });
+  res.json({ ok: true, status });
+}));
+
+app.post("/api/admin/service/openai/test", requirePermission(Permissions.ADMIN_SECRET_MANAGE), adminLimiter, generationLimiter, withAsync(async (req, res) => {
+  const body = requireObject(req.body || {}, "body");
+  const applyRequested = Boolean(body.applyBeforeTest);
+  const hasUpdatePayload = body.apiKey !== undefined || body.storeKey !== undefined || body.enabled !== undefined || body.model !== undefined;
+  if (applyRequested || hasUpdatePayload) {
+    await applyOpenAIServiceSettings({
+      actor: req.actor,
+      apiKey: body.apiKey === undefined ? undefined : String(body.apiKey || ""),
+      storeKey: body.storeKey === undefined ? undefined : Boolean(body.storeKey),
+      enabled: body.enabled === undefined ? undefined : Boolean(body.enabled),
+      model: body.model ? String(body.model) : undefined
+    });
+  }
+  try {
+    const result = await runOpenAIConnectivityTest(req.actor, req.requestId || null);
+    await persistOpenAITestStatus({ ok: true, code: "ok", errorMessage: null });
+    await audit(req, "service.openai.test", "config", "service.openai", {
+      source: result.source,
+      model: result.model,
+      requestId: result.requestId
+    });
+    res.json(result);
+  } catch (err) {
+    const classified = classifyOpenAITestError(err);
+    await persistOpenAITestStatus({ ok: false, code: classified.code, errorMessage: classified.message });
+    throw new AppError(classified.message, {
+      status: err?.status && Number(err.status) >= 400 ? Number(err.status) : 400,
+      code: "OPENAI_TEST_FAILED",
+      expose: true,
+      metadata: { requestId: req.requestId || null, reason: classified.code }
+    });
+  }
 }));
 
 app.post("/api/admin/reset", requirePermission(Permissions.ADMIN_RESET), adminLimiter, withAsync(async (req, res) => {
@@ -2193,6 +3150,8 @@ app.get("/api/admin/service-settings", requirePermission(Permissions.ADMIN_CONFI
     fallback: { google: { enabled: Boolean(BOOTSTRAP_GOOGLE_CLIENT_ID), clientId: BOOTSTRAP_GOOGLE_CLIENT_ID || "" } }
   });
   const googleSecret = await repo.getSystemSecret("google.client_secret");
+  const openaiSummary = summarizeOpenAIServiceStatus(await getOpenAIServiceConfig());
+  const openaiActive = await resolveOpenAIExecutionContext(req.actor, { includeLegacy: true });
   res.json({
     ok: true,
     settings: {
@@ -2212,6 +3171,16 @@ app.get("/api/admin/service-settings", requirePermission(Permissions.ADMIN_CONFI
           clientId: String(providers?.google?.clientId || ""),
           hasClientSecret: Boolean(googleSecret?.ciphertext)
         }
+      },
+      openai: {
+        enabled: openaiSummary.enabled,
+        configured: openaiSummary.configured || Boolean(openaiActive?.apiKey),
+        storeInDb: openaiSummary.storeInDb,
+        model: openaiSummary.model,
+        lastTestAt: openaiSummary.lastTestAt || null,
+        lastTestOk: Boolean(openaiSummary.lastTestOk),
+        lastTestError: openaiSummary.lastTestError || null,
+        source: openaiActive?.source || null
       },
       db: {
         activeDriver,
@@ -2800,6 +3769,18 @@ async function seedDefaultRuntimeConfig() {
   }
   if (!keys.has("generator.defaults")) {
     await configStore.setSafe("generator.defaults", { openAiModel: OPENAI_MODEL, maxCount: 200, openaiEnabled: false }, { scope: "global", scopeId: "global", updatedBy: "bootstrap" });
+  }
+  if (!keys.has("service.openai")) {
+    await configStore.setSafe("service.openai", {
+      enabled: false,
+      storeInDb: true,
+      model: OPENAI_MODEL,
+      apiKeyEnc: null,
+      lastTestAt: null,
+      lastTestOk: false,
+      lastTestError: null,
+      lastTestCode: null
+    }, { scope: "global", scopeId: "global", updatedBy: "bootstrap" });
   }
   if (!keys.has("service.email")) {
     await configStore.setSafe("service.email", {

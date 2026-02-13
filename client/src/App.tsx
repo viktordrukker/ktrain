@@ -269,7 +269,7 @@ type VocabularyPackRow = {
   level: number;
   type: "words" | "sentences" | "fiction" | "code";
   status: "draft" | "published" | "archived";
-  source: "manual" | "openai" | "imported";
+  source: "manual" | "openai" | "imported" | "online_generated";
   version: number;
   generator_config?: any;
   metadata?: any;
@@ -527,11 +527,24 @@ async function parseApiError(res: Response, fallback: string) {
 }
 
 const API = {
-  async generateTasks(level: number, count: number, contentMode: ContentMode, language = "en"): Promise<{ tasks: Task[]; language: string; fallbackNotice?: string | null }> {
+  async generateTasks(
+    level: number,
+    count: number,
+    contentMode: ContentMode,
+    language = "en",
+    options: { sessionId?: string; telemetry?: { cpm?: number } } = {}
+  ): Promise<{ tasks: Task[]; language: string; fallbackNotice?: string | null }> {
     const res = await fetch("/api/tasks/generate", {
       method: "POST",
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ level, count, contentMode, language })
+      body: JSON.stringify({
+        level,
+        count,
+        contentMode,
+        language,
+        sessionId: options.sessionId || null,
+        telemetry: options.telemetry || null
+      })
     });
     if (!res.ok) throw await parseApiError(res, "Failed to generate tasks");
     return res.json();
@@ -621,15 +634,15 @@ const API = {
     return res.json();
   },
   async getOwnOpenAIKeyStatus() {
-    const res = await fetch("/api/user/openai-key/status", { headers: withAuthHeaders() });
+    const res = await fetch("/api/admin/service/openai/status", { headers: withAuthHeaders() });
     if (!res.ok) throw await parseApiError(res, "Failed to load OpenAI key status");
     return res.json();
   },
-  async saveOwnOpenAIKey(apiKey: string) {
-    const res = await fetch("/api/user/openai-key", {
-      method: "PUT",
+  async saveOwnOpenAIKey(payload: { apiKey?: string; storeKey?: boolean; enabled?: boolean; model?: string }) {
+    const res = await fetch("/api/admin/service/openai", {
+      method: "POST",
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ apiKey })
+      body: JSON.stringify(payload || {})
     });
     if (!res.ok) throw await parseApiError(res, "Failed to save OpenAI key");
     return res.json();
@@ -738,8 +751,9 @@ const API = {
     if (!res.ok) throw await parseApiError(res, "Logout failed");
     return res.json();
   },
-  async getAvailableLanguages(level: number) {
-    const res = await fetch(`/api/packs/languages?level=${level}`, { headers: withAuthHeaders() });
+  async getAvailableLanguages(level: number, contentMode: ContentMode = "default") {
+    const params = new URLSearchParams({ level: String(level), contentMode });
+    const res = await fetch(`/api/packs/languages?${params.toString()}`, { headers: withAuthHeaders() });
     if (!res.ok) throw await parseApiError(res, "Failed to load available languages");
     return res.json();
   },
@@ -803,10 +817,10 @@ const API = {
     return this.generateLanguagePack(payload);
   },
   async testOpenAI(payload: any, _pin?: string) {
-    const res = await fetch("/api/admin/openai/test", {
+    const res = await fetch("/api/admin/service/openai/test", {
       method: "POST",
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload || {})
     });
     if (!res.ok) throw await parseApiError(res, "Test failed");
     return res.json();
@@ -1917,6 +1931,19 @@ function App() {
     setMistakeFlash(false);
   };
 
+  const createNewPlaySessionId = useCallback(() => {
+    const sid = crypto.randomUUID();
+    localStorage.setItem(PLAY_SESSION_KEY, sid);
+    setPlaySessionId(sid);
+    return sid;
+  }, []);
+
+  const resolveActivePlaySessionId = useCallback(() => {
+    const existing = playSessionId || localStorage.getItem(PLAY_SESSION_KEY) || "";
+    if (existing) return existing;
+    return createNewPlaySessionId();
+  }, [playSessionId, createNewPlaySessionId]);
+
   const recordSessionStats = async (endedAtMs: number, totalMs: number) => {
     const sessionSummary = {
       lettersTyped: gameStats.correct + gameStats.incorrect,
@@ -2067,11 +2094,15 @@ function App() {
 
   const startGame = async (activeSettings?: GameSettings) => {
     const runSettings = activeSettings || settings;
+    const sessionId = createNewPlaySessionId();
     setStatusMessage("");
     if (!sessionUser && !String(runSettings.playerName || "").trim()) {
       setSettings((prev) => ({ ...prev, playerName: "Guest" }));
     }
-    const generated = await API.generateTasks(runSettings.level, 40, runSettings.contentMode, runSettings.language);
+    const generated = await API.generateTasks(runSettings.level, 40, runSettings.contentMode, runSettings.language, {
+      sessionId,
+      telemetry: { cpm: 0 }
+    });
     if (generated.language !== runSettings.language) {
       setSettings((prev) => ({ ...prev, language: generated.language || prev.language }));
     }
@@ -2150,7 +2181,10 @@ function App() {
   };
 
   const loadMoreTasks = async () => {
-    const generated = await API.generateTasks(settings.level, 40, settings.contentMode, settings.language);
+    const generated = await API.generateTasks(settings.level, 40, settings.contentMode, settings.language, {
+      sessionId: resolveActivePlaySessionId(),
+      telemetry: { cpm }
+    });
     if (generated.fallbackNotice) {
       setStatusMessage(generated.fallbackNotice);
     }
@@ -2528,7 +2562,7 @@ function App() {
       setAvailableLanguages(["en", "ru"]);
       return;
     }
-    API.getAvailableLanguages(settings.level)
+    API.getAvailableLanguages(settings.level, settings.contentMode)
       .then((data) => {
         const langs = Array.isArray(data.languages) && data.languages.length > 0 ? data.languages : ["en", "ru"];
         setAvailableLanguages(langs);
@@ -2537,7 +2571,7 @@ function App() {
         }
       })
       .catch(() => setAvailableLanguages(["en", "ru"]));
-  }, [settings.level, isSetupRoute, isSetupRequired]);
+  }, [settings.level, settings.contentMode, isSetupRoute, isSetupRequired]);
 
   useEffect(() => {
     if (isSetupRoute || isSetupRequired) return;
@@ -4121,7 +4155,7 @@ function VocabularyCenterScreen({
         <Select label="Level" value={String(filters.level)} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, level: v || "" })); }} data={[{ value: "", label: "All" }, ...[1, 2, 3, 4, 5].map((n) => ({ value: String(n), label: String(n) }))]} />
         <Select label="Type" value={filters.type} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, type: v || "" })); }} data={[{ value: "", label: "All" }, ...["words", "sentences", "fiction", "code"].map((v) => ({ value: v, label: v }))]} />
         <Select label="Status" value={filters.status} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, status: v || "" })); }} data={[{ value: "", label: "All" }, ...["draft", "published", "archived"].map((v) => ({ value: v, label: v }))]} />
-        <Select label="Source" value={filters.source} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, source: v || "" })); }} data={[{ value: "", label: "All" }, ...["manual", "openai", "imported"].map((v) => ({ value: v, label: v }))]} />
+        <Select label="Source" value={filters.source} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, source: v || "" })); }} data={[{ value: "", label: "All" }, ...["manual", "openai", "imported", "online_generated"].map((v) => ({ value: v, label: v }))]} />
         <TextInput label="Search" value={filters.search} onChange={(e) => { setPage(1); setFilters((p) => ({ ...p, search: e.currentTarget.value })); }} />
       </div>
 
@@ -4634,6 +4668,10 @@ function SettingsScreen({
 }) {
   const [openaiKey, setOpenaiKey] = useState("");
   const [storeKey, setStoreKey] = useState(false);
+  const [openaiSavedStoreKey, setOpenaiSavedStoreKey] = useState(false);
+  const [openaiModel, setOpenaiModel] = useState("gpt-4o-mini");
+  const [openaiLastTestAt, setOpenaiLastTestAt] = useState<string | null>(null);
+  const [openaiLastTestOk, setOpenaiLastTestOk] = useState(false);
   const [generateType, setGenerateType] = useState<"level2" | "level3" | "sentence_words">("level2");
   const [generateCount, setGenerateCount] = useState(30);
   const [generateName, setGenerateName] = useState("New Pack");
@@ -4729,7 +4767,6 @@ function SettingsScreen({
   );
   const dbDirty = Boolean(savedDbConfig && JSON.stringify(dbConfig) !== JSON.stringify(savedDbConfig));
   const hasAnyUnsaved = hasUnsavedSettings || openaiDirty || emailDirty || googleDirty || dbDirty;
-  const openaiGenerationReady = isAdmin && openaiConfigured && !openaiDirty;
   const smtpToggleLocked = Boolean(configStatus && configStatus.optional.smtp !== "READY");
   const googleToggleLocked = Boolean(configStatus && configStatus.optional.googleAuth !== "READY");
   const themePreview = applyVisibilityGuard(computeTheme(appSettings), appSettings.visibilityGuard).theme;
@@ -4801,12 +4838,25 @@ function SettingsScreen({
         return false;
       }
     }
-    if (openaiDirty) {
+    if (isAdmin && openaiDirty) {
       try {
-        await API.saveOwnOpenAIKey(openaiKey.trim());
-        setOpenaiConfigured(true);
+        const payload: any = {
+          storeKey,
+          enabled: true,
+          model: openaiModel
+        };
+        if (openaiKey.trim()) payload.apiKey = openaiKey.trim();
+        const saved = await API.saveOwnOpenAIKey(payload);
+        const nextStatus = saved?.status || {};
+        setOpenaiConfigured(Boolean(nextStatus.configured));
+        setStoreKey(Boolean(nextStatus.storeInDb));
+        setOpenaiSavedStoreKey(Boolean(nextStatus.storeInDb));
+        setOpenaiModel(String(nextStatus.model || openaiModel || "gpt-4o-mini"));
+        setOpenaiLastTestAt(nextStatus.lastTestAt || null);
+        setOpenaiLastTestOk(Boolean(nextStatus.lastTestOk));
+        setOpenaiKey("");
         setOpenaiDirty(false);
-        setOpenaiStatus("OpenAI key saved.");
+        setOpenaiStatus("OpenAI settings saved. Run Test key to verify.");
       } catch (err: any) {
         setOpenaiStatus(err?.message || "Failed to save OpenAI key.");
         return false;
@@ -5076,15 +5126,34 @@ function SettingsScreen({
         setSavedDbConfig(configRes.dbConfig);
       })
       .catch(() => null);
+    if (!isAdmin) {
+      setOpenaiConfigured(false);
+      setOpenaiDirty(false);
+      return;
+    }
     API.getOwnOpenAIKeyStatus()
       .then((data) => {
-        setOpenaiConfigured(Boolean(data?.configured));
+        const status = data?.status || data || {};
+        setOpenaiConfigured(Boolean(status?.configured));
+        setStoreKey(Boolean(status?.storeInDb));
+        setOpenaiSavedStoreKey(Boolean(status?.storeInDb));
+        setOpenaiModel(String(status?.model || "gpt-4o-mini"));
+        setOpenaiLastTestAt(status?.lastTestAt || null);
+        setOpenaiLastTestOk(Boolean(status?.lastTestOk));
+        if (status?.lastTestError) {
+          setOpenaiStatus(`Last test failed: ${status.lastTestError}`);
+        } else if (status?.lastTestOk) {
+          setOpenaiStatus("Last key test passed.");
+        } else {
+          setOpenaiStatus("");
+        }
         setOpenaiDirty(false);
       })
       .catch(() => {
         setOpenaiConfigured(false);
+        setOpenaiStatus("");
       });
-  }, [adminPin]);
+  }, [adminPin, isAdmin]);
 
   useEffect(() => {
     if (!sessionUser) {
@@ -6106,46 +6175,74 @@ function SettingsScreen({
                 </Alert>
               </div>
             )}
-            <Divider my="sm" />
-            <SettingRow label="OpenAI API key" helper="Server-side only.">
-              <TextInput
-                value={openaiKey}
-                onChange={(e) => {
-                  setOpenaiKey(e.currentTarget.value);
-                  setOpenaiDirty(Boolean(e.currentTarget.value.trim()));
-                }}
-                placeholder={openaiConfigured ? "Configured (enter new key to rotate)" : "sk-..."}
-              />
-            </SettingRow>
-            <SettingRow label="Store key in database" helper="Insecure. Use only on trusted devices.">
-              <Switch
-                checked={storeKey}
-                onChange={(e) => setStoreKey(e.currentTarget.checked)}
-              />
-            </SettingRow>
-            <SettingRow label="Test key" helper="Check connectivity and permissions.">
-              <Button
-                variant="light"
-                onClick={async () => {
-                  setOpenaiStatus("");
-                  try {
-                    const res = await onTestKey({ apiKey: openaiKey, storeKey });
-                    setOpenaiStatus(res.ok ? "Key works!" : "Key failed");
-                  } catch {
-                    setOpenaiStatus("Key test failed");
-                  }
-                }}
-              >
-                Test key
-              </Button>
-            </SettingRow>
-            {openaiDirty && (
-              <div className="setting-row full">
-                <Alert color="blue">OpenAI key changed. Apply settings to save it.</Alert>
-              </div>
+            {isAdmin && (
+              <>
+                <Divider my="sm" />
+                <SettingRow label="OpenAI API key" helper="Server-side only.">
+                  <TextInput
+                    value={openaiKey}
+                    onChange={(e) => {
+                      const value = e.currentTarget.value;
+                      setOpenaiKey(value);
+                      setOpenaiDirty(Boolean(value.trim()) || storeKey !== openaiSavedStoreKey);
+                    }}
+                    placeholder={openaiConfigured ? "Configured (enter new key to rotate)" : "sk-..."}
+                  />
+                </SettingRow>
+                <SettingRow label="Store key in database" helper="Encrypted at rest with the server master key.">
+                  <Switch
+                    checked={storeKey}
+                    onChange={(e) => {
+                      const checked = e.currentTarget.checked;
+                      setStoreKey(checked);
+                      setOpenaiDirty(Boolean(openaiKey.trim()) || checked !== openaiSavedStoreKey);
+                    }}
+                  />
+                </SettingRow>
+                <SettingRow label="Test key" helper="Check connectivity and permissions.">
+                  <Button
+                    variant="light"
+                    onClick={async () => {
+                      setOpenaiStatus("");
+                      if (openaiDirty) {
+                        setOpenaiStatus("Apply changes before testing key.");
+                        return;
+                      }
+                      try {
+                        const res = await onTestKey({});
+                        setOpenaiLastTestAt(res?.testedAt || new Date().toISOString());
+                        setOpenaiLastTestOk(Boolean(res?.ok));
+                        setOpenaiStatus(res?.ok ? `Key works (${res?.source || "active source"}).` : "Key failed.");
+                      } catch (err: any) {
+                        const requestHint = err?.requestId ? ` request_id=${err.requestId}` : "";
+                        setOpenaiLastTestOk(false);
+                        setOpenaiStatus(`Key test failed: ${err?.message || "unknown error"}${requestHint}`);
+                      }
+                    }}
+                  >
+                    Test key
+                  </Button>
+                </SettingRow>
+                <SettingRow label="Model" helper="Active model used by key test and generation.">
+                  <TextInput value={openaiModel} readOnly />
+                </SettingRow>
+                {openaiDirty && (
+                  <div className="setting-row full">
+                    <Alert color="blue">OpenAI key changed. Apply settings to save it.</Alert>
+                  </div>
+                )}
+                {openaiConfigured && (
+                  <div className="setting-row full">
+                    <Alert color={openaiLastTestOk ? "green" : "yellow"}>
+                      {openaiLastTestOk ? "Verified." : "Not verified yet."}
+                      {openaiLastTestAt ? ` Last test: ${new Date(openaiLastTestAt).toLocaleString()}.` : ""}
+                    </Alert>
+                  </div>
+                )}
+                {openaiStatus && <div className="status">{openaiStatus}</div>}
+                <Divider my="sm" />
+              </>
             )}
-            {openaiStatus && <div className="status">{openaiStatus}</div>}
-            <Divider my="sm" />
             <SettingRow label="Reset data" helper="Resets are permanent.">
               <Group>
                 {"all leaderboard results vocab".split(" ").map((scope) => (
