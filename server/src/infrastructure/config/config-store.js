@@ -13,6 +13,7 @@ const SAFE_CONFIG_KEYS = new Set([
   "app.config_version",
   "app.wizard",
   "service.email.status",
+  "service.openai",
   "contest.rules",
   "generator.defaults",
   "theme.defaults",

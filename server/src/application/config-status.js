@@ -181,24 +181,39 @@ async function computeConfigStatus({
     }));
   }
 
-  const generatorDefaults = await configStore.get("generator.defaults", {
+  const openaiConfig = await configStore.get("service.openai", {
     scope: "global",
     scopeId: "global",
-    fallback: { openAiModel: openaiModel, maxCount: 200, openaiEnabled: false }
+    fallback: {
+      enabled: false,
+      model: openaiModel,
+      apiKeyEnc: null,
+      lastTestAt: null,
+      lastTestOk: false,
+      lastTestError: null
+    }
   });
-  const openaiEnabled = Boolean(generatorDefaults?.openaiEnabled);
-  const openaiSystemKey = await repo.getSetting("openai_key");
+  const openaiEnabled = Boolean(openaiConfig?.enabled);
+  const hasConfiguredKey = Boolean(
+    openaiConfig?.apiKeyEnc?.ciphertext
+    && openaiConfig?.apiKeyEnc?.iv
+    && (openaiConfig?.apiKeyEnc?.authTag || openaiConfig?.apiKeyEnc?.authtag)
+  );
   if (!openaiEnabled) {
     optional.openai = "MISSING";
-  } else if (openaiSystemKey) {
+  } else if (hasConfiguredKey && Boolean(openaiConfig?.lastTestOk)) {
     optional.openai = "READY";
   } else {
     optional.openai = "INVALID";
     details.push(statusDetail({
       key: "openai",
       severity: "WARN",
-      message: "OpenAI generation is enabled but no system key is configured.",
-      remediationHint: "Disable generation or configure an OpenAI key.",
+      message: hasConfiguredKey
+        ? "OpenAI is configured but latest verification failed."
+        : "OpenAI generation is enabled but no encrypted key is configured.",
+      remediationHint: hasConfiguredKey
+        ? "Run OpenAI test in Admin settings and fix any validation errors."
+        : "Save and test an OpenAI key in Admin settings.",
       affectedFeatures: ["pack-generation"],
       blocking: false
     }));

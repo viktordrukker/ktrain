@@ -1960,14 +1960,51 @@ function App() {
     setScreen("home");
   };
 
+  const normalizePlayableSettings = useCallback((value: GameSettings): GameSettings => ({
+    ...value,
+    mode: value.mode === "contest" ? "contest" : "learning",
+    level: Math.max(1, Math.min(5, Number(value.level || 1))),
+    contentMode: value.contentMode === "vocab" ? "vocab" : "default",
+    language: String(value.language || "en").toLowerCase()
+  }), []);
+
+  const toPreferencePayload = useCallback((value: GameSettings) => ({
+    mode: value.mode === "contest" ? "contest" : "learning",
+    level: Math.max(1, Math.min(5, Number(value.level || 1))),
+    contentType: value.contentMode === "vocab" ? "vocab" : "default",
+    language: String(value.language || "en").toLowerCase()
+  }), []);
+
+  const persistLastPlayedPreferences = useCallback(async (value: GameSettings) => {
+    if (!sessionUser?.isAuthenticated) return;
+    const payload = toPreferencePayload(value);
+    setSavedPreferences((prev) => ({ ...prev, ...payload }));
+    try {
+      const data = await API.saveGamePreferences(payload);
+      setSavedPreferences(data.preferences || { ...defaultGamePreferences, ...payload });
+    } catch (err) {
+      reportClientError("persist_last_played_preferences", err);
+    }
+  }, [sessionUser?.isAuthenticated, toPreferencePayload, reportClientError]);
+
   const applyMenuDraftToSettings = () => {
-    setSettings((prev) => ({
-      ...prev,
+    const next = normalizePlayableSettings({
+      ...settings,
       mode: menuDraftSettings.mode,
       level: menuDraftSettings.level,
       contentMode: menuDraftSettings.contentMode,
       language: menuDraftSettings.language
+    });
+    setSettings((prev) => ({
+      ...prev,
+      mode: next.mode,
+      level: next.level,
+      contentMode: next.contentMode,
+      language: next.language
     }));
+    if (sessionUser?.isAuthenticated) {
+      void persistLastPlayedPreferences(next);
+    }
   };
 
   const resetMenuDraftToDefaults = () => {
@@ -2004,13 +2041,13 @@ function App() {
   const startQuickGame = async () => {
     let nextSettings: GameSettings;
     if (sessionUser?.isAuthenticated) {
-      nextSettings = {
+      nextSettings = normalizePlayableSettings({
         ...settings,
-        mode: savedPreferences.mode === "contest" ? "contest" : "learning",
-        level: Math.max(1, Math.min(5, Number(savedPreferences.level || 1))),
-        contentMode: savedPreferences.contentType === "vocab" ? "vocab" : "default",
-        language: String(savedPreferences.language || "en").toLowerCase()
-      };
+        mode: menuDraftSettings.mode,
+        level: menuDraftSettings.level,
+        contentMode: menuDraftSettings.contentMode,
+        language: menuDraftSettings.language
+      });
     } else {
       nextSettings = {
         ...settings,
@@ -2022,6 +2059,9 @@ function App() {
       };
     }
     setSettings(nextSettings);
+    if (sessionUser?.isAuthenticated) {
+      void persistLastPlayedPreferences(nextSettings);
+    }
     await startGame(nextSettings);
   };
 
