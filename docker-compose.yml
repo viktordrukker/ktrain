@@ -34,7 +34,6 @@ services:
       - CRASH_REPORTS_DIR=${CRASH_REPORTS_DIR:-/data/crash-reports}
       - CRASH_ALERT_EMAILS=${CRASH_ALERT_EMAILS:-vdrukker@#thedrukkers.com}
       - OWNER_EMAIL=${OWNER_EMAIL:-vdrukker@thedrukkers.com}
-      - KTRAIN_MASTER_KEY=${KTRAIN_MASTER_KEY:-pedyty6EkRmcsIfDz/+DpzRbsj9qcoQleL5mybRgbr8=}
       - KTRAIN_BOOTSTRAP_DB=${KTRAIN_BOOTSTRAP_DB:-postgres://ktrain:stillnobodypasseshere@ff_postgres:5432/ktrain}
       - AUTH_TRUST_PROXY=${AUTH_TRUST_PROXY:-true}
       - AUTH_TRUSTED_PROXY_IPS=${AUTH_TRUSTED_PROXY_IPS:-}
