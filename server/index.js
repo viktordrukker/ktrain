@@ -284,6 +284,94 @@ function chooseRandom(list) {
   return list[Math.floor(Math.random() * list.length)];
 }
 
+function sanitizeGameplayWordText(raw, language = "en") {
+  const lang = String(language || "en").toLowerCase();
+  const source = String(raw || "");
+  const cleaned = lang === "ru"
+    ? source.replace(/[^0-9\u0400-\u04FF]/g, "")
+    : source.replace(/[^0-9A-Za-z]/g, "");
+  return cleaned.trim();
+}
+
+function sanitizeGameplaySentenceText(raw, language = "en") {
+  const lang = String(language || "en").toLowerCase();
+  const source = String(raw || "");
+  const cleaned = lang === "ru"
+    ? source.replace(/[^0-9\u0400-\u04FF\s]/g, " ")
+    : source.replace(/[^0-9A-Za-z\s]/g, " ");
+  return cleaned.replace(/\s+/g, " ").trim();
+}
+
+function sanitizeGameplayTask(task, fallbackLevel, language = "en") {
+  if (!task || typeof task !== "object") return null;
+  const level = clampNumber(task.level ?? fallbackLevel, 1, 5, clampNumber(fallbackLevel, 1, 5, 1));
+  if (level <= 3) {
+    const text = sanitizeGameplayWordText(task.answer || task.prompt || "", language);
+    if (!text) return null;
+    return {
+      ...task,
+      level,
+      prompt: text,
+      answer: text,
+      sentence: undefined,
+      wordIndex: undefined,
+      words: undefined
+    };
+  }
+  const sentenceSource = task.sentence
+    || (Array.isArray(task.words) ? task.words.join(" ") : String(task.answer || task.prompt || ""));
+  const sentence = sanitizeGameplaySentenceText(sentenceSource, language);
+  if (!sentence) return null;
+  const words = sentence
+    .split(" ")
+    .map((word) => sanitizeGameplayWordText(word, language))
+    .filter(Boolean);
+  if (!words.length) return null;
+  const currentWord = sanitizeGameplayWordText(task.answer || task.prompt || "", language).toLowerCase();
+  const guessedIndex = currentWord ? words.findIndex((word) => word.toLowerCase() === currentWord) : -1;
+  const fallbackIndex = Number.isInteger(task.wordIndex) ? Number(task.wordIndex) : guessedIndex;
+  const safeIndex = Math.max(0, Math.min(words.length - 1, fallbackIndex >= 0 ? fallbackIndex : 0));
+  return {
+    ...task,
+    level,
+    prompt: words[safeIndex],
+    answer: words[safeIndex],
+    sentence,
+    wordIndex: safeIndex,
+    words
+  };
+}
+
+function sanitizeGameplayTasks(tasks, { level, language, count }) {
+  const target = clampNumber(count, 5, 200, 10);
+  const fallbackLevel = clampNumber(level, 1, 5, 1);
+  const out = [];
+  const list = Array.isArray(tasks) ? tasks : [];
+  for (const task of list) {
+    const normalized = sanitizeGameplayTask(task, fallbackLevel, language);
+    if (!normalized) continue;
+    out.push(normalized);
+    if (out.length >= target) break;
+  }
+  return out;
+}
+
+function ensurePlayableTaskBatch(tasks, { level, language, count }) {
+  const target = clampNumber(count, 5, 200, 10);
+  const safeLevel = clampNumber(level, 1, 5, 1);
+  const playable = sanitizeGameplayTasks(tasks, { level: safeLevel, language, count: target });
+  if (playable.length >= target) return playable.slice(0, target);
+  const fallback = sanitizeGameplayTasks(
+    buildFallbackTasks(safeLevel, Math.max(target, 20), String(language || "en").toLowerCase()),
+    { level: safeLevel, language, count: Math.max(target, 20) }
+  );
+  for (let i = 0; i < fallback.length && playable.length < target; i += 1) {
+    const task = fallback[i];
+    playable.push({ ...task, id: `${task.id}-fb-${playable.length}` });
+  }
+  return playable.slice(0, target);
+}
+
 function sanitizeList(items) {
   const profanity = ["badword", "swear", "curse", "hate", "kill", "sex"];
   const filtered = items
@@ -435,17 +523,17 @@ function buildVocabularyGenerationPrompts({ language, level, type, count, theme 
   const safeTheme = String(theme || "").trim();
   const typeRules = type === "words"
     ? "Return single vocabulary words only. No spaces, no numbering, no markdown."
-    : "Return complete short sentences or chunks. Include spaces and natural punctuation.";
+    : "Return complete short sentences or chunks. Spaces are allowed, but punctuation and special symbols are not allowed.";
   const levelRules = {
     1: "Very short and basic items only.",
     2: "Beginner level. Keep words/sentences simple and easy to type.",
     3: "Intermediate beginner level with slightly longer vocabulary.",
-    4: "Intermediate level with richer sentence structure and punctuation.",
+    4: "Intermediate level with richer sentence structure and varied vocabulary.",
     5: "Advanced learner-friendly level with longer and more complex content."
   };
   const languageRule = String(language || "en").toLowerCase() === "ru"
-    ? "Use only Russian Cyrillic letters. Do not use transliteration or Latin words."
-    : "Use only English Latin letters and standard punctuation.";
+    ? "Use only Russian Cyrillic letters and digits. Do not use transliteration, Latin words, punctuation, or special symbols."
+    : "Use only English Latin letters and digits. Spaces are allowed for sentence/chunk types. No punctuation or special symbols.";
   const contentRule = safeTheme
     ? `Theme/topic: ${safeTheme}.`
     : "Theme/topic: general kid-safe educational content.";
@@ -477,27 +565,30 @@ function validateGeneratedVocabularyItems(items, { type, level, language = "en" 
   const wordMaxLen = wordMaxByLevel[numericLevel] || 7;
   const sentenceMaxLen = sentenceMaxByLevel[numericLevel] || 52;
   const lang = String(language || "en").toLowerCase();
-  const ruWordPattern = /^[\u0400-\u04FF-]+$/;
-  const ruSentencePattern = /^[\u0400-\u04FF0-9\s.,!?;:()\-"'«»]+$/;
-  const enWordPattern = /^[A-Za-z-]+$/;
-  const enSentencePattern = /^[A-Za-z0-9\s.,!?;:()\-'"`]+$/;
+  const ruWordPattern = /^[\u0400-\u04FF0-9]+$/;
+  const ruSentencePattern = /^[\u0400-\u04FF0-9\s]+$/;
+  const enWordPattern = /^[A-Za-z0-9]+$/;
+  const enSentencePattern = /^[A-Za-z0-9\s]+$/;
   for (const raw of items) {
     const text = String(raw || "").trim();
     if (!text) continue;
     if (text.includes("\n")) continue;
     if (type === "words") {
-      if (text.length > wordMaxLen) continue;
-      if (text.includes(" ")) continue;
-      if (lang === "ru" && !ruWordPattern.test(text)) continue;
-      if (lang !== "ru" && !enWordPattern.test(text)) continue;
-      validated.push(text);
+      const normalizedWord = sanitizeGameplayWordText(text, lang);
+      if (!normalizedWord) continue;
+      if (normalizedWord.length > wordMaxLen) continue;
+      if (normalizedWord.includes(" ")) continue;
+      if (lang === "ru" && !ruWordPattern.test(normalizedWord)) continue;
+      if (lang !== "ru" && !enWordPattern.test(normalizedWord)) continue;
+      validated.push(normalizedWord);
       continue;
     }
-    if (!text.includes(" ")) continue;
-    if (text.length > sentenceMaxLen) continue;
-    if (lang === "ru" && !ruSentencePattern.test(text)) continue;
-    if (lang !== "ru" && !enSentencePattern.test(text)) continue;
-    validated.push(text);
+    const normalizedSentence = sanitizeGameplaySentenceText(text, lang);
+    if (!normalizedSentence.includes(" ")) continue;
+    if (normalizedSentence.length > sentenceMaxLen) continue;
+    if (lang === "ru" && !ruSentencePattern.test(normalizedSentence)) continue;
+    if (lang !== "ru" && !enSentencePattern.test(normalizedSentence)) continue;
+    validated.push(normalizedSentence);
   }
   if (!validated.length) errors.push("No valid items after type-level validation.");
   return { items: validated, errors };
@@ -998,7 +1089,7 @@ function buildFallbackTasks(level, count, language) {
   return tasks.slice(0, count);
 }
 
-function buildTasksFromVocabularyEntries({ level, count, entries, channelState, packId }) {
+function buildTasksFromVocabularyEntries({ level, count, entries, channelState, packId, language = "en" }) {
   const tasks = [];
   if (!Array.isArray(entries) || entries.length === 0) return { tasks, depleted: true, remainingEntries: 0 };
   const total = entries.length;
@@ -1019,7 +1110,7 @@ function buildTasksFromVocabularyEntries({ level, count, entries, channelState, 
     for (let i = 0; i < candidate.length && tasks.length < count; i += 1) {
       const idx = candidate[i];
       usedSet.add(idx);
-      const text = String(entries[idx] || "").trim();
+      const text = sanitizeGameplayWordText(entries[idx], language);
       if (!text) continue;
       tasks.push({
         id: `${level}-w-${packId}-${Date.now()}-${tasks.length}`,
@@ -1037,9 +1128,12 @@ function buildTasksFromVocabularyEntries({ level, count, entries, channelState, 
     for (let i = 0; i < candidate.length && tasks.length < count; i += 1) {
       const idx = candidate[i];
       usedSet.add(idx);
-      const sentence = String(entries[idx] || "").replace(/\s+/g, " ").trim();
+      const sentence = sanitizeGameplaySentenceText(entries[idx], language);
       if (!sentence) continue;
-      const words = sentence.split(" ").filter(Boolean);
+      const words = sentence
+        .split(" ")
+        .map((word) => sanitizeGameplayWordText(word, language))
+        .filter(Boolean);
       if (!words.length) continue;
       for (let wordIndex = 0; wordIndex < words.length && tasks.length < count; wordIndex += 1) {
         const word = words[wordIndex];
@@ -1295,21 +1389,25 @@ async function generateTasks(level, count, contentMode, language = "en", runtime
     const sentenceWords = sentencePackItems.length ? sentencePackItems.map((row) => row.text) : (useRuDefaults ? defaults.sentenceWordsRu : defaults.sentenceWords);
 
     if (safeLevel === 1) {
-      return buildFallbackTasks(1, safeCount, safeLanguage);
+      return ensurePlayableTaskBatch(buildFallbackTasks(1, safeCount, safeLanguage), {
+        level: safeLevel,
+        count: safeCount,
+        language: safeLanguage
+      });
     }
     if (safeLevel === 2) {
       for (let i = 0; i < safeCount; i += 1) {
         const word = chooseRandom(level2Words);
         tasks.push({ id: `${safeLevel}-w-${Date.now()}-${i}`, level: safeLevel, prompt: word, answer: word });
       }
-      return tasks;
+      return ensurePlayableTaskBatch(tasks, { level: safeLevel, count: safeCount, language: safeLanguage });
     }
     if (safeLevel === 3) {
       for (let i = 0; i < safeCount; i += 1) {
         const word = chooseRandom(level3Words);
         tasks.push({ id: `${safeLevel}-w-${Date.now()}-${i}`, level: safeLevel, prompt: word, answer: word });
       }
-      return tasks;
+      return ensurePlayableTaskBatch(tasks, { level: safeLevel, count: safeCount, language: safeLanguage });
     }
     while (tasks.length < safeCount) {
       const maxWords = safeLevel === 4 ? 3 : 9;
@@ -1329,11 +1427,15 @@ async function generateTasks(level, count, contentMode, language = "en", runtime
         });
       });
     }
-    return tasks.slice(0, safeCount);
+    return ensurePlayableTaskBatch(tasks.slice(0, safeCount), { level: safeLevel, count: safeCount, language: safeLanguage });
   }
 
   if (safeLevel === 1) {
-    return buildFallbackTasks(1, safeCount, safeLanguage);
+    return ensurePlayableTaskBatch(buildFallbackTasks(1, safeCount, safeLanguage), {
+      level: safeLevel,
+      count: safeCount,
+      language: safeLanguage
+    });
   }
 
   const sessionId = normalizeGameSessionId(runtimeCtx.sessionId, runtimeCtx.actor, runtimeCtx.ip);
@@ -1373,7 +1475,11 @@ async function generateTasks(level, count, contentMode, language = "en", runtime
       triggerReason: "no_matching_packs",
       requestCount: Math.max(40, safeCount)
     });
-    return buildFallbackTasks(safeLevel, safeCount, safeLanguage);
+    return ensurePlayableTaskBatch(buildFallbackTasks(safeLevel, safeCount, safeLanguage), {
+      level: safeLevel,
+      count: safeCount,
+      language: safeLanguage
+    });
   }
 
   const selectedPackId = String(selectedPack.id);
@@ -1382,14 +1488,19 @@ async function generateTasks(level, count, contentMode, language = "en", runtime
     .filter(Boolean);
   if (!packEntries.length) {
     channelState.activePackId = null;
-    return buildFallbackTasks(safeLevel, safeCount, safeLanguage);
+    return ensurePlayableTaskBatch(buildFallbackTasks(safeLevel, safeCount, safeLanguage), {
+      level: safeLevel,
+      count: safeCount,
+      language: safeLanguage
+    });
   }
   const result = buildTasksFromVocabularyEntries({
     level: safeLevel,
     count: safeCount,
     entries: packEntries,
     channelState,
-    packId: selectedPackId
+    packId: selectedPackId,
+    language: safeLanguage
   });
   channelState.lastServedAtMs = Date.now();
 
@@ -1413,9 +1524,13 @@ async function generateTasks(level, count, contentMode, language = "en", runtime
   }
 
   if (!result.tasks.length) {
-    return buildFallbackTasks(safeLevel, safeCount, safeLanguage);
+    return ensurePlayableTaskBatch(buildFallbackTasks(safeLevel, safeCount, safeLanguage), {
+      level: safeLevel,
+      count: safeCount,
+      language: safeLanguage
+    });
   }
-  return result.tasks;
+  return ensurePlayableTaskBatch(result.tasks, { level: safeLevel, count: safeCount, language: safeLanguage });
 }
 
 async function callOpenAI({ apiKey, prompt, systemPrompt = "", model = OPENAI_MODEL, temperature = 0.7, maxTokens = null }) {
