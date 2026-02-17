@@ -136,8 +136,11 @@ jobs:
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
         run: |
           set -euo pipefail
-          if [ -n "${HETZNER_HOST:-}" ] && [ -n "${HETZNER_USER:-}" ] && [ -n "${HETZNER_SSH_KEY:-}" ] && [ -n "${DEPLOY_PATH:-}" ]; then
+          CLEAN_DEPLOY_PATH="$(printf '%s' "${DEPLOY_PATH:-}" | tr -d '\r\n')"
+          if [ -n "${HETZNER_HOST:-}" ] && [ -n "${HETZNER_USER:-}" ] && [ -n "${HETZNER_SSH_KEY:-}" ] && [ -n "${CLEAN_DEPLOY_PATH:-}" ]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "deploy_path_base=${CLEAN_DEPLOY_PATH}" >> "$GITHUB_OUTPUT"
+            echo "deploy_path_dev=${CLEAN_DEPLOY_PATH%/}-dev" >> "$GITHUB_OUTPUT"
             echo "Dev deploy is enabled."
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
@@ -157,14 +160,14 @@ jobs:
           username: ${{ secrets.HETZNER_USER }}
           key: ${{ secrets.HETZNER_SSH_KEY }}
           source: "docker-compose.dev.yml,.env.example,scripts/deploy-dev.sh,scripts/healthcheck.sh"
-          target: "${{ secrets.DEPLOY_PATH }}-dev"
+          target: "${{ steps.guard.outputs.deploy_path_dev }}"
           overwrite: true
 
       - name: Deploy ktrain-dev via SSH
         if: steps.guard.outputs.enabled == 'true'
         uses: appleboy/ssh-action@v1.2.0
         env:
-          DEPLOY_PATH_BASE: ${{ secrets.DEPLOY_PATH }}
+          DEPLOY_PATH_BASE: ${{ steps.guard.outputs.deploy_path_base }}
           MASTER_KEY_SECRET: ${{ secrets.KTRAIN_MASTER_KEY }}
           IMAGE_REF: ${{ needs.build_push.outputs.immutable_tag }}
           APP_BUILD: ${{ github.run_number }}
