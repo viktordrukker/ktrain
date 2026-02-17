@@ -123,15 +123,33 @@ jobs:
   deploy_dev:
     runs-on: ubuntu-latest
     needs: build_push
-    if: ${{ secrets.HETZNER_HOST != '' && secrets.HETZNER_USER != '' && secrets.HETZNER_SSH_KEY != '' && secrets.DEPLOY_PATH != '' }}
     concurrency:
       group: ktrain-dev-deploy
       cancel-in-progress: true
     steps:
+      - name: Guard deploy secrets
+        id: guard
+        env:
+          HETZNER_HOST: ${{ secrets.HETZNER_HOST }}
+          HETZNER_USER: ${{ secrets.HETZNER_USER }}
+          HETZNER_SSH_KEY: ${{ secrets.HETZNER_SSH_KEY }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          if [ -n "${HETZNER_HOST:-}" ] && [ -n "${HETZNER_USER:-}" ] && [ -n "${HETZNER_SSH_KEY:-}" ] && [ -n "${DEPLOY_PATH:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Dev deploy is enabled."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Dev deploy is skipped because required secrets are missing."
+          fi
+
       - name: Checkout
+        if: steps.guard.outputs.enabled == 'true'
         uses: actions/checkout@v4
 
       - name: Upload deployment assets (dev)
+        if: steps.guard.outputs.enabled == 'true'
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.HETZNER_HOST }}
@@ -143,6 +161,7 @@ jobs:
           overwrite: true
 
       - name: Deploy ktrain-dev via SSH
+        if: steps.guard.outputs.enabled == 'true'
         uses: appleboy/ssh-action@v1.2.0
         env:
           DEPLOY_PATH_BASE: ${{ secrets.DEPLOY_PATH }}
@@ -222,3 +241,7 @@ jobs:
             READINESS_TIMEOUT_SEC="180" \
             READINESS_POLL_SEC="2" \
             ./scripts/deploy-dev.sh
+
+      - name: Deploy skipped notice
+        if: steps.guard.outputs.enabled != 'true'
+        run: echo "Skipping dev deploy because one or more required secrets are not configured."
