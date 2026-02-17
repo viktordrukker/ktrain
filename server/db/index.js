@@ -119,20 +119,26 @@ function resolveDriver() {
   return runtime.activeDriver || DB_DRIVER_ENV;
 }
 
-async function createAdapter(driver) {
-  const config = resolveDbConfig();
+function postgresClientConfig(postgresCfg = {}) {
+  const safe = sanitizeDbConfig({ postgres: postgresCfg }).postgres;
+  if (safe.connectionString) {
+    return { connectionString: safe.connectionString };
+  }
+  return {
+    host: safe.host,
+    port: safe.port,
+    database: safe.database,
+    user: safe.user,
+    password: safe.password
+  };
+}
+
+async function createAdapterWithConfig(driver, configInput = null) {
+  const config = sanitizeDbConfig(configInput || resolveDbConfig());
   if (driver === "postgres") {
     const adapter = new PostgresAdapter({
       migrationSql: loadMigrationSql("postgres"),
-      postgres: config.postgres.connectionString
-        ? { connectionString: config.postgres.connectionString }
-        : {
-            host: config.postgres.host,
-            port: config.postgres.port,
-            database: config.postgres.database,
-            user: config.postgres.user,
-            password: config.postgres.password
-          }
+      postgres: postgresClientConfig(config.postgres)
     });
     await adapter.init();
     await migrateUp(adapter, "postgres");
@@ -142,6 +148,10 @@ async function createAdapter(driver) {
   await adapter.init();
   await migrateUp(adapter, "sqlite");
   return adapter;
+}
+
+async function createAdapter(driver) {
+  return createAdapterWithConfig(driver, resolveDbConfig());
 }
 
 function toSafePostgresError(err) {
@@ -287,6 +297,7 @@ module.exports = {
   buildDbErrorDiagnostics,
   testPostgresConfig,
   resolveDriver,
+  createAdapterWithConfig,
   createAdapter,
   initDb,
   getMigrationStatus,

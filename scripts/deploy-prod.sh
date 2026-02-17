@@ -11,6 +11,7 @@ READINESS_POLL_SEC="${READINESS_POLL_SEC:-2}"
 PROD_CADDY_ALIAS="${PROD_CADDY_ALIAS:-ktrain}"
 FORCE_SQLITE_MODE="${FORCE_SQLITE_MODE:-false}"
 EFFECTIVE_SQLITE_MODE="$FORCE_SQLITE_MODE"
+FORCE_APP_REINIT="${FORCE_APP_REINIT:-false}"
 ENV_FILE="${ENV_FILE:-.env.prod}"
 
 cd "$APP_DIR"
@@ -85,6 +86,24 @@ const runtimePath = process.env.DB_RUNTIME_CONFIG_PATH || "/data/runtime-db.json
 function isPlaceholderHost(host) {
   const v = String(host || "").trim().toLowerCase();
   return !v || v === "ktrain_postgres" || v === "postgres";
+}
+
+force_runtime_reinit() {
+  if [ "$FORCE_APP_REINIT" != "true" ]; then
+    return 0
+  fi
+  echo "Re-init trigger enabled: clearing persisted runtime DB override before deploy"
+  IMAGE="$IMAGE" docker compose -f "$COMPOSE_FILE" run --rm --no-deps "$SERVICE_NAME" sh -lc '
+runtime_cfg="${DB_RUNTIME_CONFIG_PATH:-/data/runtime-db.json}"
+stamp="$(date +%s)"
+if [ -f "$runtime_cfg" ]; then
+  cp "$runtime_cfg" "${runtime_cfg}.bak.${stamp}" || true
+fi
+rm -f "$runtime_cfg"
+mkdir -p /data/reinit
+date -u +"%Y-%m-%dT%H:%M:%SZ" > /data/reinit/last_runtime_reinit_utc.txt
+echo "Runtime override cleared at /data/reinit/last_runtime_reinit_utc.txt"
+'
 }
 
 function isPlaceholderPassword(password) {
@@ -233,6 +252,8 @@ echo "Pulling image: $IMAGE"
 if ! docker pull "$IMAGE"; then
   echo "Image pull failed; deploy will attempt using locally cached image."
 fi
+
+force_runtime_reinit
 
 set +e
 preflight_postgres

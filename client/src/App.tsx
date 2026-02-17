@@ -703,6 +703,21 @@ const API = {
     if (!res.ok) throw await parseApiError(res, "Failed to load setup database status");
     return res.json();
   },
+  async setupConfigureDb(payload: {
+    driver: "sqlite" | "postgres";
+    sqlitePath?: string;
+    postgres?: DbAdminConfig["postgres"];
+    createDatabaseIfMissing?: boolean;
+    createFromScratch?: boolean;
+  }) {
+    const res = await fetch("/api/setup/db/config", {
+      method: "POST",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload || {})
+    });
+    if (!res.ok) throw await parseApiError(res, "Failed to configure setup database");
+    return res.json();
+  },
   async bootstrapOwner() {
     const res = await fetch("/api/setup/bootstrap-owner", { method: "POST", headers: withAuthHeaders() });
     if (!res.ok) throw await parseApiError(res, "Failed to bootstrap owner");
@@ -1430,6 +1445,22 @@ function App() {
   const [setupAdminPassword, setSetupAdminPassword] = useState("");
   const [publicConfigOverall, setPublicConfigOverall] = useState<ConfigOverall>("READY");
   const [setupDbStatus, setSetupDbStatus] = useState<any>(null);
+  const [setupDbDriver, setSetupDbDriver] = useState<"sqlite" | "postgres">("postgres");
+  const [setupDbConfig, setSetupDbConfig] = useState<DbAdminConfig>({
+    sqlitePath: "/data/ktrain.sqlite",
+    postgres: {
+      host: "localhost",
+      port: 5432,
+      database: "ktrain",
+      user: "ktrain",
+      password: "",
+      connectionString: ""
+    }
+  });
+  const [setupDbCreateIfMissing, setSetupDbCreateIfMissing] = useState(true);
+  const [setupDbCreateFromScratch, setSetupDbCreateFromScratch] = useState(false);
+  const [setupDbBusy, setSetupDbBusy] = useState(false);
+  const [setupDbDirty, setSetupDbDirty] = useState(false);
   const [clientErrors, setClientErrors] = useState<ClientErrorTrace[]>([]);
   const [errorLogOpen, setErrorLogOpen] = useState(false);
   const [savePartial, setSavePartial] = useState(false);
@@ -1747,6 +1778,22 @@ function App() {
       if (Boolean(data?.setupRequired)) {
         const db = await API.getSetupDbStatus().catch(() => null);
         setSetupDbStatus(db);
+        if (db && !setupDbDirty) {
+          const nextDriver = String(db?.activeDriver || "sqlite").toLowerCase() === "postgres" ? "postgres" : "sqlite";
+          const nextConfig = db?.dbConfig || {};
+          setSetupDbDriver(nextDriver);
+          setSetupDbConfig((prev) => ({
+            sqlitePath: String(nextConfig?.sqlitePath || prev.sqlitePath || "/data/ktrain.sqlite"),
+            postgres: {
+              host: String(nextConfig?.postgres?.host || prev.postgres.host || "localhost"),
+              port: Number(nextConfig?.postgres?.port || prev.postgres.port || 5432),
+              database: String(nextConfig?.postgres?.database || prev.postgres.database || "ktrain"),
+              user: String(nextConfig?.postgres?.user || prev.postgres.user || "ktrain"),
+              password: "",
+              connectionString: String(nextConfig?.postgres?.connectionString || "")
+            }
+          }));
+        }
       } else {
         setSetupDbStatus(null);
         if (window.location.pathname === "/setup") {
@@ -1757,11 +1804,50 @@ function App() {
       setSetupStatus(null);
       reportClientError("refresh_setup_status", new Error("Failed to refresh setup status"));
     }
-  }, [reportClientError]);
+  }, [reportClientError, setupDbDirty]);
 
   useEffect(() => {
     refreshSetupStatus().catch(() => null);
   }, [refreshSetupStatus, sessionUser]);
+
+  const configureSetupDatabase = useCallback(async () => {
+    setSetupDbBusy(true);
+    setSetupMessage("");
+    try {
+      const payload: any = {
+        driver: setupDbDriver,
+        sqlitePath: setupDbConfig.sqlitePath,
+        createDatabaseIfMissing: setupDbCreateIfMissing,
+        createFromScratch: setupDbCreateFromScratch
+      };
+      if (setupDbDriver === "postgres") {
+        payload.postgres = setupDbConfig.postgres;
+      }
+      const result = await API.setupConfigureDb(payload);
+      setSetupDbDirty(false);
+      setSetupDbStatus(result);
+      const provision = result?.postgresProvision;
+      const created = provision?.created ? " Created database." : "";
+      const dropped = provision?.dropped ? " Reinitialized database from scratch." : "";
+      setSetupMessage(`Database configured with ${result?.activeDriver || setupDbDriver}.${created}${dropped}`);
+      await refreshSetupStatus();
+    } catch (err: any) {
+      const details = err?.details?.details || err?.details || {};
+      const hint = details?.hint ? ` ${details.hint}` : "";
+      const fallbackHint = details?.suggestSQLite ? " You can switch to SQLite setup mode." : "";
+      setSetupMessage(`${err?.message || "Database configuration failed."}${hint}${fallbackHint}`);
+      reportClientError("setup_configure_database", err);
+    } finally {
+      setSetupDbBusy(false);
+    }
+  }, [
+    setupDbDriver,
+    setupDbConfig,
+    setupDbCreateIfMissing,
+    setupDbCreateFromScratch,
+    refreshSetupStatus,
+    reportClientError
+  ]);
 
   useEffect(() => {
     if (isSetupRoute || isSetupRequired) return;
@@ -2748,20 +2834,146 @@ function App() {
           <Alert color={publicConfigOverall === "SETUP_REQUIRED" ? "red" : publicConfigOverall === "DEGRADED" ? "yellow" : "green"} title={`Config status: ${publicConfigOverall}`}>
             Setup mode is derived from required configuration health.
           </Alert>
-          <Text size="sm">Complete required setup steps to enable full admin functionality.</Text>
+          <Text size="sm">Setup order: 1) Database connection and schema. 2) Initial owner/admin user. 3) Optional integrations.</Text>
           <Text size="sm">1. Database: {setupStatus?.steps?.database?.state || (setupStatus?.steps?.database?.ready ? "READY" : "MISSING")}</Text>
           <Text size="sm">2. Admin user: {setupStatus?.steps?.adminUser?.state || (setupStatus?.steps?.adminUser?.ready ? "READY" : "MISSING")}</Text>
           <Text size="sm">3. SMTP: {setupStatus?.steps?.smtp?.state || (setupStatus?.steps?.smtp?.ready ? "READY" : "MISSING")} (optional)</Text>
           <Text size="sm">4. Google auth: {setupStatus?.steps?.googleAuth?.state || (setupStatus?.steps?.googleAuth?.ready ? "READY" : "MISSING")} (optional)</Text>
-          {setupDbStatus && (
-            <Alert color={setupDbStatus?.database === "READY" ? "green" : "red"} title="Database status">
-              Driver: {setupDbStatus?.activeDriver || "unknown"} | State: {setupDbStatus?.database || "unknown"}
-            </Alert>
-          )}
-          {!setupStatus?.steps?.adminUser?.ready && (
+          <Card withBorder>
+            <Stack gap="xs">
+              <Text fw={600} size="sm">Step 1: Configure database</Text>
+              <SegmentedControl
+                value={setupDbDriver}
+                onChange={(value) => {
+                  setSetupDbDriver((value || "postgres") as "sqlite" | "postgres");
+                  setSetupDbDirty(true);
+                }}
+                data={[
+                  { value: "postgres", label: "PostgreSQL" },
+                  { value: "sqlite", label: "SQLite" }
+                ]}
+              />
+              {setupDbDriver === "postgres" ? (
+                <>
+                  <TextInput
+                    label="Postgres connection string (optional)"
+                    placeholder="postgres://user:pass@host:5432/db"
+                    value={setupDbConfig.postgres.connectionString || ""}
+                    onChange={(e) => {
+                      const value = e.currentTarget.value;
+                      setSetupDbConfig((prev) => ({ ...prev, postgres: { ...prev.postgres, connectionString: value } }));
+                      setSetupDbDirty(true);
+                    }}
+                  />
+                  <Group grow>
+                    <TextInput
+                      label="Host"
+                      value={setupDbConfig.postgres.host}
+                      onChange={(e) => {
+                        const value = e.currentTarget.value;
+                        setSetupDbConfig((prev) => ({ ...prev, postgres: { ...prev.postgres, host: value } }));
+                        setSetupDbDirty(true);
+                      }}
+                    />
+                    <NumberInput
+                      label="Port"
+                      min={1}
+                      max={65535}
+                      value={setupDbConfig.postgres.port}
+                      onChange={(value) => {
+                        setSetupDbConfig((prev) => ({ ...prev, postgres: { ...prev.postgres, port: Number(value) || 5432 } }));
+                        setSetupDbDirty(true);
+                      }}
+                    />
+                  </Group>
+                  <Group grow>
+                    <TextInput
+                      label="Database"
+                      value={setupDbConfig.postgres.database}
+                      onChange={(e) => {
+                        const value = e.currentTarget.value;
+                        setSetupDbConfig((prev) => ({ ...prev, postgres: { ...prev.postgres, database: value } }));
+                        setSetupDbDirty(true);
+                      }}
+                    />
+                    <TextInput
+                      label="User"
+                      value={setupDbConfig.postgres.user}
+                      onChange={(e) => {
+                        const value = e.currentTarget.value;
+                        setSetupDbConfig((prev) => ({ ...prev, postgres: { ...prev.postgres, user: value } }));
+                        setSetupDbDirty(true);
+                      }}
+                    />
+                  </Group>
+                  <TextInput
+                    label="Password"
+                    type="password"
+                    value={setupDbConfig.postgres.password}
+                    onChange={(e) => {
+                      const value = e.currentTarget.value;
+                      setSetupDbConfig((prev) => ({ ...prev, postgres: { ...prev.postgres, password: value } }));
+                      setSetupDbDirty(true);
+                    }}
+                  />
+                  <Switch
+                    label="Create database if missing"
+                    checked={setupDbCreateIfMissing}
+                    onChange={(e) => {
+                      setSetupDbCreateIfMissing(e.currentTarget.checked);
+                      setSetupDbDirty(true);
+                    }}
+                  />
+                  <Switch
+                    label="Try to create database from scratch (destructive)"
+                    checked={setupDbCreateFromScratch}
+                    onChange={(e) => {
+                      setSetupDbCreateFromScratch(e.currentTarget.checked);
+                      setSetupDbDirty(true);
+                    }}
+                  />
+                </>
+              ) : (
+                <TextInput
+                  label="SQLite path"
+                  placeholder="/data/ktrain.sqlite"
+                  value={setupDbConfig.sqlitePath}
+                  onChange={(e) => {
+                    const value = e.currentTarget.value;
+                    setSetupDbConfig((prev) => ({ ...prev, sqlitePath: value }));
+                    setSetupDbDirty(true);
+                  }}
+                />
+              )}
+              <Group>
+                <Button loading={setupDbBusy} onClick={() => void configureSetupDatabase()}>
+                  Validate and use selected database
+                </Button>
+                {setupDbDriver === "postgres" && (
+                  <Button
+                    variant="light"
+                    loading={setupDbBusy}
+                    onClick={() => {
+                      setSetupDbDriver("sqlite");
+                      setSetupDbDirty(true);
+                    }}
+                  >
+                    Switch form to SQLite
+                  </Button>
+                )}
+              </Group>
+              {setupDbStatus && (
+                <Alert color={setupDbStatus?.database === "READY" ? "green" : "yellow"} title="Database check">
+                  Driver: {setupDbStatus?.activeDriver || "unknown"} | State: {setupDbStatus?.database || "unknown"}
+                  {setupDbStatus?.diagnostics?.message ? ` | ${setupDbStatus.diagnostics.message}` : ""}
+                </Alert>
+              )}
+            </Stack>
+          </Card>
+          {setupStatus?.steps?.database?.ready && !setupStatus?.steps?.adminUser?.ready && (
             <Card withBorder>
               <Stack gap="xs">
-                <Text fw={600} size="sm">Create initial admin user</Text>
+                <Text fw={600} size="sm">Step 2: Create initial owner/admin user</Text>
                 <TextInput label="Admin email" value={setupAdminEmail} onChange={(e) => setSetupAdminEmail(e.currentTarget.value)} />
                 <TextInput label="Display name" value={setupAdminName} onChange={(e) => setSetupAdminName(e.currentTarget.value)} />
                 <TextInput
@@ -2789,6 +3001,11 @@ function App() {
               </Stack>
             </Card>
           )}
+          {!setupStatus?.steps?.database?.ready && (
+            <Alert color="yellow" title="Database setup required first">
+              Configure and validate database before creating owner/admin user.
+            </Alert>
+          )}
           {Array.isArray(setupStatus?.details) && setupStatus.details.length > 0 && (
             <Card withBorder>
               <Stack gap="xs">
@@ -2805,7 +3022,7 @@ function App() {
           <Group justify="space-between">
             <Button variant="light" onClick={() => refreshSetupStatus().catch(() => null)}>Refresh</Button>
             <Group>
-              {!setupStatus?.steps?.adminUser?.ready && sessionUser && (
+              {setupStatus?.steps?.database?.ready && !setupStatus?.steps?.adminUser?.ready && sessionUser && (
                 <Button
                   variant="light"
                   onClick={async () => {
