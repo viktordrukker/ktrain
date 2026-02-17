@@ -47,11 +47,15 @@
 - `DEPLOY_PATH`
 - `KTRAIN_MASTER_KEY`
 
+Optional (recommended for production):
+- `PROD_DATABASE_URL` (full postgres URL; deploy uses it to set `KTRAIN_BOOTSTRAP_DB`)
+
 ## Migration Behavior
 - Dev deploy runs `npm run migrate` inside the running dev container (SQLite).
 - Production deploy runs `scripts/migrate-prod.sh`:
   - Postgres mode: runs PostgreSQL migrations during deploy.
   - SQLite fallback mode: runs same migration command for SQLite backend.
+  - Deploy fails fast if postgres credentials are missing or still set to placeholder `change-me`.
 
 ## SQLite Fallback for Production
 - Run `promote-prod.yml` with `sqlite_mode=true`.

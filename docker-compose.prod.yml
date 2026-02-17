@@ -4,41 +4,6 @@ services:
     container_name: ktrain
     env_file:
       - .env.prod
-    environment:
-      - PORT=${PORT:-3000}
-      - NODE_ENV=${NODE_ENV:-production}
-      - APP_ENV=${APP_ENV:-production}
-      - DB_DRIVER=${DB_DRIVER:-postgres}
-      - DB_RUNTIME_CONFIG_PATH=${DB_RUNTIME_CONFIG_PATH:-/data/runtime-db.json}
-      - SQLITE_PATH=${SQLITE_PATH:-/data/ktrain.sqlite}
-      - POSTGRES_HOST=${POSTGRES_HOST:-ff_postgres}
-      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
-      - POSTGRES_DB=${POSTGRES_DB:-ktrain}
-      - POSTGRES_USER=${POSTGRES_USER:-ktrain}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-change-me}
-      - KTRAIN_BOOTSTRAP_DB=${KTRAIN_BOOTSTRAP_DB:-postgres://ktrain:change-me@ff_postgres:5432/ktrain}
-      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
-      - APP_BASE_URL=${APP_BASE_URL:-http://localhost:3000}
-      - APP_MODE=${APP_MODE:-info}
-      - APP_VERSION=${APP_VERSION:-prod}
-      - APP_BUILD=${APP_BUILD:-0}
-      - APP_COMMIT=${APP_COMMIT:-unknown}
-      - SESSION_COOKIE_NAME=${SESSION_COOKIE_NAME:-ktrain_session}
-      - SESSION_TTL_MS=${SESSION_TTL_MS:-2592000000}
-      - ADVANCED_DEBUG_TTL_MINUTES=${ADVANCED_DEBUG_TTL_MINUTES:-30}
-      - CRASH_REPORTS_DIR=${CRASH_REPORTS_DIR:-/data/crash-reports}
-      - CRASH_ALERT_EMAILS=${CRASH_ALERT_EMAILS:-}
-      - OWNER_EMAIL=${OWNER_EMAIL:-}
-      - AUTH_TRUST_PROXY=${AUTH_TRUST_PROXY:-true}
-      - AUTH_TRUSTED_PROXY_IPS=${AUTH_TRUSTED_PROXY_IPS:-}
-      - AUTH_OWNER_GROUPS=${AUTH_OWNER_GROUPS:-owners}
-      - AUTH_ADMIN_GROUPS=${AUTH_ADMIN_GROUPS:-admins,ldap-admins}
-      - AUTH_MODERATOR_GROUPS=${AUTH_MODERATOR_GROUPS:-moderators}
-      - CONFIG_CACHE_TTL_MS=${CONFIG_CACHE_TTL_MS:-5000}
-      - DB_SWITCH_DUMP_DIR=${DB_SWITCH_DUMP_DIR:-/data/db-switch}
-      - DB_SWITCH_RESTART_CMD=${DB_SWITCH_RESTART_CMD:-}
-      - DB_SWITCH_POSTGRES_UP_CMD=${DB_SWITCH_POSTGRES_UP_CMD:-}
-      - DB_SWITCH_AUDIT_LOG=${DB_SWITCH_AUDIT_LOG:-/data/db-switch/switch-audit.log}
     expose:
       - "3000"
     volumes:
@@ -55,6 +20,7 @@ services:
 
 volumes:
   ktrain_prod_data:
+    name: ktrain-data
 
 networks:
   ktrain_net:
