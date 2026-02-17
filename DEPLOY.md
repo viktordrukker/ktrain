@@ -59,6 +59,17 @@
   - `DB_DRIVER=sqlite`
   - `KTRAIN_BOOTSTRAP_DB=/data/ktrain.sqlite`
 
+## KTRAIN_MASTER_KEY Handling
+- Dev deploy (`ci-dev.yml`):
+  - Uses `KTRAIN_MASTER_KEY` secret if present.
+  - If missing and `.env.dev` has no key yet, generates a random key on the server and persists it in `.env.dev` (value is never printed).
+- Production promote (`promote-prod.yml`):
+  - Uses `KTRAIN_MASTER_KEY` secret if present.
+  - If key is missing, promotion fails by default.
+  - To explicitly generate on server during promotion, set:
+    - `generate_master_key_if_missing=true`
+    - `generate_master_key_confirm=GENERATE_MASTER_KEY`
+
 ## Health + Rollback
 - Dev deploy waits for `/healthz`.
 - Production deploy waits for `/healthz` and rolls back to previous image if migration/readiness fails.
