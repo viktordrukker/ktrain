@@ -172,16 +172,34 @@ jobs:
   deploy_prod:
     runs-on: ubuntu-latest
     needs: promote_image
-    if: ${{ secrets.HETZNER_HOST != '' && secrets.HETZNER_USER != '' && secrets.HETZNER_SSH_KEY != '' && secrets.DEPLOY_PATH != '' }}
     environment: production
     concurrency:
       group: ktrain-production-deploy
       cancel-in-progress: false
     steps:
+      - name: Guard deploy secrets
+        id: guard
+        env:
+          HETZNER_HOST: ${{ secrets.HETZNER_HOST }}
+          HETZNER_USER: ${{ secrets.HETZNER_USER }}
+          HETZNER_SSH_KEY: ${{ secrets.HETZNER_SSH_KEY }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          if [ -n "${HETZNER_HOST:-}" ] && [ -n "${HETZNER_USER:-}" ] && [ -n "${HETZNER_SSH_KEY:-}" ] && [ -n "${DEPLOY_PATH:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Production deploy is enabled."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Production deploy is skipped because required secrets are missing."
+          fi
+
       - name: Checkout
+        if: steps.guard.outputs.enabled == 'true'
         uses: actions/checkout@v4
 
       - name: Upload deployment assets (prod)
+        if: steps.guard.outputs.enabled == 'true'
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.HETZNER_HOST }}
@@ -193,6 +211,7 @@ jobs:
           overwrite: true
 
       - name: Deploy promoted image to production via SSH
+        if: steps.guard.outputs.enabled == 'true'
         uses: appleboy/ssh-action@v1.2.0
         env:
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
@@ -274,3 +293,7 @@ jobs:
             READINESS_TIMEOUT_SEC="240" \
             READINESS_POLL_SEC="2" \
             ./scripts/deploy-prod.sh
+
+      - name: Deploy skipped notice
+        if: steps.guard.outputs.enabled != 'true'
+        run: echo "Skipping production deploy because one or more required secrets are not configured."
