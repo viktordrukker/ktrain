@@ -886,12 +886,16 @@ const API = {
     if (!res.ok) throw await parseApiError(res, "Failed to save DB config");
     return res.json();
   },
-  async switchDb(pinOrTarget: any, maybeTarget?: "sqlite" | "postgres") {
+  async switchDb(
+    pinOrTarget: any,
+    maybeTarget?: "sqlite" | "postgres",
+    mode: "copy-then-switch" | "use-existing" = "copy-then-switch"
+  ) {
     const target = (maybeTarget || pinOrTarget) as "sqlite" | "postgres";
     const res = await fetch("/api/admin/db/switch", {
       method: "POST",
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ target, mode: "copy-then-switch", verify: true })
+      body: JSON.stringify({ target, mode, verify: true })
     });
     if (!res.ok) throw await parseApiError(res, "DB switch failed");
     return res.json();
@@ -5007,7 +5011,7 @@ function SettingsScreen({
     }
   };
 
-  const switchDb = async (target: "sqlite" | "postgres") => {
+  const switchDb = async (target: "sqlite" | "postgres", mode: "copy-then-switch" | "use-existing" = "copy-then-switch") => {
     if (!adminPin) {
       setDbMessage("Sign in with an admin account first.");
       return;
@@ -5015,11 +5019,24 @@ function SettingsScreen({
     setDbBusy(true);
     setDbMessage("");
     try {
-      const result = await API.switchDb(adminPin, target);
-      setDbMessage(`Switched to ${result.targetDriver || target}.`);
+      const result = await API.switchDb(adminPin, target, mode);
+      const strategy = mode === "use-existing" ? "using existing database data" : "after copying current data";
+      const reinitHint = result?.reinitRecommended ? " Schema re-init may be required if migrations differ." : "";
+      setDbMessage(`Switched to ${result.targetDriver || target} (${strategy}).${reinitHint}`);
       await refreshDb();
+      if (result?.reloadRecommended !== false) {
+        const reloadNow = window.confirm("Database switch is complete. Reload application now to re-initialize active services?");
+        if (reloadNow) {
+          window.location.reload();
+          return;
+        }
+      }
     } catch (err: any) {
-      setDbMessage(err?.message || "DB switch failed");
+      const details = err?.details?.details || err?.details?.result?.diagnostics || err?.details || null;
+      const hint = details?.hint ? ` ${details.hint}` : "";
+      const code = details?.code || err?.code || "";
+      const prefix = code ? `[${code}] ` : "";
+      setDbMessage(`${prefix}${err?.message || "DB switch failed"}${hint}`);
     } finally {
       setDbBusy(false);
     }
@@ -6102,7 +6119,8 @@ function SettingsScreen({
                 </Button>
                 <Button variant="light" loading={dbBusy} onClick={saveDbConfig}>Save DB config</Button>
                 <Button variant="light" color="teal" loading={dbBusy} onClick={() => switchDb("sqlite")}>Switch to SQLite</Button>
-                <Button variant="light" color="blue" loading={dbBusy} onClick={() => switchDb("postgres")}>Switch to Postgres</Button>
+                <Button variant="light" color="blue" loading={dbBusy} onClick={() => switchDb("postgres", "copy-then-switch")}>Switch to Postgres (copy data)</Button>
+                <Button variant="light" color="indigo" loading={dbBusy} onClick={() => switchDb("postgres", "use-existing")}>Switch to Postgres (use existing)</Button>
                 <Button variant="light" color="red" loading={dbBusy} onClick={rollbackDb}>Rollback DB switch</Button>
               </Group>
             </SettingRow>

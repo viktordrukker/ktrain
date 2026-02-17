@@ -167,6 +167,16 @@ function toSafePostgresError(err) {
 function classifyDbError(err) {
   const code = String(err?.code || "").toUpperCase();
   const message = String(err?.message || "");
+  if (
+    ["42P07", "42701", "42710", "42P16"].includes(code) ||
+    /relation .* already exists/i.test(message) ||
+    /column .* already exists/i.test(message)
+  ) return "schema_conflict";
+  if (
+    ["42P01", "42703"].includes(code) ||
+    /relation .* does not exist/i.test(message) ||
+    /column .* does not exist/i.test(message)
+  ) return "schema_mismatch";
   if (code === "28P01" || /password authentication failed/i.test(message)) return "auth";
   if (code === "3D000" || /database .* does not exist/i.test(message)) return "database_not_found";
   if (code === "28000") return "access_denied";
@@ -180,6 +190,10 @@ function classifyDbError(err) {
 
 function dbErrorHint(category) {
   switch (category) {
+    case "schema_conflict":
+      return "Database schema differs from expected migration state. Use existing DB mode or reinitialize schema before copy.";
+    case "schema_mismatch":
+      return "Schema is incomplete or outdated. Run migrations/re-init for the selected database.";
     case "auth":
       return "Verify Postgres username/password and authentication method.";
     case "database_not_found":

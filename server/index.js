@@ -1638,66 +1638,119 @@ function appendSwitchAudit(entry) {
   fs.appendFileSync(DB_SWITCH_AUDIT_LOG, `${JSON.stringify(entry)}\n`);
 }
 
-async function switchToTargetDb({ target, requestedBy }) {
+async function switchToTargetDb({ target, requestedBy, mode = "copy-then-switch" }) {
   const sourceDriver = activeDriver;
   if (sourceDriver === target) {
-    return { ok: true, message: `Already on ${target}`, sourceDriver, targetDriver: target };
+    return {
+      ok: true,
+      message: `Already on ${target}`,
+      sourceDriver,
+      targetDriver: target,
+      mode,
+      reloadRecommended: false
+    };
   }
 
+  let targetAdapter = null;
+  let dumpFile = null;
+  let sourceCounts = null;
+  let targetCounts = null;
   maintenanceMode = true;
   ensureDumpDir();
-  appendSwitchAudit({ ts: new Date().toISOString(), action: "switch_start", requestedBy, sourceDriver, target });
+  appendSwitchAudit({ ts: new Date().toISOString(), action: "switch_start", requestedBy, sourceDriver, target, mode });
 
-  if (target === "postgres" && DB_SWITCH_POSTGRES_UP_CMD) {
-    await execAsync(DB_SWITCH_POSTGRES_UP_CMD);
-  }
+  try {
+    if (target === "postgres" && DB_SWITCH_POSTGRES_UP_CMD) {
+      await execAsync(DB_SWITCH_POSTGRES_UP_CMD);
+    }
 
-  const sourceDump = await repo.dumpAll();
-  const dumpFile = path.join(DB_SWITCH_DUMP_DIR, `switch-${Date.now()}-${sourceDriver}-to-${target}.json`);
-  fs.writeFileSync(dumpFile, JSON.stringify({ sourceDriver, targetDriver: target, dump: sourceDump }, null, 2));
+    if (mode === "copy-then-switch") {
+      const sourceDump = await repo.dumpAll();
+      dumpFile = path.join(DB_SWITCH_DUMP_DIR, `switch-${Date.now()}-${sourceDriver}-to-${target}.json`);
+      fs.writeFileSync(dumpFile, JSON.stringify({ sourceDriver, targetDriver: target, dump: sourceDump }, null, 2));
+      targetAdapter = await createAdapter(target);
+      await targetAdapter.restoreAll(sourceDump);
+      sourceCounts = await repo.counts();
+      targetCounts = await targetAdapter.counts();
+      const verifyOk = JSON.stringify(sourceCounts) === JSON.stringify(targetCounts);
+      if (!verifyOk) {
+        throw new AppError(`Verification failed source=${JSON.stringify(sourceCounts)} target=${JSON.stringify(targetCounts)}`, {
+          status: 409,
+          code: "VERIFY_MISMATCH",
+          expose: true,
+          details: { sourceCounts, targetCounts }
+        });
+      }
+    } else if (mode === "use-existing") {
+      targetAdapter = await createAdapter(target);
+      targetCounts = await targetAdapter.counts();
+    } else {
+      throw badRequest("Unsupported DB switch mode");
+    }
 
-  const targetAdapter = await createAdapter(target);
-  await targetAdapter.restoreAll(sourceDump);
+    await repo.close();
+    repo = targetAdapter;
+    targetAdapter = null;
+    activeDriver = target;
 
-  const sourceCounts = await repo.counts();
-  const targetCounts = await targetAdapter.counts();
+    writeRuntimeConfig({
+      ...readRuntimeConfig(),
+      activeDriver: target,
+      lastSwitchAt: new Date().toISOString(),
+      lastSwitchBy: requestedBy || "unknown",
+      previousDriver: sourceDriver,
+      lastDumpFile: dumpFile,
+      lastSwitchMode: mode
+    });
 
-  const verifyOk = JSON.stringify(sourceCounts) === JSON.stringify(targetCounts);
-  if (!verifyOk) {
-    await targetAdapter.close();
+    if (DB_SWITCH_RESTART_CMD) {
+      await execAsync(DB_SWITCH_RESTART_CMD);
+    }
+
+    appendSwitchAudit({
+      ts: new Date().toISOString(),
+      action: "switch_success",
+      requestedBy,
+      sourceDriver,
+      target,
+      mode,
+      dumpFile,
+      sourceCounts,
+      targetCounts
+    });
+    return {
+      ok: true,
+      sourceDriver,
+      targetDriver: target,
+      mode,
+      verify: sourceCounts && targetCounts ? { sourceCounts, targetCounts } : null,
+      dumpFile,
+      runtimeConfig: RUNTIME_CONFIG_PATH,
+      restartCommandRan: Boolean(DB_SWITCH_RESTART_CMD),
+      reloadRecommended: true,
+      reinitRecommended: mode === "use-existing"
+    };
+  } catch (err) {
+    if (targetAdapter) {
+      try {
+        await targetAdapter.close();
+      } catch {
+        // ignore close errors for failed switch path
+      }
+    }
+    appendSwitchAudit({
+      ts: new Date().toISOString(),
+      action: "switch_failed",
+      requestedBy,
+      sourceDriver,
+      target,
+      mode,
+      error: String(err?.message || err)
+    });
+    throw err;
+  } finally {
     maintenanceMode = false;
-    appendSwitchAudit({ ts: new Date().toISOString(), action: "switch_failed_verify", requestedBy, sourceDriver, target, sourceCounts, targetCounts });
-    throw new Error(`Verification failed source=${JSON.stringify(sourceCounts)} target=${JSON.stringify(targetCounts)}`);
   }
-
-  await repo.close();
-  repo = targetAdapter;
-  activeDriver = target;
-
-  writeRuntimeConfig({
-    ...readRuntimeConfig(),
-    activeDriver: target,
-    lastSwitchAt: new Date().toISOString(),
-    lastSwitchBy: requestedBy || "unknown",
-    previousDriver: sourceDriver,
-    lastDumpFile: dumpFile
-  });
-
-  if (DB_SWITCH_RESTART_CMD) {
-    await execAsync(DB_SWITCH_RESTART_CMD);
-  }
-
-  maintenanceMode = false;
-  appendSwitchAudit({ ts: new Date().toISOString(), action: "switch_success", requestedBy, sourceDriver, target, dumpFile, sourceCounts, targetCounts });
-  return {
-    ok: true,
-    sourceDriver,
-    targetDriver: target,
-    verify: { sourceCounts, targetCounts },
-    dumpFile,
-    runtimeConfig: RUNTIME_CONFIG_PATH,
-    restartCommandRan: Boolean(DB_SWITCH_RESTART_CMD)
-  };
 }
 
 async function rollbackDbSwitch(requestedBy) {
@@ -1712,28 +1765,48 @@ async function rollbackDbSwitch(requestedBy) {
 
   maintenanceMode = true;
   appendSwitchAudit({ ts: new Date().toISOString(), action: "rollback_start", requestedBy, activeDriver, rollbackTarget });
+  let targetAdapter = null;
+  try {
+    targetAdapter = await createAdapter(rollbackTarget);
+    await targetAdapter.restoreAll(dump);
 
-  const targetAdapter = await createAdapter(rollbackTarget);
-  await targetAdapter.restoreAll(dump);
+    await repo.close();
+    repo = targetAdapter;
+    targetAdapter = null;
+    activeDriver = rollbackTarget;
 
-  await repo.close();
-  repo = targetAdapter;
-  activeDriver = rollbackTarget;
+    writeRuntimeConfig({
+      ...runtime,
+      activeDriver: rollbackTarget,
+      rolledBackAt: new Date().toISOString(),
+      rolledBackBy: requestedBy || "unknown"
+    });
 
-  writeRuntimeConfig({
-    ...runtime,
-    activeDriver: rollbackTarget,
-    rolledBackAt: new Date().toISOString(),
-    rolledBackBy: requestedBy || "unknown"
-  });
+    if (DB_SWITCH_RESTART_CMD) {
+      await execAsync(DB_SWITCH_RESTART_CMD);
+    }
 
-  if (DB_SWITCH_RESTART_CMD) {
-    await execAsync(DB_SWITCH_RESTART_CMD);
+    appendSwitchAudit({ ts: new Date().toISOString(), action: "rollback_success", requestedBy, activeDriver });
+    return { ok: true, activeDriver, rollbackFrom: content.targetDriver, rollbackTo: rollbackTarget };
+  } catch (err) {
+    if (targetAdapter) {
+      try {
+        await targetAdapter.close();
+      } catch {
+        // ignore close errors for failed rollback path
+      }
+    }
+    appendSwitchAudit({
+      ts: new Date().toISOString(),
+      action: "rollback_failed",
+      requestedBy,
+      rollbackTarget,
+      error: String(err?.message || err)
+    });
+    throw err;
+  } finally {
+    maintenanceMode = false;
   }
-
-  maintenanceMode = false;
-  appendSwitchAudit({ ts: new Date().toISOString(), action: "rollback_success", requestedBy, activeDriver });
-  return { ok: true, activeDriver, rollbackFrom: content.targetDriver, rollbackTo: rollbackTarget };
 }
 
 app.get("/healthz", (req, res) => {
@@ -3507,17 +3580,34 @@ app.post("/api/admin/db/test", requirePermission(Permissions.ADMIN_DB_TEST), adm
 
 app.post("/api/admin/db/switch", requirePermission(Permissions.ADMIN_DB_SWITCH), adminLimiter, withAsync(async (req, res) => {
   const target = asEnum(req.body?.target, ["sqlite", "postgres"], "target");
-  const mode = req.body?.mode || "copy-then-switch";
+  const mode = asEnum(req.body?.mode || "copy-then-switch", ["copy-then-switch", "use-existing"], "mode");
   const verify = req.body?.verify !== false;
-  if (mode !== "copy-then-switch") {
-    throw badRequest("Only copy-then-switch mode is supported");
+  try {
+    const result = await switchToTargetDb({ target, requestedBy: req.actor?.externalSubject || "admin", mode });
+    if (verify && result.verify && JSON.stringify(result.verify.sourceCounts) !== JSON.stringify(result.verify.targetCounts)) {
+      throw new AppError("Verification mismatch", { status: 409, code: "VERIFY_MISMATCH", expose: true });
+    }
+    await audit(req, "admin.db.switch", "driver", target, { ...(result.verify || {}), mode });
+    res.json(result);
+  } catch (err) {
+    if (err instanceof AppError) {
+      throw err;
+    }
+    const diagnostics = buildDbErrorDiagnostics(err?.cause || err);
+    const migrationRelated = ["schema_conflict", "schema_mismatch"].includes(String(diagnostics?.category || ""));
+    throw new AppError(diagnostics.message || "Database switch failed", {
+      status: migrationRelated ? 409 : 500,
+      code: migrationRelated ? "DB_SWITCH_MIGRATION_FAILED" : "DB_SWITCH_FAILED",
+      expose: true,
+      details: {
+        ...diagnostics,
+        target,
+        mode,
+        reloadRecommended: true,
+        reinitRecommended: migrationRelated
+      }
+    });
   }
-  const result = await switchToTargetDb({ target, requestedBy: req.actor?.externalSubject || "admin" });
-  if (verify && result.verify && JSON.stringify(result.verify.sourceCounts) !== JSON.stringify(result.verify.targetCounts)) {
-    throw new AppError("Verification mismatch", { status: 500, code: "VERIFY_MISMATCH", expose: true });
-  }
-  await audit(req, "admin.db.switch", "driver", target, result.verify || null);
-  res.json(result);
 }));
 
 app.post("/api/admin/db/rollback", requirePermission(Permissions.ADMIN_DB_ROLLBACK), adminLimiter, withAsync(async (req, res) => {
