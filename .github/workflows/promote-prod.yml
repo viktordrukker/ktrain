@@ -25,6 +25,15 @@ on:
         description: "Required only when generation is enabled: type GENERATE_MASTER_KEY"
         required: false
         type: string
+      reinit_runtime:
+        description: "Force runtime re-init (clears persisted runtime DB override before deploy)"
+        required: false
+        type: boolean
+        default: false
+      reinit_runtime_confirm:
+        description: "Required only when reinit_runtime=true: type REINIT_RUNTIME"
+        required: false
+        type: string
 
 concurrency:
   group: ktrain-production-promote
@@ -49,6 +58,10 @@ jobs:
           fi
           if [ "${{ inputs.generate_master_key_if_missing }}" = "true" ] && [ "${{ inputs.generate_master_key_confirm }}" != "GENERATE_MASTER_KEY" ]; then
             echo "Refusing promotion: generate_master_key_confirm must equal GENERATE_MASTER_KEY when generate_master_key_if_missing=true"
+            exit 1
+          fi
+          if [ "${{ inputs.reinit_runtime }}" = "true" ] && [ "${{ inputs.reinit_runtime_confirm }}" != "REINIT_RUNTIME" ]; then
+            echo "Refusing promotion: reinit_runtime_confirm must equal REINIT_RUNTIME when reinit_runtime=true"
             exit 1
           fi
 
@@ -235,6 +248,7 @@ jobs:
           SQLITE_MODE: ${{ inputs.sqlite_mode }}
           GENERATE_MASTER_KEY_IF_MISSING: ${{ inputs.generate_master_key_if_missing }}
           GENERATE_MASTER_KEY_CONFIRM: ${{ inputs.generate_master_key_confirm }}
+          REINIT_RUNTIME: ${{ inputs.reinit_runtime }}
           IMAGE_REF: ${{ needs.promote_image.outputs.prod_image_tag }}
           APP_BUILD: ${{ github.run_number }}
           APP_COMMIT: ${{ needs.promote_image.outputs.image_sha }}
@@ -244,7 +258,7 @@ jobs:
           port: ${{ secrets.HETZNER_PORT || '22' }}
           username: ${{ secrets.HETZNER_USER }}
           key: ${{ secrets.HETZNER_SSH_KEY }}
-          envs: DEPLOY_PATH,MASTER_KEY_SECRET,PROD_DATABASE_URL,SQLITE_MODE,GENERATE_MASTER_KEY_IF_MISSING,GENERATE_MASTER_KEY_CONFIRM,IMAGE_REF,APP_BUILD,APP_COMMIT,APP_VERSION
+          envs: DEPLOY_PATH,MASTER_KEY_SECRET,PROD_DATABASE_URL,SQLITE_MODE,GENERATE_MASTER_KEY_IF_MISSING,GENERATE_MASTER_KEY_CONFIRM,REINIT_RUNTIME,IMAGE_REF,APP_BUILD,APP_COMMIT,APP_VERSION
           script: |
             set -euo pipefail
             if [ -z "${DEPLOY_PATH:-}" ]; then
@@ -378,6 +392,7 @@ jobs:
             APP_COMMIT="$APP_COMMIT" \
             APP_VERSION="$APP_VERSION" \
             FORCE_SQLITE_MODE="$effective_sqlite_mode" \
+            FORCE_APP_REINIT="${REINIT_RUNTIME:-false}" \
             READINESS_PATH="/healthz" \
             READINESS_TIMEOUT_SEC="240" \
             READINESS_POLL_SEC="2" \

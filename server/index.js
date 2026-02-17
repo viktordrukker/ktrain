@@ -17,6 +17,7 @@ const fs = require("fs");
 const { exec } = require("child_process");
 const { promisify } = require("util");
 const { randomUUID } = require("crypto");
+const { Pool } = require("pg");
 const {
   initDb,
   resolveDriver,
@@ -28,7 +29,8 @@ const {
   testPostgresConfig,
   getMigrationStatus,
   rollbackLastMigration,
-  buildDbErrorDiagnostics
+  buildDbErrorDiagnostics,
+  createAdapterWithConfig
 } = require("./db");
 const { loadSettings, saveSettings } = require("./settings");
 const { readRuntimeConfig, writeRuntimeConfig, RUNTIME_CONFIG_PATH } = require("./db/runtime-config");
@@ -1901,6 +1903,136 @@ app.get("/api/auth/providers", withAsync(async (req, res) => {
   });
 }));
 
+function quotePgIdentifier(value) {
+  return `"${String(value || "").replace(/"/g, "\"\"")}"`;
+}
+
+function parsePostgresConnectionString(connectionString) {
+  const raw = String(connectionString || "").trim();
+  if (!raw) return null;
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw badRequest("Invalid Postgres connection string");
+  }
+  const protocol = String(url.protocol || "").toLowerCase();
+  if (protocol !== "postgres:" && protocol !== "postgresql:") {
+    throw badRequest("Connection string must use postgres:// or postgresql://");
+  }
+  const dbName = decodeURIComponent(String(url.pathname || "").replace(/^\//, "").trim());
+  return { url, dbName };
+}
+
+function buildPostgresAdminConfig(postgres = {}) {
+  const safe = sanitizeDbConfig({ postgres }).postgres;
+  if (safe.connectionString) {
+    const parsed = parsePostgresConnectionString(safe.connectionString);
+    const targetDatabase = parsed?.dbName || String(safe.database || "").trim();
+    if (!targetDatabase) throw badRequest("Postgres database is required");
+    const adminUrl = new URL(parsed.url.toString());
+    adminUrl.pathname = "/postgres";
+    return {
+      targetDatabase,
+      targetConfig: { connectionString: parsed.url.toString() },
+      adminConfig: { connectionString: adminUrl.toString() }
+    };
+  }
+  const targetDatabase = String(safe.database || "").trim();
+  if (!targetDatabase) throw badRequest("Postgres database is required");
+  return {
+    targetDatabase,
+    targetConfig: {
+      host: safe.host,
+      port: safe.port,
+      database: targetDatabase,
+      user: safe.user,
+      password: safe.password
+    },
+    adminConfig: {
+      host: safe.host,
+      port: safe.port,
+      database: "postgres",
+      user: safe.user,
+      password: safe.password
+    }
+  };
+}
+
+async function ensurePostgresDatabase({ postgres, createIfMissing = false, createFromScratch = false }) {
+  const { targetDatabase, adminConfig } = buildPostgresAdminConfig(postgres);
+  if (!targetDatabase) {
+    throw badRequest("Postgres database is required");
+  }
+  if (String(targetDatabase).toLowerCase() === "postgres" && createFromScratch) {
+    throw badRequest("Database scratch initialization is not allowed for the postgres maintenance database");
+  }
+  const pool = new Pool({
+    max: 1,
+    idleTimeoutMillis: Number(process.env.POSTGRES_IDLE_TIMEOUT_MS || 30000),
+    connectionTimeoutMillis: Number(process.env.POSTGRES_CONNECT_TIMEOUT_MS || 10000),
+    ...adminConfig
+  });
+  const result = {
+    targetDatabase,
+    existedBefore: false,
+    created: false,
+    dropped: false
+  };
+  try {
+    const row = await pool.query("SELECT 1 AS ok FROM pg_database WHERE datname = $1", [targetDatabase]);
+    const exists = Boolean(row?.rows?.[0]?.ok);
+    result.existedBefore = exists;
+
+    if (createFromScratch && exists) {
+      await pool.query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()", [targetDatabase]);
+      await pool.query(`DROP DATABASE ${quotePgIdentifier(targetDatabase)}`);
+      result.dropped = true;
+    }
+
+    if (createFromScratch || (!exists && createIfMissing)) {
+      await pool.query(`CREATE DATABASE ${quotePgIdentifier(targetDatabase)}`);
+      result.created = true;
+      return result;
+    }
+
+    if (!exists) {
+      throw new AppError(`Postgres database '${targetDatabase}' does not exist`, {
+        status: 400,
+        code: "POSTGRES_DB_NOT_FOUND",
+        expose: true,
+        details: {
+          message: `Database '${targetDatabase}' was not found.`,
+          category: "database_not_found",
+          hint: "Retry with 'Create database if missing' or switch setup to SQLite."
+        }
+      });
+    }
+    return result;
+  } finally {
+    await pool.end().catch(() => null);
+  }
+}
+
+async function applySetupDatabaseConfig({ driver, dbConfig, requestedBy }) {
+  const nextAdapter = await createAdapterWithConfig(driver, dbConfig);
+  const prevRepo = repo;
+  repo = nextAdapter;
+  activeDriver = driver;
+  writeRuntimeConfig({
+    ...readRuntimeConfig(),
+    activeDriver: driver,
+    dbConfig: sanitizeDbConfig(dbConfig),
+    dbConfigUpdatedAt: new Date().toISOString(),
+    dbConfigUpdatedBy: requestedBy || "setup"
+  });
+  if (prevRepo && prevRepo !== nextAdapter) {
+    await prevRepo.close().catch(() => null);
+  }
+  const migration = await getMigrationStatus(repo, activeDriver);
+  return migration;
+}
+
 app.get("/api/setup/status", withAsync(async (req, res) => {
   const status = await refreshConfigStatus({ force: true });
   res.json({
@@ -1979,21 +2111,94 @@ app.post("/api/setup/admin-user", withAsync(async (req, res) => {
 }));
 
 app.get("/api/setup/db-status", withAsync(async (req, res) => {
+  const meta = resolveDbConfigMeta();
   let dbOk = false;
   let migration = null;
+  let diagnostics = null;
   try {
     await repo.ping();
     dbOk = true;
     migration = await getMigrationStatus(repo, activeDriver);
-  } catch {
+  } catch (err) {
     dbOk = false;
+    diagnostics = buildDbErrorDiagnostics(err);
   }
   res.json({
     ok: true,
     activeDriver,
     database: dbOk ? "READY" : "INVALID",
-    migrations: migration || null
+    migrations: migration || null,
+    dbConfigSource: meta.source,
+    dbConfig: sanitizeDbConfigForStatus(meta.config),
+    diagnostics
   });
+}));
+
+app.post("/api/setup/db/config", withAsync(async (req, res) => {
+  if (!setupModeActive) {
+    throw new AppError("Setup mode is not active", { status: 409, code: "SETUP_NOT_ACTIVE", expose: true });
+  }
+
+  const driver = asEnum(req.body?.driver || "postgres", ["sqlite", "postgres"], "driver");
+  const requestedBy = req.actor?.externalSubject || "setup";
+  const createDatabaseIfMissing = Boolean(req.body?.createDatabaseIfMissing);
+  const createFromScratch = Boolean(req.body?.createFromScratch);
+
+  const nextConfig = sanitizeDbConfig({
+    sqlitePath: req.body?.sqlitePath,
+    postgres: req.body?.postgres || {}
+  });
+
+  let postgresProvision = null;
+  try {
+    if (driver === "postgres") {
+      postgresProvision = await ensurePostgresDatabase({
+        postgres: nextConfig.postgres,
+        createIfMissing: createDatabaseIfMissing || createFromScratch,
+        createFromScratch
+      });
+    }
+
+    const migration = await applySetupDatabaseConfig({
+      driver,
+      dbConfig: nextConfig,
+      requestedBy
+    });
+    const status = await refreshConfigStatus({ force: true });
+    await audit(req, "setup.db.configure", "driver", driver, {
+      createDatabaseIfMissing,
+      createFromScratch,
+      postgresProvision
+    });
+    res.json({
+      ok: true,
+      activeDriver,
+      database: "READY",
+      setupRequired: status?.overall === "SETUP_REQUIRED",
+      migrations: migration || null,
+      dbConfigSource: "runtime",
+      dbConfig: sanitizeDbConfigForStatus(nextConfig),
+      postgresProvision,
+      reloadRecommended: true
+    });
+  } catch (err) {
+    if (err instanceof AppError) throw err;
+    const diagnostics = buildDbErrorDiagnostics(err?.cause || err);
+    const migrationRelated = ["schema_conflict", "schema_mismatch"].includes(String(diagnostics?.category || ""));
+    throw new AppError(diagnostics.message || "Database configuration failed", {
+      status: migrationRelated ? 409 : 400,
+      code: migrationRelated ? "SETUP_DB_SCHEMA_INVALID" : "SETUP_DB_CONFIG_INVALID",
+      expose: true,
+      details: {
+        ...diagnostics,
+        driver,
+        createDatabaseIfMissing,
+        createFromScratch,
+        suggestSQLite: driver === "postgres",
+        retryable: Boolean(diagnostics.retryable || migrationRelated)
+      }
+    });
+  }
 }));
 
 async function issueSessionForUser(req, res, user, auditAction) {
