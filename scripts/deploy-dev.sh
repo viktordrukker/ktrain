@@ -36,9 +36,6 @@ if ! docker pull "$IMAGE"; then
   echo "Image pull failed; deploy will attempt using locally cached image."
 fi
 
-echo "Resetting runtime DB override file for deterministic SQLite dev mode"
-IMAGE="$IMAGE" docker compose -f "$COMPOSE_FILE" run --rm --no-deps "$SERVICE_NAME" sh -lc 'rm -f /data/runtime-db.json'
-
 echo "Starting dev service"
 IMAGE="$IMAGE" docker compose -f "$COMPOSE_FILE" up -d --force-recreate --no-build "$SERVICE_NAME"
 

@@ -326,34 +326,47 @@ jobs:
               fi
             fi
 
-            if [ "${SQLITE_MODE}" = "true" ]; then
-              upsert_env "DB_DRIVER" "sqlite" ".env.prod"
-              upsert_env "KTRAIN_BOOTSTRAP_DB" "/data/ktrain.sqlite" ".env.prod"
-            else
-              upsert_env "DB_DRIVER" "postgres" ".env.prod"
-              if [ -n "${PROD_DATABASE_URL:-}" ]; then
-                upsert_env "KTRAIN_BOOTSTRAP_DB" "$PROD_DATABASE_URL" ".env.prod"
-              else
-                postgres_host="$(sed -n 's/^POSTGRES_HOST=//p' .env.prod | head -n 1 | tr -d '\r\n')"
-                postgres_db="$(sed -n 's/^POSTGRES_DB=//p' .env.prod | head -n 1 | tr -d '\r\n')"
-                postgres_user="$(sed -n 's/^POSTGRES_USER=//p' .env.prod | head -n 1 | tr -d '\r\n')"
-                postgres_password="$(sed -n 's/^POSTGRES_PASSWORD=//p' .env.prod | head -n 1 | tr -d '\r\n')"
-                if [ -n "${postgres_host:-}" ] && [ -n "${postgres_db:-}" ] && [ -n "${postgres_user:-}" ] && [ -n "${postgres_password:-}" ]; then
-                  remove_env "KTRAIN_BOOTSTRAP_DB" ".env.prod"
-                  echo "Using POSTGRES_* credentials from .env.prod; removed KTRAIN_BOOTSTRAP_DB to avoid stale DSN overrides."
+            effective_sqlite_mode="${SQLITE_MODE}"
+            if [ "${effective_sqlite_mode}" != "true" ]; then
+              postgres_host="$(sed -n 's/^POSTGRES_HOST=//p' .env.prod | head -n 1 | tr -d '\r\n')"
+              postgres_db="$(sed -n 's/^POSTGRES_DB=//p' .env.prod | head -n 1 | tr -d '\r\n')"
+              postgres_user="$(sed -n 's/^POSTGRES_USER=//p' .env.prod | head -n 1 | tr -d '\r\n')"
+              postgres_password="$(sed -n 's/^POSTGRES_PASSWORD=//p' .env.prod | head -n 1 | tr -d '\r\n')"
+              bootstrap_db="$(sed -n 's/^KTRAIN_BOOTSTRAP_DB=//p' .env.prod | head -n 1 | tr -d '\r\n')"
+
+              has_valid_bootstrap="false"
+              if [ -n "${bootstrap_db:-}" ] && printf '%s' "${bootstrap_db}" | grep -Eq '^postgres(ql)?://'; then
+                if printf '%s' "${bootstrap_db}" | grep -Eqi 'change-me|stillnobodypasseshere'; then
+                  has_valid_bootstrap="false"
+                else
+                  has_valid_bootstrap="true"
                 fi
               fi
-              bootstrap_db="$(sed -n 's/^KTRAIN_BOOTSTRAP_DB=//p' .env.prod | head -n 1 | tr -d '\r\n')"
-              postgres_password="$(sed -n 's/^POSTGRES_PASSWORD=//p' .env.prod | head -n 1 | tr -d '\r\n')"
-              if [ -z "${bootstrap_db:-}" ] && [ -z "${postgres_password:-}" ]; then
-                echo "PostgreSQL mode requires KTRAIN_BOOTSTRAP_DB or POSTGRES_* credentials in .env.prod."
-                exit 1
+
+              has_valid_parts="false"
+              if [ -n "${postgres_host:-}" ] && [ -n "${postgres_db:-}" ] && [ -n "${postgres_user:-}" ] && [ -n "${postgres_password:-}" ] && [ "${postgres_password:-}" != "change-me" ] && [ "${postgres_password:-}" != "stillnobodypasseshere" ]; then
+                has_valid_parts="true"
               fi
-              if [ "${bootstrap_db:-}" = "postgres://ktrain:change-me@ff_postgres:5432/ktrain" ] || [ "${postgres_password:-}" = "change-me" ]; then
-                echo "Refusing deploy with placeholder PostgreSQL credentials (change-me)."
-                echo "Set real credentials in .env.prod or provide PROD_DATABASE_URL secret."
-                exit 1
+
+              if [ -n "${PROD_DATABASE_URL:-}" ]; then
+                upsert_env "DB_DRIVER" "postgres" ".env.prod"
+                upsert_env "KTRAIN_BOOTSTRAP_DB" "$PROD_DATABASE_URL" ".env.prod"
+              elif [ "${has_valid_parts}" = "true" ]; then
+                upsert_env "DB_DRIVER" "postgres" ".env.prod"
+                remove_env "KTRAIN_BOOTSTRAP_DB" ".env.prod"
+                echo "Using POSTGRES_* credentials from .env.prod; removed KTRAIN_BOOTSTRAP_DB to avoid stale DSN overrides."
+              elif [ "${has_valid_bootstrap}" = "true" ]; then
+                upsert_env "DB_DRIVER" "postgres" ".env.prod"
+                echo "Using existing KTRAIN_BOOTSTRAP_DB postgres URL from .env.prod."
+              else
+                effective_sqlite_mode="true"
+                echo "No valid PostgreSQL credentials configured. Falling back to SQLite bootstrap mode so setup wizard remains available."
               fi
+            fi
+
+            if [ "${effective_sqlite_mode}" = "true" ]; then
+              upsert_env "DB_DRIVER" "sqlite" ".env.prod"
+              upsert_env "KTRAIN_BOOTSTRAP_DB" "/data/ktrain.sqlite" ".env.prod"
             fi
 
             chmod 600 .env.prod || true
@@ -364,7 +377,7 @@ jobs:
             APP_BUILD="$APP_BUILD" \
             APP_COMMIT="$APP_COMMIT" \
             APP_VERSION="$APP_VERSION" \
-            FORCE_SQLITE_MODE="$SQLITE_MODE" \
+            FORCE_SQLITE_MODE="$effective_sqlite_mode" \
             READINESS_PATH="/healthz" \
             READINESS_TIMEOUT_SEC="240" \
             READINESS_POLL_SEC="2" \
