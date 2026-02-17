@@ -59,7 +59,8 @@ function errorHandler() {
       ok: false,
       error: expose ? err.message : "Internal server error",
       code,
-      requestId: req.requestId
+      requestId: req.requestId,
+      ...(expose && err.details ? { details: err.details } : {})
     });
   };
 }
