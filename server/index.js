@@ -17,7 +17,19 @@ const fs = require("fs");
 const { exec } = require("child_process");
 const { promisify } = require("util");
 const { randomUUID } = require("crypto");
-const { initDb, createAdapter, resolveDriver, DB_DRIVER_ENV, resolveDbConfig, sanitizeDbConfig, testPostgresConfig, getMigrationStatus, rollbackLastMigration } = require("./db");
+const {
+  initDb,
+  resolveDriver,
+  DB_DRIVER_ENV,
+  resolveDbConfig,
+  resolveDbConfigMeta,
+  sanitizeDbConfig,
+  sanitizeDbConfigForStatus,
+  testPostgresConfig,
+  getMigrationStatus,
+  rollbackLastMigration,
+  buildDbErrorDiagnostics
+} = require("./db");
 const { loadSettings, saveSettings } = require("./settings");
 const { readRuntimeConfig, writeRuntimeConfig, RUNTIME_CONFIG_PATH } = require("./db/runtime-config");
 const { Roles, Permissions, normalizeRole, hasPermission } = require("./src/domain/rbac");
@@ -3401,18 +3413,43 @@ app.post("/api/admin/seed-defaults", requirePermission(Permissions.ADMIN_SEED_DE
 
 app.get("/api/admin/db/status", requirePermission(Permissions.ADMIN_DB_READ), adminLimiter, withAsync(async (req, res) => {
   const runtime = readRuntimeConfig();
-  const counts = await repo.counts();
-  const migrations = await getMigrationStatus(repo, activeDriver);
-  res.json({
-    ok: true,
+  const meta = resolveDbConfigMeta();
+  const base = {
     activeDriver,
     maintenanceMode,
     dbDriverEnv: DB_DRIVER_ENV,
-    dbConfig: resolveDbConfig(),
-    runtime,
-    counts,
-    migrations
-  });
+    dbConfigSource: meta.source,
+    dbConfig: sanitizeDbConfigForStatus(meta.config),
+    runtime: {
+      activeDriver: runtime?.activeDriver || null,
+      hasDbConfig: Boolean(runtime?.dbConfig),
+      dbConfigUpdatedAt: runtime?.dbConfigUpdatedAt || null,
+      dbConfigUpdatedBy: runtime?.dbConfigUpdatedBy || null
+    }
+  };
+  try {
+    const counts = await repo.counts();
+    const migrations = await getMigrationStatus(repo, activeDriver);
+    res.json({
+      ok: true,
+      ...base,
+      counts,
+      migrations
+    });
+  } catch (err) {
+    const diagnostics = buildDbErrorDiagnostics(err);
+    logger.warn("admin_db_status_unavailable", {
+      requestId: req.requestId,
+      activeDriver,
+      dbConfigSource: meta.source,
+      diagnostics
+    });
+    res.status(200).json({
+      ok: false,
+      ...base,
+      error: diagnostics
+    });
+  }
 }));
 
 app.get("/api/admin/db/config", requirePermission(Permissions.ADMIN_DB_READ), adminLimiter, withAsync(async (req, res) => {
@@ -3426,6 +3463,11 @@ app.get("/api/admin/db/config", requirePermission(Permissions.ADMIN_DB_READ), ad
 
 app.post("/api/admin/db/config", requirePermission(Permissions.ADMIN_DB_CONFIG), adminLimiter, withAsync(async (req, res) => {
   const nextConfig = sanitizeDbConfig(req.body || {});
+
+  if (req.body?.verify) {
+    await testPostgresConfig(nextConfig.postgres || {});
+  }
+
   const runtime = readRuntimeConfig();
   writeRuntimeConfig({
     ...runtime,
@@ -3433,12 +3475,6 @@ app.post("/api/admin/db/config", requirePermission(Permissions.ADMIN_DB_CONFIG),
     dbConfigUpdatedAt: new Date().toISOString(),
     dbConfigUpdatedBy: req.actor?.externalSubject || "admin"
   });
-
-  if (req.body?.verify) {
-    const probe = await createAdapter("postgres");
-    await probe.ping();
-    await probe.close();
-  }
 
   if (req.body?.restart && DB_SWITCH_RESTART_CMD) {
     await execAsync(DB_SWITCH_RESTART_CMD);
@@ -3449,9 +3485,24 @@ app.post("/api/admin/db/config", requirePermission(Permissions.ADMIN_DB_CONFIG),
 
 app.post("/api/admin/db/test", requirePermission(Permissions.ADMIN_DB_TEST), adminLimiter, withAsync(async (req, res) => {
   const postgres = req.body?.postgres || {};
-  await testPostgresConfig(postgres);
-  await audit(req, "admin.db.test", "postgres", postgres.host || "connectionString");
-  res.json({ ok: true, message: "Postgres connection successful" });
+  try {
+    await testPostgresConfig(postgres);
+    await audit(req, "admin.db.test", "postgres", postgres.host || "connectionString", { ok: true });
+    res.json({ ok: true, message: "Postgres connection successful" });
+  } catch (err) {
+    const diagnostics = buildDbErrorDiagnostics(err?.cause || err);
+    logger.warn("admin_db_test_failed", {
+      requestId: req.requestId,
+      diagnostics
+    });
+    await audit(req, "admin.db.test", "postgres", postgres.host || "connectionString", { ok: false, diagnostics });
+    throw new AppError(diagnostics.message, {
+      status: 400,
+      code: String(diagnostics.code || "POSTGRES_TEST_FAILED"),
+      expose: true,
+      details: diagnostics
+    });
+  }
 }));
 
 app.post("/api/admin/db/switch", requirePermission(Permissions.ADMIN_DB_SWITCH), adminLimiter, withAsync(async (req, res) => {
@@ -3562,7 +3613,15 @@ app.post("/api/admin/config/test/db", requirePermission(Permissions.ADMIN_DB_TES
     const ok = Array.isArray(migration?.pending) ? migration.pending.length === 0 : true;
     res.json({ ok: true, result: { status: ok ? "READY" : "INVALID", migration } });
   } catch (err) {
-    res.status(400).json({ ok: false, result: { status: "INVALID", message: String(err?.message || "DB test failed") } });
+    const diagnostics = buildDbErrorDiagnostics(err);
+    res.status(400).json({
+      ok: false,
+      result: {
+        status: "INVALID",
+        message: diagnostics.message,
+        diagnostics
+      }
+    });
   }
 }));
 
@@ -3945,7 +4004,25 @@ async function start() {
     throw new Error("KTRAIN_MASTER_KEY is required");
   }
   setStartupPhase("init_db");
-  const dbState = await initDb();
+  const startupDbMeta = resolveDbConfigMeta();
+  logger.info("db_init_start", {
+    requestedDriver: resolveDriver(),
+    dbConfigSource: startupDbMeta.source,
+    dbConfig: sanitizeDbConfigForStatus(startupDbMeta.config)
+  });
+  let dbState;
+  try {
+    dbState = await initDb();
+  } catch (err) {
+    logger.error("db_init_failed", {
+      phase: startupPhase,
+      requestedDriver: resolveDriver(),
+      dbConfigSource: startupDbMeta.source,
+      dbConfig: sanitizeDbConfigForStatus(startupDbMeta.config),
+      diagnostics: buildDbErrorDiagnostics(err)
+    });
+    throw err;
+  }
   repo = dbState.adapter;
   activeDriver = dbState.driver;
 

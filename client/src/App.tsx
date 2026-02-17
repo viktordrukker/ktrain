@@ -80,8 +80,16 @@ type DbAdminConfig = {
 };
 
 type DbAdminStatus = {
+  ok?: boolean;
   activeDriver: "sqlite" | "postgres";
   maintenanceMode: boolean;
+  dbConfigSource?: string;
+  error?: {
+    message?: string;
+    code?: string | null;
+    category?: string;
+    hint?: string;
+  };
   counts?: {
     settings: number;
     leaderboard: number;
@@ -4891,7 +4899,13 @@ function SettingsScreen({
       setDbStatus(status);
       setDbConfig(configRes.dbConfig);
       setSavedDbConfig(configRes.dbConfig);
-      setDbMessage(`DB status loaded. Active: ${status.activeDriver}`);
+      if (status?.ok === false && status?.error?.message) {
+        const category = status?.error?.category ? ` (${status.error.category})` : "";
+        const hint = status?.error?.hint ? ` ${status.error.hint}` : "";
+        setDbMessage(`DB diagnostics: ${status.error.message}${category}.${hint}`);
+      } else {
+        setDbMessage(`DB status loaded. Active: ${status.activeDriver}`);
+      }
       await refreshConfigStatus();
     } catch (err: any) {
       setDbMessage(err?.message || "Failed to load DB status");
