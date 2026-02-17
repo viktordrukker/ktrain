@@ -507,6 +507,15 @@ class ApiError extends Error {
 
 async function parseApiError(res: Response, fallback: string) {
   const requestId = res.headers.get("x-request-id") || undefined;
+  const status = Number(res.status || 0);
+  const url = String(res.url || "");
+  if ((status === 401 || status === 403) && typeof window !== "undefined") {
+    const adminRoute = url.includes("/api/admin/");
+    const userRoute = url.includes("/api/user/");
+    if (adminRoute || userRoute) {
+      window.dispatchEvent(new CustomEvent("ktrain:auth-expired", { detail: { status, url } }));
+    }
+  }
   try {
     const data = await res.json();
     const err = new ApiError(String(data?.error || data?.message || fallback));
@@ -1659,6 +1668,14 @@ function App() {
       window.history.replaceState({}, "", window.location.pathname);
     }
   }, [isSetupRoute, isSetupRequired, reportClientError]);
+
+  useEffect(() => {
+    const handler = () => {
+      setSessionUser(null);
+    };
+    window.addEventListener("ktrain:auth-expired", handler as EventListener);
+    return () => window.removeEventListener("ktrain:auth-expired", handler as EventListener);
+  }, []);
 
   useEffect(() => {
     setMenuDraftSettings(settings);
@@ -4782,6 +4799,16 @@ function SettingsScreen({
   const smtpToggleLocked = Boolean(configStatus && configStatus.optional.smtp !== "READY");
   const googleToggleLocked = Boolean(configStatus && configStatus.optional.googleAuth !== "READY");
   const themePreview = applyVisibilityGuard(computeTheme(appSettings), appSettings.visibilityGuard).theme;
+  const isAuthzError = (err: any) => {
+    const status = Number(err?.status || err?.details?.status || 0);
+    return status === 401 || status === 403 || String(err?.code || "").toUpperCase() === "FORBIDDEN";
+  };
+  const handleAdminAuthError = (err: any, setter?: (value: string) => void) => {
+    if (!isAuthzError(err)) return false;
+    setAdminPin("");
+    if (setter) setter("Admin session expired or missing. Please log in again.");
+    return true;
+  };
 
   const refreshConfigStatus = async () => {
     if (!adminPin) {
@@ -4793,6 +4820,7 @@ function SettingsScreen({
       setConfigStatus((data?.status || null) as ConfigStatus | null);
       setConfigStatusMessage("");
     } catch (err: any) {
+      if (handleAdminAuthError(err, setConfigStatusMessage)) return;
       setConfigStatusMessage(err?.message || "Failed to load config status.");
     }
   };
@@ -4912,6 +4940,7 @@ function SettingsScreen({
       }
       await refreshConfigStatus();
     } catch (err: any) {
+      if (handleAdminAuthError(err, setDbMessage)) return;
       setDbMessage(err?.message || "Failed to load DB status");
     } finally {
       setDbBusy(false);
@@ -5005,6 +5034,7 @@ function SettingsScreen({
       setDbMessage("DB config saved and verified.");
       await refreshDb();
     } catch (err: any) {
+      if (handleAdminAuthError(err, setDbMessage)) return;
       setDbMessage(err?.message || "Failed to save DB config");
     } finally {
       setDbBusy(false);
@@ -5032,6 +5062,7 @@ function SettingsScreen({
         }
       }
     } catch (err: any) {
+      if (handleAdminAuthError(err, setDbMessage)) return;
       const details = err?.details?.details || err?.details?.result?.diagnostics || err?.details || null;
       const hint = details?.hint ? ` ${details.hint}` : "";
       const code = details?.code || err?.code || "";
@@ -5054,6 +5085,7 @@ function SettingsScreen({
       setDbMessage(`Rollback complete. Active: ${result.activeDriver}`);
       await refreshDb();
     } catch (err: any) {
+      if (handleAdminAuthError(err, setDbMessage)) return;
       setDbMessage(err?.message || "DB rollback failed");
     } finally {
       setDbBusy(false);
@@ -5071,6 +5103,7 @@ function SettingsScreen({
       await API.testDbConnection(adminPin, { postgres: dbConfig.postgres });
       setDbMessage("Postgres connection successful.");
     } catch (err: any) {
+      if (handleAdminAuthError(err, setDbMessage)) return;
       setDbMessage(err?.message || "Postgres connection failed");
     } finally {
       setDbBusy(false);

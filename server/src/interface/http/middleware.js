@@ -45,15 +45,18 @@ function errorHandler() {
     const status = Number(err.status || 500);
     const code = err.code || "INTERNAL_ERROR";
     const expose = Boolean(err.expose);
-    logger.error("http_error", {
+    const payload = {
       requestId: req.requestId,
       ip: req.ip,
       method: req.method,
       path: req.path,
       status,
       code,
+      actorRole: req.actor?.role || "GUEST",
       error: err
-    });
+    };
+    if (status >= 500) logger.error("http_error", payload);
+    else logger.warn("http_client_error", payload);
     if (res.headersSent) return next(err);
     return res.status(status).json({
       ok: false,
