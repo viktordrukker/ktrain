@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const { Pool } = require("pg");
 const { SqliteAdapter } = require("./adapters/sqlite");
 const { PostgresAdapter } = require("./adapters/postgres");
 const { readRuntimeConfig } = require("./runtime-config");
@@ -98,7 +99,27 @@ async function createAdapter(driver) {
   return adapter;
 }
 
-async function createPostgresAdapterForConfig(inputConfig = {}) {
+function toSafePostgresError(err) {
+  const raw = String(err?.message || "Postgres connection failed");
+  if (/password authentication failed/i.test(raw)) {
+    return "Postgres authentication failed. Check username/password.";
+  }
+  if (/no pg_hba\.conf entry/i.test(raw)) {
+    return "Postgres rejected this host/user combination (pg_hba.conf).";
+  }
+  if (/getaddrinfo|ENOTFOUND|EAI_AGAIN/i.test(raw)) {
+    return "Postgres host could not be resolved.";
+  }
+  if (/ECONNREFUSED/i.test(raw)) {
+    return "Postgres is unreachable (connection refused).";
+  }
+  if (/timeout/i.test(raw)) {
+    return "Postgres connection timed out.";
+  }
+  return raw;
+}
+
+async function testPostgresConfig(inputConfig = {}) {
   const safe = sanitizeDbConfig({ postgres: inputConfig }).postgres;
   const pgConfig = safe.connectionString
     ? { connectionString: safe.connectionString }
@@ -109,19 +130,24 @@ async function createPostgresAdapterForConfig(inputConfig = {}) {
         user: safe.user,
         password: safe.password
       };
-  const adapter = new PostgresAdapter({ migrationSql: loadMigrationSql("postgres"), postgres: pgConfig });
-  await adapter.init();
-  await migrateUp(adapter, "postgres");
-  return adapter;
-}
-
-async function testPostgresConfig(inputConfig = {}) {
-  const adapter = await createPostgresAdapterForConfig(inputConfig);
+  const pool = new Pool({
+    max: 1,
+    idleTimeoutMillis: Number(process.env.POSTGRES_IDLE_TIMEOUT_MS || 30000),
+    connectionTimeoutMillis: Number(process.env.POSTGRES_CONNECT_TIMEOUT_MS || 10000),
+    ...pgConfig
+  });
   try {
-    await adapter.ping();
+    await pool.query("SELECT 1");
     return true;
+  } catch (err) {
+    const wrapped = new Error(toSafePostgresError(err));
+    wrapped.status = 400;
+    wrapped.code = "POSTGRES_TEST_FAILED";
+    wrapped.expose = true;
+    wrapped.cause = err;
+    throw wrapped;
   } finally {
-    await adapter.close();
+    await pool.end().catch(() => null);
   }
 }
 

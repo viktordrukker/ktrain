@@ -48,6 +48,50 @@ rollback() {
   IMAGE="$PREVIOUS_IMAGE" docker compose -f "$COMPOSE_FILE" up -d --force-recreate --no-build "$SERVICE_NAME" || true
 }
 
+preflight_postgres() {
+  if [ "$FORCE_SQLITE_MODE" = "true" ]; then
+    return 0
+  fi
+  echo "Preflight: validating PostgreSQL connectivity from deployment env"
+  IMAGE="$IMAGE" docker compose -f "$COMPOSE_FILE" run --rm --no-deps "$SERVICE_NAME" sh -lc 'node - <<'"'"'JS'"'"'
+const { Pool } = require("pg");
+
+const raw = String(process.env.KTRAIN_BOOTSTRAP_DB || "").trim();
+let pgConfig;
+if (/^postgres(ql)?:\/\//i.test(raw)) {
+  pgConfig = { connectionString: raw };
+} else {
+  pgConfig = {
+    host: process.env.POSTGRES_HOST || "ff_postgres",
+    port: Number(process.env.POSTGRES_PORT || 5432),
+    database: process.env.POSTGRES_DB || "ktrain",
+    user: process.env.POSTGRES_USER || "ktrain",
+    password: process.env.POSTGRES_PASSWORD || ""
+  };
+}
+
+const pool = new Pool({
+  max: 1,
+  connectionTimeoutMillis: Number(process.env.POSTGRES_CONNECT_TIMEOUT_MS || 10000),
+  idleTimeoutMillis: Number(process.env.POSTGRES_IDLE_TIMEOUT_MS || 30000),
+  ...pgConfig
+});
+
+(async () => {
+  try {
+    await pool.query("SELECT 1");
+    console.log("PostgreSQL preflight passed");
+  } catch (err) {
+    const message = String(err && err.message ? err.message : "PostgreSQL preflight failed");
+    console.error(`PostgreSQL preflight failed: ${message}`);
+    process.exitCode = 1;
+  } finally {
+    await pool.end().catch(() => null);
+  }
+})();
+JS'
+}
+
 wait_ready() {
   attempts=$((READINESS_TIMEOUT_SEC / READINESS_POLL_SEC))
   if [ "$attempts" -lt 1 ]; then
@@ -92,6 +136,14 @@ echo "Pulling image: $IMAGE"
 if ! docker pull "$IMAGE"; then
   echo "Image pull failed; deploy will attempt using locally cached image."
 fi
+
+if ! preflight_postgres; then
+  echo "PostgreSQL preflight failed; deployment aborted before container replacement."
+  exit 1
+fi
+
+echo "Resetting runtime DB override file to honor deployment env"
+IMAGE="$IMAGE" docker compose -f "$COMPOSE_FILE" run --rm --no-deps "$SERVICE_NAME" sh -lc 'rm -f /data/runtime-db.json'
 
 echo "Starting production service"
 IMAGE="$IMAGE" docker compose -f "$COMPOSE_FILE" up -d --force-recreate --no-build "$SERVICE_NAME"
