@@ -53,7 +53,7 @@ preflight_postgres() {
     return 0
   fi
   echo "Preflight: validating PostgreSQL connectivity from deployment env"
-  IMAGE="$IMAGE" docker compose -f "$COMPOSE_FILE" run --rm --no-deps "$SERVICE_NAME" sh -lc 'node - <<'"'"'JS'"'"'
+  IMAGE="$IMAGE" docker compose -f "$COMPOSE_FILE" run --rm --no-deps "$SERVICE_NAME" sh -lc 'cd /app/server && node - <<'"'"'JS'"'"'
 const { Pool } = require("pg");
 
 const raw = String(process.env.KTRAIN_BOOTSTRAP_DB || "").trim();

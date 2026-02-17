@@ -231,6 +231,7 @@ jobs:
         env:
           DEPLOY_PATH: ${{ steps.guard.outputs.deploy_path }}
           MASTER_KEY_SECRET: ${{ secrets.KTRAIN_MASTER_KEY }}
+          PROD_DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
           SQLITE_MODE: ${{ inputs.sqlite_mode }}
           GENERATE_MASTER_KEY_IF_MISSING: ${{ inputs.generate_master_key_if_missing }}
           GENERATE_MASTER_KEY_CONFIRM: ${{ inputs.generate_master_key_confirm }}
@@ -243,7 +244,7 @@ jobs:
           port: ${{ secrets.HETZNER_PORT || '22' }}
           username: ${{ secrets.HETZNER_USER }}
           key: ${{ secrets.HETZNER_SSH_KEY }}
-          envs: DEPLOY_PATH,MASTER_KEY_SECRET,SQLITE_MODE,GENERATE_MASTER_KEY_IF_MISSING,GENERATE_MASTER_KEY_CONFIRM,IMAGE_REF,APP_BUILD,APP_COMMIT,APP_VERSION
+          envs: DEPLOY_PATH,MASTER_KEY_SECRET,PROD_DATABASE_URL,SQLITE_MODE,GENERATE_MASTER_KEY_IF_MISSING,GENERATE_MASTER_KEY_CONFIRM,IMAGE_REF,APP_BUILD,APP_COMMIT,APP_VERSION
           script: |
             set -euo pipefail
             if [ -z "${DEPLOY_PATH:-}" ]; then
@@ -257,10 +258,18 @@ jobs:
             if [ ! -f ".env.prod" ]; then
               if [ -f ".env" ]; then
                 cp .env .env.prod
-              elif [ -f ".env.example" ]; then
-                cp .env.example .env.prod
               else
-                touch .env.prod
+                if [ -n "${PROD_DATABASE_URL:-}" ]; then
+                  if [ -f ".env.example" ]; then
+                    cp .env.example .env.prod
+                  else
+                    touch .env.prod
+                  fi
+                else
+                  echo "Missing .env.prod and no PROD_DATABASE_URL secret provided."
+                  echo "Create ${DEPLOY_PATH}/.env.prod with valid PostgreSQL config, or set PROD_DATABASE_URL secret."
+                  exit 1
+                fi
               fi
             fi
 
@@ -273,6 +282,14 @@ jobs:
                 sed -i "s|^${key}=.*$|${key}=${escaped}|" "$file"
               else
                 printf '%s=%s\n' "$key" "$value" >> "$file"
+              fi
+            }
+
+            remove_env() {
+              key="$1"
+              file="$2"
+              if grep -q "^${key}=" "$file"; then
+                sed -i "/^${key}=/d" "$file"
               fi
             }
 
@@ -314,6 +331,29 @@ jobs:
               upsert_env "KTRAIN_BOOTSTRAP_DB" "/data/ktrain.sqlite" ".env.prod"
             else
               upsert_env "DB_DRIVER" "postgres" ".env.prod"
+              if [ -n "${PROD_DATABASE_URL:-}" ]; then
+                upsert_env "KTRAIN_BOOTSTRAP_DB" "$PROD_DATABASE_URL" ".env.prod"
+              else
+                postgres_host="$(sed -n 's/^POSTGRES_HOST=//p' .env.prod | head -n 1 | tr -d '\r\n')"
+                postgres_db="$(sed -n 's/^POSTGRES_DB=//p' .env.prod | head -n 1 | tr -d '\r\n')"
+                postgres_user="$(sed -n 's/^POSTGRES_USER=//p' .env.prod | head -n 1 | tr -d '\r\n')"
+                postgres_password="$(sed -n 's/^POSTGRES_PASSWORD=//p' .env.prod | head -n 1 | tr -d '\r\n')"
+                if [ -n "${postgres_host:-}" ] && [ -n "${postgres_db:-}" ] && [ -n "${postgres_user:-}" ] && [ -n "${postgres_password:-}" ]; then
+                  remove_env "KTRAIN_BOOTSTRAP_DB" ".env.prod"
+                  echo "Using POSTGRES_* credentials from .env.prod; removed KTRAIN_BOOTSTRAP_DB to avoid stale DSN overrides."
+                fi
+              fi
+              bootstrap_db="$(sed -n 's/^KTRAIN_BOOTSTRAP_DB=//p' .env.prod | head -n 1 | tr -d '\r\n')"
+              postgres_password="$(sed -n 's/^POSTGRES_PASSWORD=//p' .env.prod | head -n 1 | tr -d '\r\n')"
+              if [ -z "${bootstrap_db:-}" ] && [ -z "${postgres_password:-}" ]; then
+                echo "PostgreSQL mode requires KTRAIN_BOOTSTRAP_DB or POSTGRES_* credentials in .env.prod."
+                exit 1
+              fi
+              if [ "${bootstrap_db:-}" = "postgres://ktrain:change-me@ff_postgres:5432/ktrain" ] || [ "${postgres_password:-}" = "change-me" ]; then
+                echo "Refusing deploy with placeholder PostgreSQL credentials (change-me)."
+                echo "Set real credentials in .env.prod or provide PROD_DATABASE_URL secret."
+                exit 1
+              fi
             fi
 
             chmod 600 .env.prod || true
