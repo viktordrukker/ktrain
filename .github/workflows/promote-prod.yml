@@ -186,8 +186,10 @@ jobs:
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
         run: |
           set -euo pipefail
-          if [ -n "${HETZNER_HOST:-}" ] && [ -n "${HETZNER_USER:-}" ] && [ -n "${HETZNER_SSH_KEY:-}" ] && [ -n "${DEPLOY_PATH:-}" ]; then
+          CLEAN_DEPLOY_PATH="$(printf '%s' "${DEPLOY_PATH:-}" | tr -d '\r\n')"
+          if [ -n "${HETZNER_HOST:-}" ] && [ -n "${HETZNER_USER:-}" ] && [ -n "${HETZNER_SSH_KEY:-}" ] && [ -n "${CLEAN_DEPLOY_PATH:-}" ]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "deploy_path=${CLEAN_DEPLOY_PATH}" >> "$GITHUB_OUTPUT"
             echo "Production deploy is enabled."
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
@@ -207,14 +209,14 @@ jobs:
           username: ${{ secrets.HETZNER_USER }}
           key: ${{ secrets.HETZNER_SSH_KEY }}
           source: "docker-compose.prod.yml,.env.example,scripts/deploy-prod.sh,scripts/migrate-prod.sh,scripts/healthcheck.sh,scripts/deploy_remote.sh"
-          target: "${{ secrets.DEPLOY_PATH }}"
+          target: "${{ steps.guard.outputs.deploy_path }}"
           overwrite: true
 
       - name: Deploy promoted image to production via SSH
         if: steps.guard.outputs.enabled == 'true'
         uses: appleboy/ssh-action@v1.2.0
         env:
-          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          DEPLOY_PATH: ${{ steps.guard.outputs.deploy_path }}
           MASTER_KEY_SECRET: ${{ secrets.KTRAIN_MASTER_KEY }}
           SQLITE_MODE: ${{ inputs.sqlite_mode }}
           IMAGE_REF: ${{ needs.promote_image.outputs.prod_image_tag }}
