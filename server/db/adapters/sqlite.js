@@ -11,6 +11,11 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function hasExplicitTransaction(sql) {
+  const text = String(sql || "");
+  return /\bBEGIN(?:\s+TRANSACTION)?\b/i.test(text) || /\bCOMMIT\b/i.test(text) || /\bROLLBACK\b/i.test(text);
+}
+
 function mapUserRow(row) {
   if (!row) return null;
   return {
@@ -51,14 +56,23 @@ class SqliteAdapter {
   async runMigrations(migrations) {
     this.db.exec("CREATE TABLE IF NOT EXISTS schema_migrations (id TEXT PRIMARY KEY, appliedAt TEXT NOT NULL)");
     const applied = new Set(this.db.prepare("SELECT id FROM schema_migrations").all().map((row) => row.id));
-    const tx = this.db.transaction(() => {
-      for (const migration of migrations) {
-        if (applied.has(migration.id)) continue;
-        this.db.exec(migration.sql);
-        this.db.prepare("INSERT INTO schema_migrations (id, appliedAt) VALUES (?, ?)").run(migration.id, nowIso());
-      }
+    const insertApplied = this.db.prepare("INSERT INTO schema_migrations (id, appliedAt) VALUES (?, ?)");
+    const tx = this.db.transaction((id, sql, appliedAt) => {
+      this.db.exec(sql);
+      insertApplied.run(id, appliedAt);
     });
-    tx();
+
+    for (const migration of migrations) {
+      if (applied.has(migration.id)) continue;
+      const appliedAt = nowIso();
+      if (hasExplicitTransaction(migration.sql)) {
+        // Some migrations manage their own BEGIN/COMMIT; do not wrap them.
+        this.db.exec(migration.sql);
+        insertApplied.run(migration.id, appliedAt);
+      } else {
+        tx(migration.id, migration.sql, appliedAt);
+      }
+    }
     return this.db.prepare("SELECT id, appliedAt FROM schema_migrations ORDER BY id ASC").all();
   }
 
@@ -68,6 +82,11 @@ class SqliteAdapter {
   }
 
   async rollbackMigration(id, downSql) {
+    if (hasExplicitTransaction(downSql)) {
+      this.db.exec(downSql);
+      this.db.prepare("DELETE FROM schema_migrations WHERE id = ?").run(id);
+      return;
+    }
     const tx = this.db.transaction(() => {
       this.db.exec(downSql);
       this.db.prepare("DELETE FROM schema_migrations WHERE id = ?").run(id);
