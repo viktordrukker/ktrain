@@ -1,0 +1,276 @@
+name: Promote ktrain-dev to production
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_sha:
+        description: "Commit SHA to promote (optional: defaults to latest successful ci-dev run on main)"
+        required: false
+        type: string
+      confirm:
+        description: "Type PROMOTE to continue"
+        required: true
+        type: string
+      sqlite_mode:
+        description: "Deploy production in SQLite mode (fallback mode)"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: ktrain-production-promote
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      image_sha: ${{ steps.resolve.outputs.image_sha }}
+      run_id: ${{ steps.resolve.outputs.run_id }}
+    steps:
+      - name: Guard confirmation
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.confirm }}" != "PROMOTE" ]; then
+            echo "Refusing promotion: input 'confirm' must equal PROMOTE"
+            exit 1
+          fi
+
+      - name: Resolve verified dev image SHA
+        id: resolve
+        uses: actions/github-script@v7
+        env:
+          REQUESTED_SHA: ${{ inputs.image_sha }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const requestedRaw = (process.env.REQUESTED_SHA || "").trim().toLowerCase();
+
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRuns,
+              {
+                owner,
+                repo,
+                workflow_id: "ci-dev.yml",
+                branch: "main",
+                event: "push",
+                status: "completed",
+                per_page: 100
+              }
+            );
+            const successful = runs.filter((r) => r.conclusion === "success");
+            if (!successful.length) {
+              core.setFailed("No successful ci-dev runs found on main");
+              return;
+            }
+
+            let selected = null;
+            if (requestedRaw) {
+              selected = successful.find((r) => {
+                const sha = String(r.head_sha || "").toLowerCase();
+                return sha === requestedRaw || sha.startsWith(requestedRaw);
+              });
+              if (!selected) {
+                core.setFailed(`SHA '${requestedRaw}' is not from a successful ci-dev run on main`);
+                return;
+              }
+            } else {
+              selected = successful[0];
+            }
+
+            core.info(`Promoting verified SHA ${selected.head_sha} from ci-dev run #${selected.run_number}`);
+            core.setOutput("image_sha", selected.head_sha);
+            core.setOutput("run_id", String(selected.id));
+
+  promote_image:
+    runs-on: ubuntu-latest
+    needs: resolve
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      prod_image_tag: ${{ steps.meta.outputs.prod_image_tag }}
+      image_sha: ${{ needs.resolve.outputs.image_sha }}
+      version_label: ${{ steps.meta.outputs.version_label }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set image metadata
+        id: meta
+        run: |
+          SHA="${{ needs.resolve.outputs.image_sha }}"
+          SHORT_SHA="${SHA::12}"
+          VERSION_BASE="$(node -p "require('./server/package.json').version")"
+          VERSION_LABEL="${VERSION_BASE}-${GITHUB_RUN_NUMBER}-${SHORT_SHA}"
+          echo "source_tag=ghcr.io/${GITHUB_REPOSITORY}:ktrain-dev-${SHA}" >> "$GITHUB_OUTPUT"
+          echo "prod_image_tag=ghcr.io/${GITHUB_REPOSITORY}:ktrain-${SHA}" >> "$GITHUB_OUTPUT"
+          echo "stable_tag=ghcr.io/${GITHUB_REPOSITORY}:ktrain" >> "$GITHUB_OUTPUT"
+          echo "version_tag=ghcr.io/${GITHUB_REPOSITORY}:ktrain-v${VERSION_LABEL}" >> "$GITHUB_OUTPUT"
+          echo "version_label=${VERSION_LABEL}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify source dev image exists
+        run: |
+          docker buildx imagetools inspect "${{ steps.meta.outputs.source_tag }}"
+
+      - name: Smoke run promoted image (SQLite)
+        run: |
+          set -euo pipefail
+          SMOKE_CONTAINER="ktrain_promote_smoke_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          cleanup() {
+            docker rm -f "$SMOKE_CONTAINER" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker run -d --name "$SMOKE_CONTAINER" -p 19090:3000 \
+            -e NODE_ENV=production \
+            -e DB_DRIVER=sqlite \
+            -e SQLITE_PATH=/tmp/ktrain-promote.sqlite \
+            -e KTRAIN_BOOTSTRAP_DB=/tmp/ktrain-promote.sqlite \
+            -e KTRAIN_MASTER_KEY='MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=' \
+            "${{ steps.meta.outputs.source_tag }}" >/dev/null
+
+          for _ in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:19090/healthz >/dev/null; then
+              echo "Smoke check passed"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "Smoke check failed; container logs:"
+          docker logs "$SMOKE_CONTAINER" || true
+          exit 1
+
+      - name: Promote immutable dev image to production tags
+        run: |
+          docker buildx imagetools create \
+            -t "${{ steps.meta.outputs.stable_tag }}" \
+            -t "${{ steps.meta.outputs.prod_image_tag }}" \
+            -t "${{ steps.meta.outputs.version_tag }}" \
+            "${{ steps.meta.outputs.source_tag }}"
+
+  deploy_prod:
+    runs-on: ubuntu-latest
+    needs: promote_image
+    if: ${{ secrets.HETZNER_HOST != '' && secrets.HETZNER_USER != '' && secrets.HETZNER_SSH_KEY != '' && secrets.DEPLOY_PATH != '' }}
+    environment: production
+    concurrency:
+      group: ktrain-production-deploy
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Upload deployment assets (prod)
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.HETZNER_HOST }}
+          port: ${{ secrets.HETZNER_PORT || '22' }}
+          username: ${{ secrets.HETZNER_USER }}
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          source: "docker-compose.prod.yml,.env.example,scripts/deploy-prod.sh,scripts/migrate-prod.sh,scripts/healthcheck.sh,scripts/deploy_remote.sh"
+          target: "${{ secrets.DEPLOY_PATH }}"
+          overwrite: true
+
+      - name: Deploy promoted image to production via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          MASTER_KEY_SECRET: ${{ secrets.KTRAIN_MASTER_KEY }}
+          SQLITE_MODE: ${{ inputs.sqlite_mode }}
+          IMAGE_REF: ${{ needs.promote_image.outputs.prod_image_tag }}
+          APP_BUILD: ${{ github.run_number }}
+          APP_COMMIT: ${{ needs.promote_image.outputs.image_sha }}
+          APP_VERSION: ${{ needs.promote_image.outputs.version_label }}
+        with:
+          host: ${{ secrets.HETZNER_HOST }}
+          port: ${{ secrets.HETZNER_PORT || '22' }}
+          username: ${{ secrets.HETZNER_USER }}
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          envs: DEPLOY_PATH,MASTER_KEY_SECRET,SQLITE_MODE,IMAGE_REF,APP_BUILD,APP_COMMIT,APP_VERSION
+          script: |
+            set -euo pipefail
+            if [ -z "${DEPLOY_PATH:-}" ]; then
+              echo "Missing DEPLOY_PATH secret"
+              exit 1
+            fi
+
+            mkdir -p "$DEPLOY_PATH"
+            cd "$DEPLOY_PATH"
+
+            if [ ! -f ".env.prod" ]; then
+              if [ -f ".env" ]; then
+                cp .env .env.prod
+              elif [ -f ".env.example" ]; then
+                cp .env.example .env.prod
+              else
+                touch .env.prod
+              fi
+            fi
+
+            upsert_env() {
+              key="$1"
+              value="$2"
+              file="$3"
+              escaped="$(printf '%s' "$value" | sed -e 's/[|&]/\\&/g')"
+              if grep -q "^${key}=" "$file"; then
+                sed -i "s|^${key}=.*$|${key}=${escaped}|" "$file"
+              else
+                printf '%s=%s\n' "$key" "$value" >> "$file"
+              fi
+            }
+
+            upsert_env "NODE_ENV" "production" ".env.prod"
+            upsert_env "APP_ENV" "production" ".env.prod"
+            upsert_env "DB_RUNTIME_CONFIG_PATH" "/data/runtime-db.json" ".env.prod"
+            upsert_env "DB_SWITCH_DUMP_DIR" "/data/db-switch" ".env.prod"
+            upsert_env "DB_SWITCH_AUDIT_LOG" "/data/db-switch/switch-audit.log" ".env.prod"
+            upsert_env "SQLITE_PATH" "/data/ktrain.sqlite" ".env.prod"
+            upsert_env "APP_BUILD" "$APP_BUILD" ".env.prod"
+            upsert_env "APP_COMMIT" "$APP_COMMIT" ".env.prod"
+            upsert_env "APP_VERSION" "$APP_VERSION" ".env.prod"
+
+            if [ -n "${MASTER_KEY_SECRET:-}" ]; then
+              upsert_env "KTRAIN_MASTER_KEY" "$MASTER_KEY_SECRET" ".env.prod"
+            fi
+
+            if [ "${SQLITE_MODE}" = "true" ]; then
+              upsert_env "DB_DRIVER" "sqlite" ".env.prod"
+              upsert_env "KTRAIN_BOOTSTRAP_DB" "/data/ktrain.sqlite" ".env.prod"
+            else
+              upsert_env "DB_DRIVER" "postgres" ".env.prod"
+            fi
+
+            chmod 600 .env.prod || true
+            chmod +x scripts/*.sh || true
+
+            APP_DIR="$DEPLOY_PATH" \
+            IMAGE="$IMAGE_REF" \
+            APP_BUILD="$APP_BUILD" \
+            APP_COMMIT="$APP_COMMIT" \
+            APP_VERSION="$APP_VERSION" \
+            FORCE_SQLITE_MODE="$SQLITE_MODE" \
+            READINESS_PATH="/healthz" \
+            READINESS_TIMEOUT_SEC="240" \
+            READINESS_POLL_SEC="2" \
+            ./scripts/deploy-prod.sh

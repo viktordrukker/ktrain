@@ -1,0 +1,57 @@
+services:
+  ktrain:
+    image: ${IMAGE:-ghcr.io/viktordrukker/ktrain:ktrain-dev}
+    container_name: ktrain_dev
+    env_file:
+      - .env.dev
+    environment:
+      - PORT=${PORT:-3000}
+      - NODE_ENV=${NODE_ENV:-production}
+      - APP_ENV=${APP_ENV:-development}
+      - DB_DRIVER=${DB_DRIVER:-sqlite}
+      - KTRAIN_BOOTSTRAP_DB=${KTRAIN_BOOTSTRAP_DB:-/data/ktrain.sqlite}
+      - SQLITE_PATH=${SQLITE_PATH:-/data/ktrain.sqlite}
+      - DB_RUNTIME_CONFIG_PATH=${DB_RUNTIME_CONFIG_PATH:-/data/runtime-db.json}
+      - DB_SWITCH_DUMP_DIR=${DB_SWITCH_DUMP_DIR:-/data/db-switch}
+      - DB_SWITCH_AUDIT_LOG=${DB_SWITCH_AUDIT_LOG:-/data/db-switch/switch-audit.log}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+      - APP_BASE_URL=${APP_BASE_URL:-http://127.0.0.1:3000}
+      - APP_MODE=${APP_MODE:-info}
+      - APP_VERSION=${APP_VERSION:-dev}
+      - APP_BUILD=${APP_BUILD:-0}
+      - APP_COMMIT=${APP_COMMIT:-unknown}
+      - SESSION_COOKIE_NAME=${SESSION_COOKIE_NAME:-ktrain_session}
+      - SESSION_TTL_MS=${SESSION_TTL_MS:-2592000000}
+      - ADVANCED_DEBUG_TTL_MINUTES=${ADVANCED_DEBUG_TTL_MINUTES:-30}
+      - CRASH_REPORTS_DIR=${CRASH_REPORTS_DIR:-/data/crash-reports}
+      - KTRAIN_MASTER_KEY=${KTRAIN_MASTER_KEY:-}
+      - AUTH_TRUST_PROXY=${AUTH_TRUST_PROXY:-true}
+      - AUTH_TRUSTED_PROXY_IPS=${AUTH_TRUSTED_PROXY_IPS:-}
+      - AUTH_OWNER_GROUPS=${AUTH_OWNER_GROUPS:-owners}
+      - AUTH_ADMIN_GROUPS=${AUTH_ADMIN_GROUPS:-admins,ldap-admins}
+      - AUTH_MODERATOR_GROUPS=${AUTH_MODERATOR_GROUPS:-moderators}
+      - CONFIG_CACHE_TTL_MS=${CONFIG_CACHE_TTL_MS:-5000}
+    expose:
+      - "3000"
+    volumes:
+      - ktrain_dev_data:/data
+    networks:
+      ktrain_dev_net: {}
+      caddy_net:
+        aliases:
+          - ktrain-dev
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/healthz"]
+      interval: 20s
+      timeout: 5s
+      retries: 8
+
+volumes:
+  ktrain_dev_data:
+
+networks:
+  ktrain_dev_net:
+    driver: bridge
+  caddy_net:
+    external: true
