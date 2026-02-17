@@ -142,9 +142,6 @@ if ! preflight_postgres; then
   exit 1
 fi
 
-echo "Resetting runtime DB override file to honor deployment env"
-IMAGE="$IMAGE" docker compose -f "$COMPOSE_FILE" run --rm --no-deps "$SERVICE_NAME" sh -lc 'rm -f /data/runtime-db.json'
-
 echo "Starting production service"
 IMAGE="$IMAGE" docker compose -f "$COMPOSE_FILE" up -d --force-recreate --no-build "$SERVICE_NAME"
 
