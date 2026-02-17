@@ -228,8 +228,17 @@ jobs:
             upsert_env "APP_COMMIT" "$APP_COMMIT" ".env.dev"
             upsert_env "APP_VERSION" "$APP_VERSION" ".env.dev"
 
+            current_master_key="$(sed -n 's/^KTRAIN_MASTER_KEY=//p' .env.dev | head -n 1 | tr -d '\r\n')"
             if [ -n "${MASTER_KEY_SECRET:-}" ]; then
               upsert_env "KTRAIN_MASTER_KEY" "$MASTER_KEY_SECRET" ".env.dev"
+            elif [ -z "${current_master_key:-}" ]; then
+              if command -v openssl >/dev/null 2>&1; then
+                generated_master_key="$(openssl rand -base64 32 | tr -d '\r\n')"
+              else
+                generated_master_key="$(head -c 32 /dev/urandom | base64 | tr -d '\r\n')"
+              fi
+              upsert_env "KTRAIN_MASTER_KEY" "$generated_master_key" ".env.dev"
+              echo "Generated KTRAIN_MASTER_KEY on server for dev deployment (value hidden)."
             fi
 
             chmod 600 .env.dev || true

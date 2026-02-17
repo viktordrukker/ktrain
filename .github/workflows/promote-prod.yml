@@ -16,6 +16,15 @@ on:
         required: false
         type: boolean
         default: false
+      generate_master_key_if_missing:
+        description: "Generate and persist KTRAIN_MASTER_KEY on server if missing"
+        required: false
+        type: boolean
+        default: false
+      generate_master_key_confirm:
+        description: "Required only when generation is enabled: type GENERATE_MASTER_KEY"
+        required: false
+        type: string
 
 concurrency:
   group: ktrain-production-promote
@@ -36,6 +45,10 @@ jobs:
           set -euo pipefail
           if [ "${{ inputs.confirm }}" != "PROMOTE" ]; then
             echo "Refusing promotion: input 'confirm' must equal PROMOTE"
+            exit 1
+          fi
+          if [ "${{ inputs.generate_master_key_if_missing }}" = "true" ] && [ "${{ inputs.generate_master_key_confirm }}" != "GENERATE_MASTER_KEY" ]; then
+            echo "Refusing promotion: generate_master_key_confirm must equal GENERATE_MASTER_KEY when generate_master_key_if_missing=true"
             exit 1
           fi
 
@@ -219,6 +232,8 @@ jobs:
           DEPLOY_PATH: ${{ steps.guard.outputs.deploy_path }}
           MASTER_KEY_SECRET: ${{ secrets.KTRAIN_MASTER_KEY }}
           SQLITE_MODE: ${{ inputs.sqlite_mode }}
+          GENERATE_MASTER_KEY_IF_MISSING: ${{ inputs.generate_master_key_if_missing }}
+          GENERATE_MASTER_KEY_CONFIRM: ${{ inputs.generate_master_key_confirm }}
           IMAGE_REF: ${{ needs.promote_image.outputs.prod_image_tag }}
           APP_BUILD: ${{ github.run_number }}
           APP_COMMIT: ${{ needs.promote_image.outputs.image_sha }}
@@ -228,7 +243,7 @@ jobs:
           port: ${{ secrets.HETZNER_PORT || '22' }}
           username: ${{ secrets.HETZNER_USER }}
           key: ${{ secrets.HETZNER_SSH_KEY }}
-          envs: DEPLOY_PATH,MASTER_KEY_SECRET,SQLITE_MODE,IMAGE_REF,APP_BUILD,APP_COMMIT,APP_VERSION
+          envs: DEPLOY_PATH,MASTER_KEY_SECRET,SQLITE_MODE,GENERATE_MASTER_KEY_IF_MISSING,GENERATE_MASTER_KEY_CONFIRM,IMAGE_REF,APP_BUILD,APP_COMMIT,APP_VERSION
           script: |
             set -euo pipefail
             if [ -z "${DEPLOY_PATH:-}" ]; then
@@ -271,8 +286,27 @@ jobs:
             upsert_env "APP_COMMIT" "$APP_COMMIT" ".env.prod"
             upsert_env "APP_VERSION" "$APP_VERSION" ".env.prod"
 
+            current_master_key="$(sed -n 's/^KTRAIN_MASTER_KEY=//p' .env.prod | head -n 1 | tr -d '\r\n')"
             if [ -n "${MASTER_KEY_SECRET:-}" ]; then
               upsert_env "KTRAIN_MASTER_KEY" "$MASTER_KEY_SECRET" ".env.prod"
+            elif [ -z "${current_master_key:-}" ]; then
+              if [ "${GENERATE_MASTER_KEY_IF_MISSING:-false}" = "true" ]; then
+                if [ "${GENERATE_MASTER_KEY_CONFIRM:-}" != "GENERATE_MASTER_KEY" ]; then
+                  echo "Refusing key generation: missing explicit confirmation."
+                  exit 1
+                fi
+                if command -v openssl >/dev/null 2>&1; then
+                  generated_master_key="$(openssl rand -base64 32 | tr -d '\r\n')"
+                else
+                  generated_master_key="$(head -c 32 /dev/urandom | base64 | tr -d '\r\n')"
+                fi
+                upsert_env "KTRAIN_MASTER_KEY" "$generated_master_key" ".env.prod"
+                echo "Generated KTRAIN_MASTER_KEY on server for production deployment (value hidden)."
+              else
+                echo "Missing KTRAIN_MASTER_KEY and no existing key found in .env.prod."
+                echo "Set repository secret KTRAIN_MASTER_KEY or rerun with generate_master_key_if_missing=true and generate_master_key_confirm=GENERATE_MASTER_KEY."
+                exit 1
+              fi
             fi
 
             if [ "${SQLITE_MODE}" = "true" ]; then
