@@ -90,6 +90,24 @@ echo "Runtime override cleared at /data/reinit/last_runtime_reinit_utc.txt"
 '
 }
 
+force_setup_wizard_on_sqlite_fallback() {
+  if [ "$FORCE_APP_REINIT" != "true" ]; then
+    return 0
+  fi
+  echo "Re-init + SQLite fallback: rotating SQLite data to force setup wizard"
+  IMAGE="$IMAGE" docker compose -f "$COMPOSE_FILE" run --rm --no-deps "$SERVICE_NAME" sh -lc '
+sqlite_path="${SQLITE_PATH:-/data/ktrain.sqlite}"
+stamp="$(date +%s)"
+mkdir -p /data/reinit
+if [ -f "$sqlite_path" ]; then
+  mv "$sqlite_path" "${sqlite_path}.bak.${stamp}" || true
+  echo "Backed up SQLite DB to ${sqlite_path}.bak.${stamp}"
+fi
+rm -f "$sqlite_path-wal" "$sqlite_path-shm" || true
+echo "forced_setup_after_sqlite_fallback=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /data/reinit/forced_setup_after_sqlite_fallback.txt
+'
+}
+
 preflight_postgres() {
   if [ "$EFFECTIVE_SQLITE_MODE" = "true" ]; then
     return 0
@@ -262,6 +280,7 @@ set -e
 
 if [ "$PREFLIGHT_RC" -eq 42 ]; then
   enable_sqlite_fallback
+  force_setup_wizard_on_sqlite_fallback
 elif [ "$PREFLIGHT_RC" -ne 0 ]; then
   echo "PostgreSQL preflight failed; deployment aborted before container replacement."
   exit 1
