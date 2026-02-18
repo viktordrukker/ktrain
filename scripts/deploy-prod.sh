@@ -72,22 +72,6 @@ enable_sqlite_fallback() {
   echo "No valid PostgreSQL bootstrap config found. Falling back to SQLite bootstrap mode."
 }
 
-preflight_postgres() {
-  if [ "$EFFECTIVE_SQLITE_MODE" = "true" ]; then
-    return 0
-  fi
-  echo "Preflight: validating PostgreSQL connectivity from persisted runtime/env config"
-  IMAGE="$IMAGE" docker compose -f "$COMPOSE_FILE" run --rm --no-deps "$SERVICE_NAME" sh -lc 'cd /app/server && node - <<'"'"'JS'"'"'
-const fs = require("fs");
-const { Pool } = require("pg");
-
-const runtimePath = process.env.DB_RUNTIME_CONFIG_PATH || "/data/runtime-db.json";
-
-function isPlaceholderHost(host) {
-  const v = String(host || "").trim().toLowerCase();
-  return !v || v === "ktrain_postgres" || v === "postgres";
-}
-
 force_runtime_reinit() {
   if [ "$FORCE_APP_REINIT" != "true" ]; then
     return 0
@@ -104,6 +88,22 @@ mkdir -p /data/reinit
 date -u +"%Y-%m-%dT%H:%M:%SZ" > /data/reinit/last_runtime_reinit_utc.txt
 echo "Runtime override cleared at /data/reinit/last_runtime_reinit_utc.txt"
 '
+}
+
+preflight_postgres() {
+  if [ "$EFFECTIVE_SQLITE_MODE" = "true" ]; then
+    return 0
+  fi
+  echo "Preflight: validating PostgreSQL connectivity from persisted runtime/env config"
+  IMAGE="$IMAGE" docker compose -f "$COMPOSE_FILE" run --rm --no-deps "$SERVICE_NAME" sh -lc 'cd /app/server && node - <<'"'"'JS'"'"'
+const fs = require("fs");
+const { Pool } = require("pg");
+
+const runtimePath = process.env.DB_RUNTIME_CONFIG_PATH || "/data/runtime-db.json";
+
+function isPlaceholderHost(host) {
+  const v = String(host || "").trim().toLowerCase();
+  return !v || v === "ktrain_postgres" || v === "postgres";
 }
 
 function isPlaceholderPassword(password) {
