@@ -168,17 +168,18 @@ class SqliteAdapter {
     return this.db.prepare("SELECT * FROM game_preferences WHERE userId = ? LIMIT 1").get(userId) || null;
   }
 
-  async upsertGamePreferences({ userId, mode, level, contentType, language, updatedAt }) {
+  async upsertGamePreferences({ userId, mode, level, contentType, language, selectedPackId, updatedAt }) {
     this.db.prepare(`
-      INSERT INTO game_preferences (userId, mode, level, contentType, language, updatedAt)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO game_preferences (userId, mode, level, contentType, language, selectedPackId, updatedAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(userId) DO UPDATE SET
         mode = excluded.mode,
         level = excluded.level,
         contentType = excluded.contentType,
         language = excluded.language,
+        selectedPackId = excluded.selectedPackId,
         updatedAt = excluded.updatedAt
-    `).run(userId, mode, level, contentType, language, updatedAt);
+    `).run(userId, mode, level, contentType, language, selectedPackId || null, updatedAt);
   }
 
   async getPlayerStats(userId) {

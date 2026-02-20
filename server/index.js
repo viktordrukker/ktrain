@@ -648,6 +648,7 @@ function defaultGamePreferences(userId = null) {
     level: 1,
     contentType: "default",
     language: "en",
+    selectedPackId: null,
     updatedAt: new Date().toISOString()
   };
 }
@@ -1617,58 +1618,87 @@ async function generateTasks(level, count, contentMode, language = "en", runtime
   const safeLevel = clampNumber(level, 1, 5, 1);
   const safeCount = clampNumber(count, 5, 200, 10);
   const safeLanguage = String(language || "en").toLowerCase();
+  const requestedPackId = runtimeCtx?.selectedPackId ? String(runtimeCtx.selectedPackId) : null;
 
-  // Legacy published packs path remains unchanged for explicit vocab mode.
+  if (process.env.NODE_ENV !== "production") {
+    logger.info("tasks_generate_debug_input", {
+      requestId: runtimeCtx.requestId || null,
+      sessionId: runtimeCtx.sessionId || null,
+      actorId: runtimeCtx?.actor?.id || null,
+      mode: contentMode,
+      level: safeLevel,
+      language: safeLanguage,
+      selectedPackId: requestedPackId
+    });
+  }
+
   if (contentMode === "vocab") {
-    const tasks = [];
-    const level2PackItems = await repo.getPublishedPackItems({ language: safeLanguage, type: "level2" });
-    const level3PackItems = await repo.getPublishedPackItems({ language: safeLanguage, type: "level3" });
-    const sentencePackItems = await repo.getPublishedPackItems({ language: safeLanguage, type: "sentence_words" });
-    const useRuDefaults = safeLanguage === "ru";
-    const level2Words = level2PackItems.length ? level2PackItems.map((row) => row.text) : (useRuDefaults ? defaults.level2WordsRu : defaults.level2Words);
-    const level3Words = level3PackItems.length ? level3PackItems.map((row) => row.text) : (useRuDefaults ? defaults.level3WordsRu : defaults.level3Words);
-    const sentenceWords = sentencePackItems.length ? sentencePackItems.map((row) => row.text) : (useRuDefaults ? defaults.sentenceWordsRu : defaults.sentenceWords);
-
-    if (safeLevel === 1) {
-      return ensurePlayableTaskBatch(buildFallbackTasks(1, safeCount, safeLanguage), {
+    const vocabType = getVocabularyTypeForLevel(safeLevel);
+    const sessionId = normalizeGameSessionId(runtimeCtx.sessionId, runtimeCtx.actor, runtimeCtx.ip);
+    const sessionState = ensureDefaultModeSession(sessionId);
+    const channelKey = `${safeLanguage}|${safeLevel}|${vocabType}|vocab`;
+    const channelState = ensureDefaultModeChannel(sessionState, channelKey);
+    const packResult = await repo.listVocabularyPacks(
+      {
+        language: safeLanguage,
+        level: safeLevel,
+        type: vocabType,
+        status: "published"
+      },
+      {
+        page: 1,
+        pageSize: 500,
+        sortBy: "updated_at",
+        sortDir: "desc"
+      }
+    );
+    const packs = Array.isArray(packResult?.rows) ? packResult.rows : [];
+    let selectedPack = null;
+    if (requestedPackId) {
+      selectedPack = packs.find((pack) => String(pack.id) === requestedPackId) || null;
+    }
+    if (!selectedPack && packs.length > 0) {
+      selectedPack = chooseRandom(packs);
+    }
+    if (!selectedPack) {
+      return ensurePlayableTaskBatch(buildFallbackTasks(safeLevel, safeCount, safeLanguage), {
         level: safeLevel,
         count: safeCount,
         language: safeLanguage
       });
     }
-    if (safeLevel === 2) {
-      for (let i = 0; i < safeCount; i += 1) {
-        const word = chooseRandom(level2Words);
-        tasks.push({ id: `${safeLevel}-w-${Date.now()}-${i}`, level: safeLevel, prompt: word, answer: word });
-      }
-      return ensurePlayableTaskBatch(tasks, { level: safeLevel, count: safeCount, language: safeLanguage });
-    }
-    if (safeLevel === 3) {
-      for (let i = 0; i < safeCount; i += 1) {
-        const word = chooseRandom(level3Words);
-        tasks.push({ id: `${safeLevel}-w-${Date.now()}-${i}`, level: safeLevel, prompt: word, answer: word });
-      }
-      return ensurePlayableTaskBatch(tasks, { level: safeLevel, count: safeCount, language: safeLanguage });
-    }
-    while (tasks.length < safeCount) {
-      const maxWords = safeLevel === 4 ? 3 : 9;
-      const minWords = safeLevel === 4 ? 2 : 4;
-      const length = Math.floor(Math.random() * (maxWords - minWords + 1)) + minWords;
-      const words = Array.from({ length }, () => chooseRandom(sentenceWords));
-      const sentence = words.join(" ");
-      words.forEach((word, idx) => {
-        tasks.push({
-          id: `${safeLevel}-s-${Date.now()}-${tasks.length}`,
-          level: safeLevel,
-          prompt: word,
-          answer: word,
-          sentence,
-          wordIndex: idx,
-          words
-        });
+    const selectedPackId = String(selectedPack.id);
+    channelState.activePackId = selectedPackId;
+    const entries = (await repo.listVocabularyEntries(selectedPackId))
+      .map((row) => String(row.text || "").trim())
+      .filter(Boolean);
+    if (!entries.length) {
+      return ensurePlayableTaskBatch(buildFallbackTasks(safeLevel, safeCount, safeLanguage), {
+        level: safeLevel,
+        count: safeCount,
+        language: safeLanguage
       });
     }
-    return ensurePlayableTaskBatch(tasks.slice(0, safeCount), { level: safeLevel, count: safeCount, language: safeLanguage });
+    const result = buildTasksFromVocabularyEntries({
+      level: safeLevel,
+      count: safeCount,
+      entries,
+      channelState,
+      packId: selectedPackId,
+      language: safeLanguage
+    });
+    if (!result.tasks.length) {
+      return ensurePlayableTaskBatch(buildFallbackTasks(safeLevel, safeCount, safeLanguage), {
+        level: safeLevel,
+        count: safeCount,
+        language: safeLanguage
+      });
+    }
+    return ensurePlayableTaskBatch(result.tasks, {
+      level: safeLevel,
+      count: safeCount,
+      language: safeLanguage
+    });
   }
 
   if (safeLevel === 1) {
@@ -2689,6 +2719,7 @@ app.get("/api/user/preferences", requirePermission(Permissions.SESSION_READ), wi
         level: clampNumber(existing.level, 1, 5, 1),
         contentType: existing.contenttype || existing.contentType || "default",
         language: String(existing.language || "en").toLowerCase(),
+        selectedPackId: existing.selectedpackid || existing.selectedPackId || null,
         updatedAt: existing.updatedat || existing.updatedAt || new Date().toISOString()
       }
     : defaultGamePreferences(req.actor.id);
@@ -2702,6 +2733,7 @@ app.put("/api/user/preferences", requirePermission(Permissions.SESSION_READ), wi
   const level = clampNumber(body.level, 1, 5, 1);
   const contentType = body.contentType === "vocab" ? "vocab" : "default";
   const language = String(body.language || "en").toLowerCase();
+  const selectedPackId = body.selectedPackId ? String(body.selectedPackId).trim() || null : null;
   const updatedAt = new Date().toISOString();
   await repo.upsertGamePreferences({
     userId: req.actor.id,
@@ -2709,9 +2741,10 @@ app.put("/api/user/preferences", requirePermission(Permissions.SESSION_READ), wi
     level,
     contentType,
     language,
+    selectedPackId,
     updatedAt
   });
-  await audit(req, "user.preferences.update", "user", String(req.actor.id), { mode, level, contentType, language });
+  await audit(req, "user.preferences.update", "user", String(req.actor.id), { mode, level, contentType, language, selectedPackId });
   res.json({
     ok: true,
     preferences: {
@@ -2720,6 +2753,7 @@ app.put("/api/user/preferences", requirePermission(Permissions.SESSION_READ), wi
       level,
       contentType,
       language,
+      selectedPackId,
       updatedAt
     }
   });
@@ -2830,24 +2864,23 @@ app.post("/api/tasks/generate", requirePermission(Permissions.TASKS_GENERATE), r
   const safeLevel = asNumber(body.level, { min: 1, max: maxLevel, field: "level" });
   const safeCount = asNumber(body.count ?? 10, { min: 5, max: 100, field: "count" });
   const safeContentMode = body.contentMode === "vocab" ? "vocab" : "default";
+  const selectedPackId = body.selectedPackId ? String(body.selectedPackId) : null;
   const requestedLanguage = String(body.language || "en").toLowerCase();
   const telemetry = body.telemetry && typeof body.telemetry === "object" ? body.telemetry : {};
   const sessionId = normalizeGameSessionId(body.sessionId, req.actor, req.ip);
+  const type = getVocabularyTypeForLevel(safeLevel);
+  const packResult = await repo.listVocabularyPacks({ level: safeLevel, type, status: "published" }, {
+    page: 1,
+    pageSize: 500,
+    sortBy: "updated_at",
+    sortDir: "desc"
+  });
+  const dynamic = Array.isArray(packResult?.rows)
+    ? packResult.rows.map((row) => String(row.language || "").toLowerCase()).filter(Boolean)
+    : [];
   const languages = safeContentMode === "vocab"
-    ? await repo.listPublishedLanguagesByType(safeLevel === 2 ? "level2" : safeLevel === 3 ? "level3" : "sentence_words")
-    : await (async () => {
-      const type = getVocabularyTypeForLevel(safeLevel);
-      const packResult = await repo.listVocabularyPacks({ level: safeLevel, type, status: "published" }, {
-        page: 1,
-        pageSize: 500,
-        sortBy: "updated_at",
-        sortDir: "desc"
-      });
-      const dynamic = Array.isArray(packResult?.rows)
-        ? packResult.rows.map((row) => String(row.language || "").toLowerCase()).filter(Boolean)
-        : [];
-      return Array.from(new Set(["en", "ru", ...dynamic]));
-    })();
+    ? Array.from(new Set(dynamic))
+    : Array.from(new Set(["en", "ru", ...dynamic]));
   let fallbackNotice = null;
   let language = requestedLanguage;
   if (!languages.includes(language)) {
@@ -2862,6 +2895,7 @@ app.post("/api/tasks/generate", requirePermission(Permissions.TASKS_GENERATE), r
   }
   const tasks = await generateTasks(safeLevel, safeCount, safeContentMode, language, {
     sessionId,
+    selectedPackId,
     telemetry: {
       cpm: clampNumber(telemetry.cpm, 0, 10_000, 0)
     },
@@ -2869,6 +2903,18 @@ app.post("/api/tasks/generate", requirePermission(Permissions.TASKS_GENERATE), r
     ip: req.ip,
     requestId: req.requestId || null
   });
+  if (process.env.NODE_ENV !== "production") {
+    logger.info("tasks_generate_debug_output", {
+      requestId: req.requestId || null,
+      sessionId,
+      mode: safeContentMode,
+      level: safeLevel,
+      selectedPackId,
+      language,
+      tasks: Array.isArray(tasks) ? tasks.length : 0,
+      firstPrompts: Array.isArray(tasks) ? tasks.slice(0, 3).map((task) => task.prompt) : []
+    });
+  }
   res.json({ tasks, language, fallbackNotice, safeDefaultsApplied: !actorIsAuthorized });
 }));
 
@@ -2960,11 +3006,6 @@ app.get("/api/leaderboard", requirePermission(Permissions.LEADERBOARD_READ), wit
 app.get("/api/packs/languages", requirePermission(Permissions.TASKS_GENERATE), withAsync(async (req, res) => {
   const level = asNumber(req.query.level || 2, { min: 1, max: 5, field: "level" });
   const contentMode = req.query.contentMode === "vocab" ? "vocab" : "default";
-  if (contentMode === "vocab") {
-    const type = level === 2 ? "level2" : level === 3 ? "level3" : "sentence_words";
-    const languages = await repo.listPublishedLanguagesByType(type);
-    return res.json({ ok: true, level, type, contentMode, languages });
-  }
   const vocabType = getVocabularyTypeForLevel(level);
   const packResult = await repo.listVocabularyPacks({
     level,
@@ -2979,8 +3020,40 @@ app.get("/api/packs/languages", requirePermission(Permissions.TASKS_GENERATE), w
   const dynamic = Array.isArray(packResult?.rows)
     ? packResult.rows.map((row) => String(row.language || "").toLowerCase()).filter(Boolean)
     : [];
-  const languages = Array.from(new Set(["en", "ru", ...dynamic])).sort();
+  const languages = contentMode === "vocab"
+    ? Array.from(new Set(dynamic)).sort()
+    : Array.from(new Set(["en", "ru", ...dynamic])).sort();
   return res.json({ ok: true, level, type: vocabType, contentMode, languages });
+}));
+
+app.get("/api/vocabulary/packs", requirePermission(Permissions.TASKS_GENERATE), withAsync(async (req, res) => {
+  const level = asNumber(req.query.level || 1, { min: 1, max: 5, field: "level" });
+  const language = String(req.query.language || "").toLowerCase().trim();
+  const type = normalizeVocabularyType(String(req.query.type || getVocabularyTypeForLevel(level)));
+  const filters = {
+    level,
+    type,
+    status: "published"
+  };
+  if (language) filters.language = language;
+  const result = await repo.listVocabularyPacks(filters, {
+    page: 1,
+    pageSize: 500,
+    sortBy: "updated_at",
+    sortDir: "desc"
+  });
+  const rows = Array.isArray(result?.rows) ? result.rows : [];
+  const packs = rows.map((row) => ({
+    id: String(row.id),
+    name: String(row.name || `Pack ${row.id}`),
+    language: String(row.language || "").toLowerCase(),
+    level: Number(row.level || level),
+    type: normalizeVocabularyType(String(row.type || type)),
+    status: String(row.status || "published"),
+    entry_count: Number(row.entry_count || 0),
+    updated_at: row.updated_at || row.updatedAt || null
+  }));
+  res.json({ ok: true, packs });
 }));
 
 app.get("/api/packs/items", requirePermission(Permissions.TASKS_GENERATE), withAsync(async (req, res) => {
