@@ -28,6 +28,15 @@ import { TaskText, FitConfig, FitMetrics } from "./textFit";
 import { normalizePlayableSettings, toPreferencePayload, toTaskGenerationPayload } from "./gameConfig";
 import { applyGuestGamePreferences, loadGuestGamePreferences, persistGuestGamePreferences } from "./gamePreferencesStorage";
 import { getPreviewControlState } from "./previewControls";
+import {
+  DEFAULT_ANTI_SMASH_CONFIG,
+  KeyboardInputController,
+  normalizeInputKey,
+  type InputResult,
+  type AntiSmashConfig
+} from "./inputController";
+import { deriveAntiSmashUiCue } from "./antiSmashUi";
+import { resolveAntiSmashRuntimeConfig } from "./antiSmashRuntime";
 
 type Mode = "learning" | "contest";
 type ContestType = "time" | "tasks";
@@ -265,6 +274,8 @@ type AppSettings = {
   rollingCart: "off" | "on";
   rollingIntensity: "minimal" | "normal";
   spaceRequired: boolean;
+  toddlerMode: boolean;
+  antiSmash: AntiSmashConfig;
   debugLayout: boolean;
   showBounds: boolean;
   apcaDeveloper: boolean;
@@ -390,6 +401,20 @@ const defaultAppSettings: AppSettings = {
   rollingCart: "off",
   rollingIntensity: "minimal",
   spaceRequired: false,
+  toddlerMode: false,
+  antiSmash: {
+    ...DEFAULT_ANTI_SMASH_CONFIG,
+    enabled: true,
+    maxSimultaneousKeysAllowed: 1,
+    burstWindowMs: 120,
+    requireAllKeysUpBetweenAccepts: true,
+    escalation: true,
+    maxFreezeMs: 1200,
+    baseFreezeMs: 400,
+    resetAfterCleanPresses: 5,
+    penalizeScore: false,
+    breakStreak: false
+  },
   debugLayout: false,
   showBounds: false,
   apcaDeveloper: false,
@@ -467,6 +492,7 @@ const agePresets: Record<string, Partial<AppSettings> & { maxAllowedLevel: numbe
     theme: "high_contrast",
     flatTheme: true,
     lowStimulation: true,
+    toddlerMode: true,
     customTheme: {
       background: "#ffffff",
       backgroundAlt: "#ffffff",
@@ -486,6 +512,7 @@ const agePresets: Record<string, Partial<AppSettings> & { maxAllowedLevel: numbe
   "3-4": {
     textSize: "xlarge",
     theme: "warm_playful",
+    toddlerMode: true,
     correctEffects: { intensity: "low", variation: "small" } as AppSettings["correctEffects"],
     animationSpeed: 0.9,
     maxAllowedLevel: 3,
@@ -1401,6 +1428,11 @@ function classifyKey(event: KeyboardEvent) {
   return "other";
 }
 
+function toInputControllerKind(kind: ReturnType<typeof classifyKey>) {
+  if (kind === "function") return "other" as const;
+  return kind;
+}
+
 function renderZeroStyledText(text: string, settings: AppSettings) {
   if (!settings.differentiateZero) return text;
   return text.split("").map((char, idx) => {
@@ -1487,6 +1519,10 @@ function App() {
   const [showLangBanner, setShowLangBanner] = useState(false);
   const [langDismissed, setLangDismissed] = useState(false);
   const [functionKeyNotice, setFunctionKeyNotice] = useState("");
+  const [antiSmashHint, setAntiSmashHint] = useState("");
+  const [antiSmashFreezeMs, setAntiSmashFreezeMs] = useState(0);
+  const [antiSmashJiggle, setAntiSmashJiggle] = useState(false);
+  const antiSmashTimersRef = useRef<{ hint: number | null; jiggle: number | null }>({ hint: null, jiggle: null });
   const [lastFunctionKey, setLastFunctionKey] = useState("");
   const [lastFunctionKeyTime, setLastFunctionKeyTime] = useState(0);
   const [showZeroHint, setShowZeroHint] = useState(false);
@@ -1541,6 +1577,7 @@ function App() {
     modes: []
   });
   const [playSessionId, setPlaySessionId] = useState<string>("");
+  const inputControllerRef = useRef(new KeyboardInputController(DEFAULT_ANTI_SMASH_CONFIG));
   const [googleClientId, setGoogleClientId] = useState("");
   const [passwordResetEnabled, setPasswordResetEnabled] = useState(false);
   const [myRank, setMyRank] = useState<number | null>(null);
@@ -1627,6 +1664,10 @@ function App() {
     : 0;
   const isSetupRoute = window.location.pathname === "/setup";
   const isSetupRequired = publicConfigOverall === "SETUP_REQUIRED";
+  const antiSmashRuntimeConfig = useMemo(
+    () => resolveAntiSmashRuntimeConfig(appSettings.antiSmash, appSettings.toddlerMode, settings.level),
+    [appSettings.antiSmash, appSettings.toddlerMode, settings.level]
+  );
 
   const reportClientError = useCallback((action: string, err: any) => {
     const apiErr = err as ApiError;
@@ -1678,6 +1719,59 @@ function App() {
       }
     });
   }, [themeVars]);
+
+  useEffect(() => {
+    inputControllerRef.current.updateConfig(antiSmashRuntimeConfig);
+    inputControllerRef.current.reset();
+  }, [antiSmashRuntimeConfig]);
+
+  useEffect(() => {
+    if (screen !== "game") {
+      inputControllerRef.current.reset();
+      return;
+    }
+    inputControllerRef.current.reset();
+  }, [screen, currentTask?.id]);
+
+  const clearAntiSmashTimers = useCallback(() => {
+    if (antiSmashTimersRef.current.hint !== null) {
+      window.clearTimeout(antiSmashTimersRef.current.hint);
+      antiSmashTimersRef.current.hint = null;
+    }
+    if (antiSmashTimersRef.current.jiggle !== null) {
+      window.clearTimeout(antiSmashTimersRef.current.jiggle);
+      antiSmashTimersRef.current.jiggle = null;
+    }
+  }, []);
+
+  const triggerAntiSmashFeedback = useCallback((result: Pick<InputResult, "action" | "freezeMs">) => {
+    const cue = deriveAntiSmashUiCue(result, appSettings.soundEnabled);
+    if (!cue.active) return;
+    clearAntiSmashTimers();
+    setAntiSmashHint(cue.hintLabel);
+    setAntiSmashFreezeMs(cue.freezeMs);
+    setAntiSmashJiggle(cue.shouldJiggle);
+    if (cue.shouldPlaySound) {
+      sound.play("chime");
+    }
+    antiSmashTimersRef.current.jiggle = window.setTimeout(() => setAntiSmashJiggle(false), 560);
+    antiSmashTimersRef.current.hint = window.setTimeout(() => {
+      setAntiSmashHint("");
+      setAntiSmashFreezeMs(0);
+    }, cue.freezeMs);
+  }, [appSettings.soundEnabled, clearAntiSmashTimers, sound]);
+
+  useEffect(() => () => {
+    clearAntiSmashTimers();
+  }, [clearAntiSmashTimers]);
+
+  useEffect(() => {
+    if (screen === "game") return;
+    clearAntiSmashTimers();
+    setAntiSmashHint("");
+    setAntiSmashFreezeMs(0);
+    setAntiSmashJiggle(false);
+  }, [clearAntiSmashTimers, screen]);
 
   const applySettings = useCallback(async () => {
     if (!adminPin) return false;
@@ -2066,7 +2160,8 @@ function App() {
           maxAllowedLevel: maxAllowed,
           allowedLevels: buildAllowedLevels(maxAllowed),
           customTheme: { ...defaultAppSettings.customTheme, ...(loaded.customTheme || {}) },
-          correctEffects: { ...defaultAppSettings.correctEffects, ...(loaded.correctEffects || {}) }
+          correctEffects: { ...defaultAppSettings.correctEffects, ...(loaded.correctEffects || {}) },
+          antiSmash: { ...defaultAppSettings.antiSmash, ...(loaded.antiSmash || {}) }
         });
         setSavedAppSettings({
           ...defaultAppSettings,
@@ -2074,7 +2169,8 @@ function App() {
           maxAllowedLevel: maxAllowed,
           allowedLevels: buildAllowedLevels(maxAllowed),
           customTheme: { ...defaultAppSettings.customTheme, ...(loaded.customTheme || {}) },
-          correctEffects: { ...defaultAppSettings.correctEffects, ...(loaded.correctEffects || {}) }
+          correctEffects: { ...defaultAppSettings.correctEffects, ...(loaded.correctEffects || {}) },
+          antiSmash: { ...defaultAppSettings.antiSmash, ...(loaded.antiSmash || {}) }
         });
         setLastSettingsAppliedAt(new Date().toISOString());
         setSettingsLoaded(true);
@@ -2506,7 +2602,106 @@ function App() {
     }
   };
 
-  const handleKey = useCallback((event: KeyboardEvent) => {
+  const applyAcceptedInput = useCallback((normalized: string, kind: ReturnType<typeof classifyKey>, isCorrect: boolean) => {
+    if (!currentTask) return;
+    if (kind === "space") {
+      if (!expectSpace) return;
+      if (isCorrect) {
+        setExpectSpace(false);
+        handleCorrect();
+      } else {
+        handleIncorrect(settings.mode === "contest");
+      }
+      return;
+    }
+    const expected = currentTask.answer.toLowerCase();
+    const expectedChar = expected[caretIndex];
+    if (!expectedChar) return;
+
+    if (expected.length === 1) {
+      if (isCorrect) {
+        handleCorrect();
+      } else {
+        handleIncorrect(settings.mode === "contest");
+      }
+      return;
+    }
+
+    if (isCorrect) {
+      const nextBuffer = buffer + normalized;
+      setBuffer(nextBuffer);
+      setProgress((prev) => {
+        const next = [...prev];
+        next[caretIndex] = "correct";
+        return next;
+      });
+      const nextCaret = caretIndex + 1;
+      if (nextCaret >= expected.length) {
+        if (currentTask.sentence && appSettings.spaceRequired) {
+          setExpectSpace(true);
+        } else {
+          handleCorrect();
+        }
+      } else {
+        setCaretIndex(nextCaret);
+      }
+      return;
+    }
+
+    registerMistake();
+    setProgress((prev) => {
+      const next = [...prev];
+      next[caretIndex] = "wrong";
+      return next;
+    });
+    setTimeout(() => {
+      setProgress((prev) => {
+        const next = [...prev];
+        if (next[caretIndex] === "wrong") next[caretIndex] = "pending";
+        return next;
+      });
+    }, 400);
+    if (appSettings.wrongCharBehavior === "skip") {
+      const nextCaret = caretIndex + 1;
+      if (nextCaret >= expected.length) {
+        if (currentTask.sentence && appSettings.spaceRequired) {
+          setExpectSpace(true);
+        } else {
+          handleCorrect();
+        }
+      } else {
+        setCaretIndex(nextCaret);
+      }
+    }
+  }, [
+    appSettings.spaceRequired,
+    appSettings.wrongCharBehavior,
+    buffer,
+    caretIndex,
+    currentTask,
+    expectSpace,
+    handleCorrect,
+    handleIncorrect,
+    registerMistake,
+    settings.mode
+  ]);
+
+  const handleGameplayKeyResult = useCallback((result: InputResult, kind: ReturnType<typeof classifyKey>) => {
+    if (result.action === "IGNORED_SMASH") {
+      triggerAntiSmashFeedback(result);
+      return;
+    }
+    const normalizedKey = normalizeInputKey(result.normalizedKey);
+    if (result.action === "ACCEPTED_CORRECT") {
+      applyAcceptedInput(normalizedKey, kind, true);
+      return;
+    }
+    if (result.action === "ACCEPTED_WRONG") {
+      applyAcceptedInput(normalizedKey, kind, false);
+    }
+  }, [applyAcceptedInput, triggerAntiSmashFeedback]);
+
+  const handleKeyDown = useCallback((event: KeyboardEvent) => {
     if (screen !== "game" || !currentTask) return;
     const key = event.key;
     const kind = classifyKey(event);
@@ -2526,28 +2721,12 @@ function App() {
       return;
     }
 
-    if (kind === "modifier" || kind === "navigation" || kind === "other") return;
+    if (kind === "modifier" || kind === "navigation" || kind === "other" || kind === "punct") return;
+    if (expectSpace && kind !== "space") return;
+    if (kind === "space" && !expectSpace) return;
 
-    if (kind === "space") {
-      if (!expectSpace) return;
-    }
-
-    if (kind === "punct") {
-      return;
-    }
-
-    if (kind === "space") {
-      if (key === " ") {
-        setExpectSpace(false);
-        handleCorrect();
-      }
-      return;
-    }
-
-    const normalized = key.toLowerCase();
     const expected = currentTask.answer.toLowerCase();
-    const expectedChar = expected[caretIndex];
-
+    const expectedChar = expectSpace ? " " : expected[caretIndex] || null;
     if (!expectedChar) return;
 
     if (appSettings.languageReminder && !langDismissed) {
@@ -2564,77 +2743,54 @@ function App() {
     }
     if (showLangBanner) setShowLangBanner(false);
 
-    if (expected.length === 1) {
-      if (normalized === expectedChar) {
-        handleCorrect();
-      } else {
-        handleIncorrect(settings.mode === "contest");
-      }
-      return;
-    }
-
-    if (normalized === expectedChar) {
-      const nextBuffer = buffer + normalized;
-      setBuffer(nextBuffer);
-      setProgress((prev) => {
-        const next = [...prev];
-        next[caretIndex] = "correct";
-        return next;
-      });
-      const nextCaret = caretIndex + 1;
-      if (nextCaret >= expected.length) {
-        if (currentTask.sentence && appSettings.spaceRequired) {
-          setExpectSpace(true);
-        } else {
-          handleCorrect();
-        }
-      } else {
-        setCaretIndex(nextCaret);
-      }
-    } else {
-      registerMistake();
-      setProgress((prev) => {
-        const next = [...prev];
-        next[caretIndex] = "wrong";
-        return next;
-      });
-      setTimeout(() => {
-        setProgress((prev) => {
-          const next = [...prev];
-          if (next[caretIndex] === "wrong") next[caretIndex] = "pending";
-          return next;
-        });
-      }, 400);
-      if (appSettings.wrongCharBehavior === "skip") {
-        const nextCaret = caretIndex + 1;
-        if (nextCaret >= expected.length) {
-          if (currentTask.sentence && appSettings.spaceRequired) {
-            setExpectSpace(true);
-          } else {
-            handleCorrect();
-          }
-        } else {
-          setCaretIndex(nextCaret);
-        }
-      }
-    }
+    const result = inputControllerRef.current.handleKeyDown(
+      {
+        key,
+        kind: toInputControllerKind(kind),
+        repeat: Boolean(event.repeat),
+        timestampMs: Date.now()
+      },
+      expectedChar
+    );
+    handleGameplayKeyResult(result, kind);
   }, [
-    screen,
-    currentTask,
-    buffer,
-    caretIndex,
-    expectSpace,
     appSettings.languageReminder,
-    appSettings.spaceRequired,
-    appSettings.wrongCharBehavior,
     appSettings.protectFunctionKeys,
+    caretIndex,
+    currentTask,
+    expectSpace,
+    handleGameplayKeyResult,
+    langDismissed,
     langMismatchCount,
     langMismatchTs,
-    langDismissed,
     lastFunctionKey,
     lastFunctionKeyTime,
+    screen,
     showLangBanner
   ]);
+
+  const handleKeyUp = useCallback((event: KeyboardEvent) => {
+    if (screen !== "game" || !currentTask) return;
+    const kind = classifyKey(event);
+    if (expectSpace && kind !== "space") {
+      inputControllerRef.current.handleKeyUp(
+        { key: event.key, kind: toInputControllerKind(kind), timestampMs: Date.now() },
+        " "
+      );
+      return;
+    }
+    const expected = currentTask.answer.toLowerCase();
+    const expectedChar = expectSpace ? " " : expected[caretIndex] || null;
+    const result = inputControllerRef.current.handleKeyUp(
+      {
+        key: event.key,
+        kind: toInputControllerKind(kind),
+        timestampMs: Date.now()
+      },
+      expectedChar
+    );
+    handleGameplayKeyResult(result, kind);
+  }, [caretIndex, currentTask, expectSpace, handleGameplayKeyResult, screen]);
 
   useEffect(() => {
     if (screen !== "game") return;
@@ -2657,10 +2813,15 @@ function App() {
 
   useEffect(() => {
     if (screen !== "game") return;
-    const listener = (e: KeyboardEvent) => handleKey(e);
-    window.addEventListener("keydown", listener);
-    return () => window.removeEventListener("keydown", listener);
-  }, [screen, handleKey]);
+    const downListener = (e: KeyboardEvent) => handleKeyDown(e);
+    const upListener = (e: KeyboardEvent) => handleKeyUp(e);
+    window.addEventListener("keydown", downListener);
+    window.addEventListener("keyup", upListener);
+    return () => {
+      window.removeEventListener("keydown", downListener);
+      window.removeEventListener("keyup", upListener);
+    };
+  }, [screen, handleKeyDown, handleKeyUp]);
 
   useEffect(() => {
     if (screen !== "game") return;
@@ -3575,6 +3736,7 @@ function App() {
               appSettings={appSettings}
               correctFlash={correctFlash}
               mistakeFlash={mistakeFlash}
+              antiSmashJiggle={antiSmashJiggle}
               buffer={buffer}
               progress={progress}
               caretIndex={caretIndex}
@@ -3591,6 +3753,12 @@ function App() {
             )}
             {functionKeyNotice && (
               <FunctionKeyBanner message={functionKeyNotice} onDismiss={() => setFunctionKeyNotice("")} />
+            )}
+            {antiSmashHint && (
+              <div className="language-banner anti-smash-banner" role="status" aria-live="polite">
+                <div className="language-text"><span className="anti-smash-icon" aria-hidden>☝️</span> {antiSmashHint}</div>
+                <Badge variant="light" color="yellow">Pause {Math.max(0.3, antiSmashFreezeMs / 1000).toFixed(1)}s</Badge>
+              </div>
             )}
             {settings.mode === "learning"
               && showZeroHint
@@ -5718,6 +5886,14 @@ function SettingsScreen({
     }));
   };
 
+  const updateAntiSmash = (patch: Partial<AntiSmashConfig>) => {
+    setAppSettings((prev) => ({
+      ...prev,
+      agePreset: "custom",
+      antiSmash: { ...prev.antiSmash, ...patch }
+    }));
+  };
+
   const updateTheme = (patch: Partial<AppSettings["customTheme"]>) => {
     setAppSettings((prev) => ({
       ...prev,
@@ -5734,6 +5910,7 @@ function SettingsScreen({
       maxAllowedLevel: preset.maxAllowedLevel,
       allowedLevels: buildAllowedLevels(preset.maxAllowedLevel),
       correctEffects: { ...prev.correctEffects, ...(preset.correctEffects || {}) },
+      antiSmash: { ...prev.antiSmash, ...(preset.antiSmash || {}) },
       agePreset: presetKey
     }));
   };
@@ -6287,6 +6464,55 @@ function SettingsScreen({
                 onChange={(e) => updateSettings({ spaceRequired: e.currentTarget.checked })}
               />
             </SettingRow>
+            <Divider my="sm" />
+            <SettingRow label="Toddler Mode (3–4y)" helper="Forces one-key-at-a-time behavior on all levels.">
+              <Switch
+                checked={appSettings.toddlerMode}
+                onChange={(e) => updateSettings({ toddlerMode: e.currentTarget.checked })}
+              />
+            </SettingRow>
+            <SettingRow label="Anti-smash protection" helper="Level 1 enables this automatically unless turned off here.">
+              <Switch
+                checked={appSettings.antiSmash.enabled}
+                onChange={(e) => updateAntiSmash({ enabled: e.currentTarget.checked })}
+              />
+            </SettingRow>
+            <SettingSliderRow
+              label="Burst window"
+              helper="Treat very fast two-key bursts as smashing."
+              min={50}
+              max={180}
+              step={5}
+              value={appSettings.antiSmash.burstWindowMs}
+              onChange={(value) => updateAntiSmash({ burstWindowMs: value })}
+              formatValue={(value) => `${Math.round(value)} ms`}
+            />
+            <SettingSliderRow
+              label="Freeze time"
+              helper="How long input pauses after smashing."
+              min={300}
+              max={1200}
+              step={50}
+              value={appSettings.antiSmash.baseFreezeMs}
+              onChange={(value) => updateAntiSmash({ baseFreezeMs: value })}
+              formatValue={(value) => `${Math.round(value)} ms`}
+            />
+            <SettingRow label="Escalate freeze" helper="Repeated smashing increases pause duration (gentle cap).">
+              <Switch
+                checked={appSettings.antiSmash.escalation}
+                onChange={(e) => updateAntiSmash({ escalation: e.currentTarget.checked })}
+              />
+            </SettingRow>
+            <SettingSliderRow
+              label="Reset after clean presses"
+              helper="How many clean key presses reset the smash escalation."
+              min={2}
+              max={10}
+              step={1}
+              value={appSettings.antiSmash.resetAfterCleanPresses}
+              onChange={(value) => updateAntiSmash({ resetAfterCleanPresses: Math.round(value) })}
+              formatValue={(value) => `${Math.round(value)} presses`}
+            />
           </SettingsSection>
 
           <SettingsSection
@@ -6924,6 +7150,7 @@ function TaskStage({
   appSettings,
   correctFlash,
   mistakeFlash,
+  antiSmashJiggle,
   buffer,
   progress,
   caretIndex,
@@ -6937,6 +7164,7 @@ function TaskStage({
   appSettings: AppSettings;
   correctFlash: boolean;
   mistakeFlash: boolean;
+  antiSmashJiggle: boolean;
   buffer: string;
   progress: Array<"correct" | "wrong" | "pending">;
   caretIndex: number;
@@ -6983,7 +7211,7 @@ function TaskStage({
   return (
     <div className={`task-stage ${paddingClass}`}>
       <div className="task-stack horizontal">
-        <div className="task current">
+        <div className={`task current${antiSmashJiggle ? " anti-smash-jiggle" : ""}`}>
           <TaskText
             text={currentTask.prompt}
             config={fitConfigCurrent}
