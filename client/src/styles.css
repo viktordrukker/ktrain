@@ -1009,6 +1009,7 @@ input, select, textarea {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
 }
 
 .vocab-toolbar.sticky {
@@ -1022,11 +1023,24 @@ input, select, textarea {
 }
 
 .vocab-create-wizard {
-  width: min(1480px, 98vw);
+  width: 100%;
 }
 
 .vocab-import-panel {
+  width: 100%;
+}
+
+.vocab-toolbar-controls {
   width: min(1480px, 98vw);
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.vocab-quick-search {
+  flex: 1;
+  max-width: 480px;
 }
 
 .vocab-wizard-head {
@@ -1046,6 +1060,7 @@ input, select, textarea {
   display: grid;
   gap: 10px;
   align-items: start;
+  isolation: isolate;
 }
 
 .vocab-tree-panel,
@@ -1085,6 +1100,10 @@ input, select, textarea {
   gap: 8px;
 }
 
+.vocab-tree-pack strong {
+  display: block;
+}
+
 .vocab-tree-pack.active {
   background: rgba(255, 255, 255, 0.1);
 }
@@ -1103,8 +1122,12 @@ input, select, textarea {
 
 .vocab-filters {
   display: grid;
-  grid-template-columns: repeat(6, minmax(120px, 1fr));
+  grid-template-columns: repeat(5, minmax(120px, 1fr));
   gap: 10px;
+}
+
+.mantine-Drawer-body .vocab-filters {
+  grid-template-columns: 1fr;
 }
 
 .vocab-batch-bar {
@@ -1149,6 +1172,9 @@ input, select, textarea {
   text-align: left;
   border-bottom: 1px solid rgba(255, 255, 255, 0.07);
   white-space: nowrap;
+}
+
+.vocab-table td {
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -1196,6 +1222,13 @@ input, select, textarea {
   min-width: 260px;
 }
 
+.vocab-table th.col-actions,
+.vocab-table td.col-actions,
+.vocab-table td:last-child {
+  overflow: visible;
+  text-overflow: clip;
+}
+
 .vocab-table td.is-number {
   text-align: right;
   font-variant-numeric: tabular-nums;
@@ -1214,7 +1247,7 @@ input, select, textarea {
 .vocab-row-actions {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 6px;
 }
 
@@ -1259,6 +1292,13 @@ input, select, textarea {
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 8px;
   padding: 8px;
+}
+
+.vocab-preview-item {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.03);
 }
 
 .vocab-resizer {
@@ -1592,6 +1632,13 @@ input, select, textarea {
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
 }
 
+.mantine-Select-dropdown,
+.mantine-Combobox-dropdown,
+.mantine-Menu-dropdown,
+.mantine-Popover-dropdown {
+  z-index: 260 !important;
+}
+
 .mantine-Select-dropdown .mantine-ScrollArea-viewport,
 .mantine-Combobox-dropdown .mantine-ScrollArea-viewport,
 .mantine-Select-dropdown .mantine-Select-options,
@@ -1818,6 +1865,13 @@ input, select, textarea {
     flex-direction: column;
     align-items: stretch;
   }
+  .vocab-toolbar-controls {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .vocab-quick-search {
+    max-width: none;
+  }
   .settings-shell {
     grid-template-columns: 1fr;
   }
@@ -1855,6 +1909,13 @@ input, select, textarea {
   }
   .vocab-filters {
     grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .vocab-toolbar-controls {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .vocab-quick-search {
+    max-width: none;
   }
   .vocab-form-grid {
     grid-template-columns: 1fr;
