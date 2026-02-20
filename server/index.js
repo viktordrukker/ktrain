@@ -2182,8 +2182,22 @@ app.post("/api/setup/db/config", withAsync(async (req, res) => {
       reloadRecommended: true
     });
   } catch (err) {
-    if (err instanceof AppError) throw err;
+    if (err instanceof AppError) {
+      logger.warn("setup_db_config_failed", {
+        requestId: req.requestId,
+        driver,
+        code: err.code,
+        message: err.message,
+        details: err.details || null
+      });
+      throw err;
+    }
     const diagnostics = buildDbErrorDiagnostics(err?.cause || err);
+    logger.warn("setup_db_config_failed", {
+      requestId: req.requestId,
+      driver,
+      diagnostics
+    });
     const migrationRelated = ["schema_conflict", "schema_mismatch"].includes(String(diagnostics?.category || ""));
     throw new AppError(diagnostics.message || "Database configuration failed", {
       status: migrationRelated ? 409 : 400,
