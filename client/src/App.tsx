@@ -37,6 +37,13 @@ import {
 } from "./inputController";
 import { deriveAntiSmashUiCue } from "./antiSmashUi";
 import { resolveAntiSmashRuntimeConfig } from "./antiSmashRuntime";
+import {
+  analyzeVocabularyEntries,
+  dedupeEntryLines,
+  normalizeEntryCase,
+  parseVocabularyImportInput,
+  sortEntryLines
+} from "./vocabularyStudio";
 
 type Mode = "learning" | "contest";
 type ContestType = "time" | "tasks";
@@ -1226,6 +1233,7 @@ function Select(props: AppSelectProps) {
       checkIconPosition="right"
       comboboxProps={{
         withinPortal: true,
+        zIndex: 260,
         width: "target",
         position: "bottom-start",
         offset: 6,
@@ -3914,6 +3922,24 @@ function App() {
           isAdmin={isAdminUser}
           onBack={() => navigateFromSettings("settings")}
           onStatus={(msg) => setStatusMessage(msg)}
+          onPlayPack={async (pack) => {
+            const next = normalizePlayableSettings({
+              ...settings,
+              mode: "learning",
+              contentMode: "vocab",
+              selectedPackId: String(pack.id),
+              level: Number(pack.level || settings.level || 1),
+              language: String(pack.language || settings.language || "en").toLowerCase()
+            });
+            setSettings(next);
+            setMenuDraftSettings(next);
+            if (sessionUser?.isAuthenticated) {
+              void persistLastPlayedPreferences(next);
+            }
+            window.history.pushState({}, "", "/");
+            setScreen("game");
+            await startGame(next);
+          }}
         />
       )}
     </div>
@@ -4277,11 +4303,13 @@ function LeaderboardScreen({
 function VocabularyCenterScreen({
   isAdmin,
   onBack,
-  onStatus
+  onStatus,
+  onPlayPack
 }: {
   isAdmin: boolean;
   onBack: () => void;
   onStatus: (msg: string) => void;
+  onPlayPack: (pack: VocabularyPackRow) => Promise<void>;
 }) {
   const query = useMemo(() => new URLSearchParams(window.location.search), []);
   const initialPaneState = useMemo(() => {
@@ -4300,8 +4328,9 @@ function VocabularyCenterScreen({
   const [rightPanePercent, setRightPanePercent] = useState(initialPaneState.right);
   const [isMobile, setIsMobile] = useState(window.innerWidth <= 1024);
   const [mobileTab, setMobileTab] = useState<"tree" | "table" | "inspector">("table");
+  const [workspaceMode, setWorkspaceMode] = useState<"studio" | "table">("studio");
   const [tree, setTree] = useState<any>({});
-  const [treeSearch, setTreeSearch] = useState("");
+  const [treeSearch, setTreeSearch] = useState(query.get("search") || "");
   const [collapsedLangs, setCollapsedLangs] = useState<Record<string, boolean>>({});
   const [rows, setRows] = useState<VocabularyPackRow[]>([]);
   const [total, setTotal] = useState(0);
@@ -4331,13 +4360,17 @@ function VocabularyCenterScreen({
   const [createStep, setCreateStep] = useState(1);
   const [showCreateWizard, setShowCreateWizard] = useState(window.location.pathname === "/admin/vocabulary/new");
   const [showImportPanel, setShowImportPanel] = useState(false);
-  const [inspectorTab, setInspectorTab] = useState<"details" | "entries" | "history" | "diagnostics">("details");
+  const [showAdvancedFilters, setShowAdvancedFilters] = useState(false);
+  const [inspectorTab, setInspectorTab] = useState<"details" | "entries" | "preview" | "history" | "diagnostics">("details");
   const [inspectorMaximized, setInspectorMaximized] = useState(false);
   const [importJson, setImportJson] = useState("");
+  const [importAsDraft, setImportAsDraft] = useState(true);
+  const [importErrors, setImportErrors] = useState<string[]>([]);
   const [batchBusy, setBatchBusy] = useState(false);
   const [saveBusy, setSaveBusy] = useState(false);
   const [generateBusy, setGenerateBusy] = useState(false);
   const [lastGenerationError, setLastGenerationError] = useState<any>(null);
+  const [previewSeed, setPreviewSeed] = useState(0);
   const [createDraft, setCreateDraft] = useState<any>({
     language: "en",
     level: 1,
@@ -4455,6 +4488,14 @@ function VocabularyCenterScreen({
     void loadTree(key);
   }, [isAdmin, loadTree]);
 
+  useEffect(() => {
+    if (!isAdmin) return;
+    const fromQuery = String(query.get("packId") || "").trim();
+    if (!fromQuery || fromQuery === selectedId) return;
+    setSelectedId(fromQuery);
+    void loadPackDetail(fromQuery, true);
+  }, [isAdmin, query, selectedId, loadPackDetail]);
+
   const selectedCount = useMemo(() => Object.values(selectedIds).filter(Boolean).length, [selectedIds]);
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const filteredTree = useMemo(() => {
@@ -4472,26 +4513,23 @@ function VocabularyCenterScreen({
     });
     return out;
   }, [tree, treeSearch]);
-  const parsedLines = useMemo(() => {
-    const raw = entriesText.split(/\n/).map((line) => line.trim());
-    const nonEmpty = raw.filter(Boolean);
-    const dedupe = new Set<string>();
-    let duplicateCount = 0;
-    const normalized = nonEmpty.filter((line) => {
-      const key = line.toLowerCase();
-      if (dedupe.has(key)) {
-        duplicateCount += 1;
-        return false;
-      }
-      dedupe.add(key);
-      return true;
-    });
-    return {
-      normalized,
-      emptyCount: raw.length - nonEmpty.length,
-      duplicateCount
-    };
-  }, [entriesText]);
+  const entryType = ((pack?.type || createDraft.type || "words") as "words" | "sentences" | "fiction" | "code");
+  const parsedLines = useMemo(() => analyzeVocabularyEntries(entriesText, { type: entryType }), [entriesText, entryType]);
+  const samplePreviewEntries = useMemo(() => {
+    const source = parsedLines.cleanedLines.length > 0 ? parsedLines.cleanedLines : entries.map((entry) => entry.text);
+    if (source.length === 0) return [];
+    const count = Math.min(5, source.length);
+    const start = Math.max(0, previewSeed % source.length);
+    const out: string[] = [];
+    for (let i = 0; i < count; i += 1) {
+      out.push(source[(start + i) % source.length]);
+    }
+    return out;
+  }, [parsedLines.cleanedLines, entries, previewSeed]);
+  const importPreview = useMemo(() => {
+    if (!String(importJson || "").trim()) return null;
+    return parseVocabularyImportInput(importJson, { importAsDraft });
+  }, [importJson, importAsDraft]);
   const hasUnsavedInspectorChanges = useMemo(() => {
     if (!pack || !originalSnapshotRef.current) return false;
     const prev = originalSnapshotRef.current;
@@ -4540,7 +4578,7 @@ function VocabularyCenterScreen({
     if (!pack) return;
     setSaveBusy(true);
     try {
-      const nextEntries = parsedLines.normalized.map((text, idx) => ({
+      const nextEntries = parsedLines.cleanedLines.map((text, idx) => ({
         id: entries[idx]?.id || `tmp-${idx}`,
         text,
         order_index: idx
@@ -4553,7 +4591,7 @@ function VocabularyCenterScreen({
     } finally {
       setSaveBusy(false);
     }
-  }, [pack, parsedLines, entries, loadPackDetail, loadRows, loadTree, filters.language, filters.status, onStatus]);
+  }, [pack, parsedLines.cleanedLines, entries, loadPackDetail, loadRows, loadTree, filters.language, filters.status, onStatus]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -4569,9 +4607,15 @@ function VocabularyCenterScreen({
   const publishToggle = async (targetPack?: VocabularyPackRow) => {
     const localPack = targetPack || pack;
     if (!localPack) return;
+    if (!targetPack && localPack.status !== "published" && !parsedLines.canPublish) {
+      setInspectorTab("entries");
+      onStatus("Fix entry validation before publishing this pack.");
+      return;
+    }
     if (localPack.status === "published") await API.unpublishVocabularyPack(localPack.id);
     else await API.publishVocabularyPack(localPack.id);
     await refreshAll();
+    onStatus(localPack.status === "published" ? "Pack unpublished." : "Pack published.");
   };
 
   const rollbackVersion = async () => {
@@ -4590,13 +4634,20 @@ function VocabularyCenterScreen({
   };
 
   const importPack = async () => {
+    const parsed = parseVocabularyImportInput(importJson, { importAsDraft });
+    if (!parsed.ok) {
+      setImportErrors(parsed.errors);
+      onStatus(parsed.errors[0] || "Import JSON is invalid.");
+      return;
+    }
+    setImportErrors([]);
     try {
-      const payload = JSON.parse(importJson || "{}");
-      const data = await API.importVocabularyPack(payload);
+      const data = await API.importVocabularyPack(parsed.payload);
       setShowImportPanel(false);
       setImportJson("");
       await refreshAll();
       await loadPackDetail(data.id);
+      setInspectorTab("entries");
       onStatus("Pack imported.");
     } catch (err: any) {
       onStatus(err?.message || "Import JSON is invalid.");
@@ -4659,6 +4710,8 @@ function VocabularyCenterScreen({
     const created = await API.createVocabularyPack(payload);
     setCreateStep(1);
     setShowCreateWizard(false);
+    setInspectorTab("entries");
+    setWorkspaceMode("studio");
     window.history.replaceState({}, "", "/admin/vocabulary");
     await refreshAll();
     await loadPackDetail(created.id);
@@ -4720,7 +4773,6 @@ function VocabularyCenterScreen({
 
   const renderTreePanel = (
     <aside className="vocab-tree-panel">
-      <TextInput placeholder="Filter tree..." value={treeSearch} onChange={(e) => setTreeSearch(e.currentTarget.value)} />
       <div className="vocab-tree">
         {Object.entries(filteredTree).map(([lang, levelsAny]) => {
           const collapsed = Boolean(collapsedLangs[lang]);
@@ -4743,7 +4795,10 @@ function VocabularyCenterScreen({
                       className={`vocab-tree-pack ${selectedId === p.id ? "active" : ""}`}
                       onClick={() => openPackPage(p.id)}
                     >
-                      <span>{p.name}</span>
+                      <span>
+                        <strong>{p.name}</strong>
+                        <Text size="xs" c="dimmed">{p.type} · {Number(p.entry_count || 0)} entries</Text>
+                      </span>
                       <Badge size="xs" color={p.status === "published" ? "green" : p.status === "archived" ? "gray" : "yellow"}>{p.status}</Badge>
                       <span className="vocab-tree-version">v{p.version}</span>
                     </button>
@@ -4765,7 +4820,6 @@ function VocabularyCenterScreen({
         <Select label="Type" value={filters.type} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, type: v || "" })); }} data={[{ value: "", label: "All" }, ...["words", "sentences", "fiction", "code"].map((v) => ({ value: v, label: v }))]} />
         <Select label="Status" value={filters.status} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, status: v || "" })); }} data={[{ value: "", label: "All" }, ...["draft", "published", "archived"].map((v) => ({ value: v, label: v }))]} />
         <Select label="Source" value={filters.source} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, source: v || "" })); }} data={[{ value: "", label: "All" }, ...["manual", "openai", "imported", "online_generated"].map((v) => ({ value: v, label: v }))]} />
-        <TextInput label="Search" value={filters.search} onChange={(e) => { setPage(1); setFilters((p) => ({ ...p, search: e.currentTarget.value })); }} />
       </div>
 
       {selectedCount > 0 && (
@@ -4830,7 +4884,7 @@ function VocabularyCenterScreen({
                 <td className="is-number">v{row.version}</td>
                 <td>{new Date(row.updated_at || "").toLocaleString()}</td>
                 <td>{row.source}</td>
-                <td>
+                <td className="col-actions">
                   <div className="vocab-row-actions">
                     <Button size="xs" variant="light" onClick={() => openPackPage(row.id)}>Inspect</Button>
                     <Button size="xs" variant="light" onClick={() => void publishToggle(row)}>{row.status === "published" ? "Unpublish" : "Publish"}</Button>
@@ -4875,6 +4929,16 @@ function VocabularyCenterScreen({
               <Badge>v{pack.version}</Badge>
             </Group>
             <Group gap={6}>
+              <Tooltip label={pack.status === "published" ? "Start a game directly from this pack." : "Publish pack first to play it."}>
+                <Button
+                  size="xs"
+                  variant="light"
+                  disabled={pack.status !== "published"}
+                  onClick={() => void onPlayPack(pack)}
+                >
+                  Play this pack
+                </Button>
+              </Tooltip>
               <Button size="xs" variant="default" onClick={() => setInspectorMaximized((v) => !v)}>{inspectorMaximized ? "Restore" : "Maximize"}</Button>
             </Group>
           </div>
@@ -4884,6 +4948,7 @@ function VocabularyCenterScreen({
             data={[
               { value: "details", label: "Details" },
               { value: "entries", label: "Entries" },
+              { value: "preview", label: "Preview" },
               { value: "history", label: "History" },
               { value: "diagnostics", label: "Diagnostics" }
             ]}
@@ -4898,9 +4963,25 @@ function VocabularyCenterScreen({
               </Group>
               <Group>
                 <Button onClick={() => void savePack()} disabled={!hasUnsavedInspectorChanges || saveBusy}>{saveBusy ? "Saving..." : "Save (Ctrl+Enter)"}</Button>
-                <Button variant="light" onClick={() => void publishToggle()}>{pack.status === "published" ? "Unpublish" : "Publish"}</Button>
+                <Button
+                  variant="light"
+                  onClick={() => void publishToggle()}
+                  disabled={pack.status !== "published" && !parsedLines.canPublish}
+                >
+                  {pack.status === "published" ? "Unpublish" : "Publish"}
+                </Button>
                 <Button variant="light" onClick={() => void runGenerate()} disabled={!generatorEnabled || generateBusy}>{generateBusy ? "Generating..." : "Regenerate"}</Button>
                 <Button variant="light" onClick={() => void exportPack()}>Export JSON</Button>
+                <Button
+                  variant="light"
+                  onClick={async () => {
+                    const shareUrl = `${window.location.origin}/admin/vocabulary?packId=${pack.id}`;
+                    await navigator.clipboard.writeText(shareUrl);
+                    onStatus("Pack link copied.");
+                  }}
+                >
+                  Share link
+                </Button>
                 <Button color="red" variant="light" onClick={async () => {
                   if (!window.confirm("Delete this pack?")) return;
                   await API.deleteVocabularyPack(pack.id);
@@ -4918,7 +4999,14 @@ function VocabularyCenterScreen({
             <Stack>
               <Group justify="space-between">
                 <Text size="sm">Entries editor (one line = one entry)</Text>
-                <Text size="sm" c="dimmed">{parsedLines.normalized.length} entries</Text>
+                <Text size="sm" c="dimmed">{parsedLines.cleanedLines.length} entries</Text>
+              </Group>
+              <Group gap={6}>
+                <Button size="xs" variant="default" onClick={() => setEntriesText(dedupeEntryLines(entriesText))}>Deduplicate</Button>
+                <Button size="xs" variant="default" onClick={() => setEntriesText(parsedLines.cleanedLines.join("\n"))}>Remove blanks</Button>
+                <Button size="xs" variant="default" onClick={() => setEntriesText(sortEntryLines(entriesText))}>Sort A→Z</Button>
+                <Button size="xs" variant="default" onClick={() => setEntriesText(normalizeEntryCase(entriesText, "lower"))}>lowercase</Button>
+                <Button size="xs" variant="default" onClick={() => setEntriesText(normalizeEntryCase(entriesText, "upper"))}>UPPERCASE</Button>
               </Group>
               <Textarea
                 value={entriesText}
@@ -4930,7 +5018,50 @@ function VocabularyCenterScreen({
               <Group>
                 <Badge color={parsedLines.emptyCount > 0 ? "yellow" : "gray"}>Empty lines: {parsedLines.emptyCount}</Badge>
                 <Badge color={parsedLines.duplicateCount > 0 ? "yellow" : "gray"}>Duplicates: {parsedLines.duplicateCount}</Badge>
+                <Badge color={parsedLines.invalidCount > 0 ? "red" : "gray"}>Invalid lines: {parsedLines.invalidCount}</Badge>
+                {entryType === "words" && (
+                  <Badge color="blue">
+                    Length S/M/L: {parsedLines.wordsLengthBuckets.short}/{parsedLines.wordsLengthBuckets.medium}/{parsedLines.wordsLengthBuckets.long}
+                  </Badge>
+                )}
               </Group>
+              {parsedLines.lines.some((line) => line.issues.includes("too_long") || line.issues.includes("invalid_chars")) && (
+                <Alert color="yellow" title="Validation issues">
+                  {parsedLines.lines
+                    .filter((line) => line.issues.includes("too_long") || line.issues.includes("invalid_chars"))
+                    .slice(0, 5)
+                    .map((line) => (
+                      <div key={line.index}>
+                        Line {line.index + 1}: {line.issues.join(", ")}
+                      </div>
+                    ))}
+                </Alert>
+              )}
+              <Text size="xs" c="dimmed">Publishing requires at least one entry and no invalid lines.</Text>
+            </Stack>
+          )}
+          {inspectorTab === "preview" && (
+            <Stack>
+              <Group justify="space-between">
+                <Text size="sm">Preview how this pack will appear in game tasks</Text>
+                <Button size="xs" variant="light" onClick={() => setPreviewSeed((prev) => prev + 1)}>Random sample</Button>
+              </Group>
+              {samplePreviewEntries.length === 0 ? (
+                <Alert color="gray" title="No entries yet">
+                  Add entries on the Entries tab to preview game tasks.
+                </Alert>
+              ) : (
+                <Card withBorder>
+                  <Stack gap={8}>
+                    {samplePreviewEntries.map((entry, idx) => (
+                      <div key={`${entry}-${idx}`} className="vocab-preview-item">
+                        <Badge color="blue" size="xs">Task {idx + 1}</Badge>
+                        <Text fw={700}>{entry}</Text>
+                      </div>
+                    ))}
+                  </Stack>
+                </Card>
+              )}
             </Stack>
           )}
           {inspectorTab === "history" && (
@@ -5008,12 +5139,34 @@ function VocabularyCenterScreen({
         </Group>
       </div>
 
-      {showCreateWizard && (
-        <Card className="vocab-create-wizard" withBorder>
-          <div className="vocab-wizard-head">
-            <Text fw={700}>Create New Pack</Text>
-            <Button variant="subtle" size="xs" onClick={closeNewWizard}>Close</Button>
-          </div>
+      <div className="vocab-toolbar-controls">
+        <TextInput
+          className="vocab-quick-search"
+          label="Filter packs"
+          placeholder="Filter packs..."
+          value={filters.search}
+          onChange={(e) => {
+            const value = e.currentTarget.value;
+            setTreeSearch(value);
+            setPage(1);
+            setFilters((prev) => ({ ...prev, search: value }));
+          }}
+        />
+        <Group>
+          <Button variant="default" onClick={() => setShowAdvancedFilters(true)}>Advanced filters</Button>
+          <SegmentedControl
+            value={workspaceMode}
+            onChange={(value) => setWorkspaceMode((value as "studio" | "table") || "studio")}
+            data={[
+              { value: "studio", label: "Studio" },
+              { value: "table", label: "Table" }
+            ]}
+          />
+        </Group>
+      </div>
+
+      <Modal opened={showCreateWizard} onClose={closeNewWizard} title="Create New Pack" size="xl" centered>
+        <div className="vocab-create-wizard">
           <Text size="sm" c="dimmed">Step {createStep} of 3</Text>
           {createStep === 1 && (
             <div className="vocab-form-grid">
@@ -5040,7 +5193,7 @@ function VocabularyCenterScreen({
               <div><strong>Count:</strong> {createDraft.count}</div>
             </Alert>
           )}
-          <Group>
+          <Group mt="sm">
             <Button variant="default" disabled={createStep <= 1} onClick={() => setCreateStep((s) => Math.max(1, s - 1))}>Back</Button>
             {createStep < 3 ? (
               <Button onClick={() => setCreateStep((s) => Math.min(3, s + 1))}>Next</Button>
@@ -5048,17 +5201,59 @@ function VocabularyCenterScreen({
               <Button onClick={() => void createPackWizard()}>Create Draft</Button>
             )}
           </Group>
-        </Card>
-      )}
+        </div>
+      </Modal>
 
-      {showImportPanel && (
-        <Card className="vocab-import-panel" withBorder>
-          <Textarea label="Import pack JSON" value={importJson} onChange={(e) => setImportJson(e.currentTarget.value)} minRows={6} />
-          <Group>
-            <Button variant="light" onClick={() => void importPack()}>Import JSON</Button>
+      <Modal opened={showImportPanel} onClose={() => setShowImportPanel(false)} title="Import Pack JSON" size="xl" centered>
+        <div className="vocab-import-panel">
+          <Textarea label="Import pack JSON" value={importJson} onChange={(e) => { setImportErrors([]); setImportJson(e.currentTarget.value); }} minRows={8} />
+          <Switch
+            mt="sm"
+            label="Import as Draft"
+            checked={importAsDraft}
+            onChange={(e) => setImportAsDraft(e.currentTarget.checked)}
+          />
+          {importPreview && !importPreview.ok && (
+            <Alert mt="sm" color="red" title="Import validation failed">
+              {importPreview.errors.map((error) => <div key={error}>{error}</div>)}
+            </Alert>
+          )}
+          {importPreview && importPreview.ok && (
+            <Alert mt="sm" color="green" title="Import preview">
+              <div><strong>Name:</strong> {importPreview.preview.name}</div>
+              <div><strong>Language:</strong> {importPreview.preview.language.toUpperCase()}</div>
+              <div><strong>Level:</strong> {importPreview.preview.level}</div>
+              <div><strong>Type:</strong> {importPreview.preview.type}</div>
+              <div><strong>Status:</strong> {importPreview.preview.status}</div>
+              <div><strong>Entries:</strong> {importPreview.preview.entryCount}</div>
+            </Alert>
+          )}
+          {importErrors.length > 0 && (
+            <Alert mt="sm" color="red" title="Import failed">
+              {importErrors.map((error) => <div key={error}>{error}</div>)}
+            </Alert>
+          )}
+          <Group mt="sm">
+            <Button variant="light" onClick={() => void importPack()} disabled={Boolean(importPreview && !importPreview.ok)}>Import JSON</Button>
           </Group>
-        </Card>
-      )}
+        </div>
+      </Modal>
+
+      <Drawer
+        opened={showAdvancedFilters}
+        onClose={() => setShowAdvancedFilters(false)}
+        title="Advanced filters"
+        position="right"
+        size="md"
+      >
+        <div className="vocab-filters">
+          <Select label="Language" value={filters.language} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, language: v || "" })); }} data={[{ value: "", label: "All" }, { value: "en", label: "EN" }, { value: "ru", label: "RU" }]} />
+          <Select label="Level" value={String(filters.level)} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, level: v || "" })); }} data={[{ value: "", label: "All" }, ...[1, 2, 3, 4, 5].map((n) => ({ value: String(n), label: String(n) }))]} />
+          <Select label="Type" value={filters.type} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, type: v || "" })); }} data={[{ value: "", label: "All" }, ...["words", "sentences", "fiction", "code"].map((v) => ({ value: v, label: v }))]} />
+          <Select label="Status" value={filters.status} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, status: v || "" })); }} data={[{ value: "", label: "All" }, ...["draft", "published", "archived"].map((v) => ({ value: v, label: v }))]} />
+          <Select label="Source" value={filters.source} onChange={(v) => { setPage(1); setFilters((p) => ({ ...p, source: v || "" })); }} data={[{ value: "", label: "All" }, ...["manual", "openai", "imported", "online_generated"].map((v) => ({ value: v, label: v }))]} />
+        </div>
+      </Drawer>
 
       {isMobile && (
         <SegmentedControl
@@ -5078,7 +5273,9 @@ function VocabularyCenterScreen({
         style={!isMobile ? {
           gridTemplateColumns: inspectorMaximized
             ? `minmax(220px, ${leftPanePercent}%) minmax(0, ${100 - leftPanePercent}%)`
-            : `minmax(220px, ${leftPanePercent}%) 10px minmax(0, ${100 - leftPanePercent - rightPanePercent}%) 10px minmax(320px, ${rightPanePercent}%)`
+            : workspaceMode === "table"
+              ? `minmax(220px, ${leftPanePercent}%) 10px minmax(0, ${100 - leftPanePercent - rightPanePercent}%) 10px minmax(320px, ${rightPanePercent}%)`
+              : `minmax(220px, ${leftPanePercent}%) 10px minmax(320px, ${100 - leftPanePercent}%)`
         } : undefined}
       >
         {(!isMobile || mobileTab === "tree") && renderTreePanel}
@@ -5091,8 +5288,8 @@ function VocabularyCenterScreen({
             tabIndex={0}
           />
         )}
-        {(!isMobile || mobileTab === "table") && renderTablePanel}
-        {!isMobile && !inspectorMaximized && (
+        {((isMobile && mobileTab === "table") || (!isMobile && !inspectorMaximized && workspaceMode === "table")) && renderTablePanel}
+        {!isMobile && !inspectorMaximized && workspaceMode === "table" && (
           <div
             className="vocab-resizer"
             onMouseDown={(e) => startResize("right", e.clientX)}
