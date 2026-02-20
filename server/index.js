@@ -202,7 +202,7 @@ async function resolveRequestActor(req, res, next) {
  */
 async function audit(req, action, targetType, targetId, metadata = null) {
   if (!repo?.insertAuditLog) return;
-  await repo.insertAuditLog({
+  const basePayload = {
     actorUserId: req.actor?.id || null,
     actorRole: req.actor?.role || Roles.GUEST,
     action,
@@ -212,7 +212,54 @@ async function audit(req, action, targetType, targetId, metadata = null) {
     requestId: req.requestId,
     ip: req.ip,
     createdAt: new Date().toISOString()
-  });
+  };
+  try {
+    await repo.insertAuditLog(basePayload);
+  } catch (err) {
+    const code = String(err?.code || "");
+    const message = String(err?.message || "");
+    const isFk = /FOREIGN KEY constraint failed|violates foreign key constraint/i.test(message)
+      || code === "SQLITE_CONSTRAINT_FOREIGNKEY"
+      || code === "23503";
+    if (isFk && basePayload.actorUserId != null) {
+      try {
+        await repo.insertAuditLog({
+          ...basePayload,
+          actorUserId: null,
+          metadata: {
+            ...(metadata && typeof metadata === "object" ? metadata : {}),
+            auditActorFallback: true
+          }
+        });
+        logger.warn("audit_log_actor_fallback", {
+          requestId: req.requestId,
+          action,
+          targetType,
+          targetId,
+          actorUserId: basePayload.actorUserId
+        });
+        return;
+      } catch (retryErr) {
+        logger.warn("audit_log_write_failed", {
+          requestId: req.requestId,
+          action,
+          targetType,
+          targetId,
+          code: String(retryErr?.code || ""),
+          message: String(retryErr?.message || retryErr)
+        });
+        return;
+      }
+    }
+    logger.warn("audit_log_write_failed", {
+      requestId: req.requestId,
+      action,
+      targetType,
+      targetId,
+      code,
+      message
+    });
+  }
 }
 
 function requireNotMaintenance(req, res, next) {
@@ -3779,7 +3826,15 @@ app.post("/api/admin/db/test", requirePermission(Permissions.ADMIN_DB_TEST), adm
   const postgres = req.body?.postgres || {};
   try {
     await testPostgresConfig(postgres);
-    await audit(req, "admin.db.test", "postgres", postgres.host || "connectionString", { ok: true });
+    try {
+      await audit(req, "admin.db.test", "postgres", postgres.host || "connectionString", { ok: true });
+    } catch (auditErr) {
+      logger.warn("admin_db_test_audit_failed", {
+        requestId: req.requestId,
+        code: String(auditErr?.code || ""),
+        message: String(auditErr?.message || auditErr)
+      });
+    }
     res.json({ ok: true, message: "Postgres connection successful" });
   } catch (err) {
     const diagnostics = buildDbErrorDiagnostics(err?.cause || err);
@@ -3787,7 +3842,15 @@ app.post("/api/admin/db/test", requirePermission(Permissions.ADMIN_DB_TEST), adm
       requestId: req.requestId,
       diagnostics
     });
-    await audit(req, "admin.db.test", "postgres", postgres.host || "connectionString", { ok: false, diagnostics });
+    try {
+      await audit(req, "admin.db.test", "postgres", postgres.host || "connectionString", { ok: false, diagnostics });
+    } catch (auditErr) {
+      logger.warn("admin_db_test_audit_failed", {
+        requestId: req.requestId,
+        code: String(auditErr?.code || ""),
+        message: String(auditErr?.message || auditErr)
+      });
+    }
     throw new AppError(diagnostics.message, {
       status: 400,
       code: String(diagnostics.code || "POSTGRES_TEST_FAILED"),
