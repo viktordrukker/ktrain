@@ -177,18 +177,56 @@ app.use(withAsync(enforceSetupMode));
  * @returns {Promise<void>}
  */
 async function resolveRequestActor(req, res, next) {
-  req.actor = await resolveActor({
-    req,
-    repo,
-    options: {
-      ownerEmail: OWNER_EMAIL,
-      authTrustProxy: AUTH_TRUST_PROXY,
-      trustedProxyIps: AUTH_TRUSTED_PROXY_IPS,
-      ownerGroups: AUTH_OWNER_GROUPS,
-      adminGroups: AUTH_ADMIN_GROUPS,
-      moderatorGroups: AUTH_MODERATOR_GROUPS
+  try {
+    req.actor = await resolveActor({
+      req,
+      repo,
+      options: {
+        ownerEmail: OWNER_EMAIL,
+        authTrustProxy: AUTH_TRUST_PROXY,
+        trustedProxyIps: AUTH_TRUSTED_PROXY_IPS,
+        ownerGroups: AUTH_OWNER_GROUPS,
+        adminGroups: AUTH_ADMIN_GROUPS,
+        moderatorGroups: AUTH_MODERATOR_GROUPS
+      }
+    });
+  } catch (err) {
+    const message = String(err?.message || "");
+    const isClosedAdapterError = /database connection is not open|pool .* has ended|cannot use a pool after calling end/i.test(message);
+    if (isClosedAdapterError) {
+      const recovered = await recoverActiveRepository({
+        reason: "resolve_request_actor",
+        requestId: req.requestId,
+        errorMessage: message
+      });
+      if (recovered) {
+        try {
+          req.actor = await resolveActor({
+            req,
+            repo,
+            options: {
+              ownerEmail: OWNER_EMAIL,
+              authTrustProxy: AUTH_TRUST_PROXY,
+              trustedProxyIps: AUTH_TRUSTED_PROXY_IPS,
+              ownerGroups: AUTH_OWNER_GROUPS,
+              adminGroups: AUTH_ADMIN_GROUPS,
+              moderatorGroups: AUTH_MODERATOR_GROUPS
+            }
+          });
+          return next();
+        } catch {
+          // Fall through to guest actor fallback.
+        }
+      }
     }
-  });
+    logger.warn("resolve_actor_fallback_guest", {
+      requestId: req.requestId,
+      path: req.path,
+      method: req.method,
+      message
+    });
+    req.actor = { isAuthenticated: false, authType: "none", role: Roles.GUEST, groups: [] };
+  }
   return next();
 }
 
@@ -288,6 +326,7 @@ async function activateRepository(nextAdapter, nextDriver, runtimePatch = null) 
   rebuildRuntimeServicesForRepo();
 
   try {
+    await nextAdapter.ping();
     if (runtimePatch) {
       writeRuntimeConfig({
         ...readRuntimeConfig(),
@@ -300,6 +339,14 @@ async function activateRepository(nextAdapter, nextDriver, runtimePatch = null) 
     activeDriver = prevDriver;
     configStore = prevConfigStore;
     smtpService = prevSmtpService;
+    if (nextAdapter && nextAdapter !== prevRepo) {
+      await nextAdapter.close().catch((closeErr) => {
+        logger.warn("db_failed_target_adapter_close_failed", {
+          driverAfterSwitch: nextDriver,
+          message: String(closeErr?.message || closeErr)
+        });
+      });
+    }
     throw err;
   }
 
@@ -311,6 +358,38 @@ async function activateRepository(nextAdapter, nextDriver, runtimePatch = null) 
         message: String(closeErr?.message || closeErr)
       });
     });
+  }
+}
+
+function isClosedAdapterError(err) {
+  const message = String(err?.message || "");
+  return /database connection is not open|pool .* has ended|cannot use a pool after calling end/i.test(message);
+}
+
+async function recoverActiveRepository({ reason, requestId = null, errorMessage = "" } = {}) {
+  const targetDriver = resolveDriver();
+  const meta = resolveDbConfigMeta();
+  try {
+    const recoveredAdapter = await createAdapterWithConfig(targetDriver, meta.config);
+    await activateRepository(recoveredAdapter, targetDriver, null);
+    logger.warn("repo_recovered_after_adapter_error", {
+      reason,
+      requestId,
+      targetDriver,
+      dbConfigSource: meta.source,
+      errorMessage
+    });
+    return true;
+  } catch (recoverErr) {
+    logger.error("repo_recovery_failed", {
+      reason,
+      requestId,
+      targetDriver,
+      dbConfigSource: meta.source,
+      sourceError: errorMessage,
+      recoveryError: String(recoverErr?.message || recoverErr)
+    });
+    return false;
   }
 }
 
@@ -342,14 +421,17 @@ async function refreshConfigStatus({ force = false } = {}) {
       openaiModel: OPENAI_MODEL
     });
   } catch (err) {
+    if (!isClosedAdapterError(err)) throw err;
     const message = String(err?.message || "");
-    const repoClosed = /database connection is not open|pool .* has ended|cannot use a pool after calling end/i.test(message);
-    if (!repoClosed) throw err;
     logger.warn("config_status_retry_after_repo_rebind", {
       activeDriver,
       message
     });
-    rebuildRuntimeServicesForRepo();
+    const recovered = await recoverActiveRepository({
+      reason: "refresh_config_status",
+      errorMessage: message
+    });
+    if (!recovered) throw err;
     snapshot = await computeConfigStatus({
       repo,
       configStore,
