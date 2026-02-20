@@ -51,6 +51,22 @@ function inferRoleFromGroups(groups, options) {
   return Roles.USER;
 }
 
+function resolveSessionUserId(session) {
+  // WHY: sqlite adapter preserves camelCase column names while pg normalizes to lowercase.
+  // Accept both to avoid accidentally using auth_session.id as actor user id.
+  const candidates = [
+    session?.userIdReal,
+    session?.useridreal,
+    session?.userId,
+    session?.userid
+  ];
+  for (const value of candidates) {
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+
 async function resolveActor({ req, repo, options }) {
   const authHeader = String(req.headers.authorization || "");
   const cookies = parseCookies(req);
@@ -62,8 +78,12 @@ async function resolveActor({ req, repo, options }) {
     const session = await repo.getAuthSessionByTokenHash(tokenHash);
     if (session) {
       await repo.touchAuthSession(tokenHash);
+      const sessionUserId = resolveSessionUserId(session);
+      if (!sessionUserId) {
+        return { isAuthenticated: false, authType: "none", role: Roles.GUEST, groups: [] };
+      }
       return {
-        id: session.userid || session.useridreal || session.id,
+        id: sessionUserId,
         isAuthenticated: true,
         authType: "session",
         externalSubject: session.externalsubject || session.externalSubject || session.email,
