@@ -262,6 +262,57 @@ async function audit(req, action, targetType, targetId, metadata = null) {
   }
 }
 
+function rebuildRuntimeServicesForRepo() {
+  const ttlMs = configStore?.ttlMs || Number(process.env.CONFIG_CACHE_TTL_MS || 5000);
+  configStore = new ConfigStore({
+    repo,
+    ttlMs
+  });
+  if (encryptionService) {
+    smtpService = new SmtpService({ configStore, repo, encryptionService });
+  }
+  // WHY: config status cache is tied to adapter/config snapshots and must be reset after a repo swap.
+  configStatusSnapshot = null;
+  configStatusExpiresAt = 0;
+}
+
+async function activateRepository(nextAdapter, nextDriver, runtimePatch = null) {
+  const prevRepo = repo;
+  const prevDriver = activeDriver;
+  const prevConfigStore = configStore;
+  const prevSmtpService = smtpService;
+
+  repo = nextAdapter;
+  activeDriver = nextDriver;
+  rebuildRuntimeServicesForRepo();
+
+  try {
+    if (runtimePatch) {
+      writeRuntimeConfig({
+        ...readRuntimeConfig(),
+        ...runtimePatch
+      });
+    }
+  } catch (err) {
+    // Roll back in-memory bindings if runtime config persistence fails.
+    repo = prevRepo;
+    activeDriver = prevDriver;
+    configStore = prevConfigStore;
+    smtpService = prevSmtpService;
+    throw err;
+  }
+
+  if (prevRepo && prevRepo !== nextAdapter) {
+    await prevRepo.close().catch((closeErr) => {
+      logger.warn("db_previous_adapter_close_failed", {
+        driverBeforeSwitch: prevRepo?.driver || "unknown",
+        driverAfterSwitch: nextDriver,
+        message: String(closeErr?.message || closeErr)
+      });
+    });
+  }
+}
+
 function requireNotMaintenance(req, res, next) {
   if (!maintenanceMode) return next();
   return res.status(503).json({ error: "Maintenance mode active. Try again shortly." });
@@ -277,16 +328,38 @@ async function refreshConfigStatus({ force = false } = {}) {
   if (!repo || !configStore || !smtpService) return null;
   const now = Date.now();
   if (!force && configStatusSnapshot && configStatusExpiresAt > now) return configStatusSnapshot;
-  const snapshot = await computeConfigStatus({
-    repo,
-    configStore,
-    smtpService,
-    activeDriver,
-    maintenanceMode,
-    migrationStatus: getMigrationStatus,
-    googleClientIdFromEnv: BOOTSTRAP_GOOGLE_CLIENT_ID,
-    openaiModel: OPENAI_MODEL
-  });
+  let snapshot;
+  try {
+    snapshot = await computeConfigStatus({
+      repo,
+      configStore,
+      smtpService,
+      activeDriver,
+      maintenanceMode,
+      migrationStatus: getMigrationStatus,
+      googleClientIdFromEnv: BOOTSTRAP_GOOGLE_CLIENT_ID,
+      openaiModel: OPENAI_MODEL
+    });
+  } catch (err) {
+    const message = String(err?.message || "");
+    const repoClosed = /database connection is not open|pool .* has ended|cannot use a pool after calling end/i.test(message);
+    if (!repoClosed) throw err;
+    logger.warn("config_status_retry_after_repo_rebind", {
+      activeDriver,
+      message
+    });
+    rebuildRuntimeServicesForRepo();
+    snapshot = await computeConfigStatus({
+      repo,
+      configStore,
+      smtpService,
+      activeDriver,
+      maintenanceMode,
+      migrationStatus: getMigrationStatus,
+      googleClientIdFromEnv: BOOTSTRAP_GOOGLE_CLIENT_ID,
+      openaiModel: OPENAI_MODEL
+    });
+  }
   configStatusSnapshot = snapshot;
   configStatusExpiresAt = now + 3000;
   setupModeActive = snapshot.overall === "SETUP_REQUIRED";
@@ -321,6 +394,7 @@ function isSetupPathAllowed(req) {
  */
 async function enforceSetupMode(req, res, next) {
   if (!repo || !configStore || !smtpService) return next();
+  if (isSetupPathAllowed(req)) return next();
   let status = null;
   try {
     status = await refreshConfigStatus();
@@ -336,7 +410,6 @@ async function enforceSetupMode(req, res, next) {
       }
     });
     req.configStatus = null;
-    if (isSetupPathAllowed(req)) return next();
     if (req.path.startsWith("/api/")) {
       return res.status(503).json({
         ok: false,
@@ -1761,13 +1834,7 @@ async function switchToTargetDb({ target, requestedBy, mode = "copy-then-switch"
       throw badRequest("Unsupported DB switch mode");
     }
 
-    await repo.close();
-    repo = targetAdapter;
-    targetAdapter = null;
-    activeDriver = target;
-
-    writeRuntimeConfig({
-      ...readRuntimeConfig(),
+    await activateRepository(targetAdapter, target, {
       activeDriver: target,
       lastSwitchAt: new Date().toISOString(),
       lastSwitchBy: requestedBy || "unknown",
@@ -1775,6 +1842,7 @@ async function switchToTargetDb({ target, requestedBy, mode = "copy-then-switch"
       lastDumpFile: dumpFile,
       lastSwitchMode: mode
     });
+    targetAdapter = null;
 
     if (DB_SWITCH_RESTART_CMD) {
       await execAsync(DB_SWITCH_RESTART_CMD);
@@ -1843,17 +1911,13 @@ async function rollbackDbSwitch(requestedBy) {
     targetAdapter = await createAdapter(rollbackTarget);
     await targetAdapter.restoreAll(dump);
 
-    await repo.close();
-    repo = targetAdapter;
-    targetAdapter = null;
-    activeDriver = rollbackTarget;
-
-    writeRuntimeConfig({
+    await activateRepository(targetAdapter, rollbackTarget, {
       ...runtime,
       activeDriver: rollbackTarget,
       rolledBackAt: new Date().toISOString(),
       rolledBackBy: requestedBy || "unknown"
     });
+    targetAdapter = null;
 
     if (DB_SWITCH_RESTART_CMD) {
       await execAsync(DB_SWITCH_RESTART_CMD);
@@ -2095,25 +2159,12 @@ async function applySetupDatabaseConfig({ driver, dbConfig, requestedBy }) {
     throw err;
   }
 
-  const prevRepo = repo;
-  repo = nextAdapter;
-  activeDriver = driver;
-  writeRuntimeConfig({
-    ...readRuntimeConfig(),
+  await activateRepository(nextAdapter, driver, {
     activeDriver: driver,
     dbConfig: sanitizeDbConfig(dbConfig),
     dbConfigUpdatedAt: new Date().toISOString(),
     dbConfigUpdatedBy: requestedBy || "setup"
   });
-  if (prevRepo && prevRepo !== nextAdapter) {
-    await prevRepo.close().catch((closeErr) => {
-      logger.warn("db_previous_adapter_close_failed", {
-        driverBeforeSwitch: prevRepo?.driver || "unknown",
-        driverAfterSwitch: driver,
-        message: String(closeErr?.message || closeErr)
-      });
-    });
-  }
   return migration;
 }
 
