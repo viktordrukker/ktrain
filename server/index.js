@@ -321,8 +321,32 @@ function isSetupPathAllowed(req) {
  */
 async function enforceSetupMode(req, res, next) {
   if (!repo || !configStore || !smtpService) return next();
-  const status = await refreshConfigStatus();
-  req.configStatus = status;
+  let status = null;
+  try {
+    status = await refreshConfigStatus();
+    req.configStatus = status;
+  } catch (err) {
+    logger.error("setup_mode_status_refresh_failed", {
+      requestId: req.requestId,
+      path: req.path,
+      method: req.method,
+      error: {
+        message: String(err?.message || err),
+        name: err?.name || "Error"
+      }
+    });
+    req.configStatus = null;
+    if (isSetupPathAllowed(req)) return next();
+    if (req.path.startsWith("/api/")) {
+      return res.status(503).json({
+        ok: false,
+        error: "SETUP_STATUS_UNAVAILABLE",
+        message: "Application setup status is temporarily unavailable.",
+        setupRequired: true
+      });
+    }
+    return res.redirect("/setup");
+  }
   if (status?.overall !== "SETUP_REQUIRED") return next();
   if (isSetupPathAllowed(req)) return next();
   if (req.path.startsWith("/api/")) {
@@ -2063,6 +2087,14 @@ async function ensurePostgresDatabase({ postgres, createIfMissing = false, creat
 
 async function applySetupDatabaseConfig({ driver, dbConfig, requestedBy }) {
   const nextAdapter = await createAdapterWithConfig(driver, dbConfig);
+  let migration = null;
+  try {
+    migration = await getMigrationStatus(nextAdapter, driver);
+  } catch (err) {
+    await nextAdapter.close().catch(() => null);
+    throw err;
+  }
+
   const prevRepo = repo;
   repo = nextAdapter;
   activeDriver = driver;
@@ -2074,9 +2106,14 @@ async function applySetupDatabaseConfig({ driver, dbConfig, requestedBy }) {
     dbConfigUpdatedBy: requestedBy || "setup"
   });
   if (prevRepo && prevRepo !== nextAdapter) {
-    await prevRepo.close().catch(() => null);
+    await prevRepo.close().catch((closeErr) => {
+      logger.warn("db_previous_adapter_close_failed", {
+        driverBeforeSwitch: prevRepo?.driver || "unknown",
+        driverAfterSwitch: driver,
+        message: String(closeErr?.message || closeErr)
+      });
+    });
   }
-  const migration = await getMigrationStatus(repo, activeDriver);
   return migration;
 }
 
