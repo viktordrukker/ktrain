@@ -492,6 +492,16 @@ input, select, textarea {
   background: rgba(255, 255, 255, 0.12);
 }
 
+.anti-smash-banner {
+  background: rgba(255, 208, 102, 0.16);
+  border: 1px solid rgba(255, 208, 102, 0.42);
+}
+
+.anti-smash-icon {
+  font-size: 1.15rem;
+  margin-right: 6px;
+}
+
 .zero-hint {
   background: rgba(255, 255, 255, 0.12);
 }
@@ -1317,6 +1327,31 @@ input, select, textarea {
 .screen.game.mistake .task.current {
   box-shadow: 0 0 18px rgba(244, 162, 97, 0.35);
   border: 3px solid rgba(244, 162, 97, 0.45);
+}
+
+.task.current.anti-smash-jiggle {
+  animation: antiSmashJiggle 540ms ease;
+}
+
+@keyframes antiSmashJiggle {
+  0% {
+    transform: translateX(0);
+  }
+  20% {
+    transform: translateX(-6px);
+  }
+  40% {
+    transform: translateX(6px);
+  }
+  60% {
+    transform: translateX(-4px);
+  }
+  80% {
+    transform: translateX(4px);
+  }
+  100% {
+    transform: translateX(0);
+  }
 }
 
 .preview-panel {

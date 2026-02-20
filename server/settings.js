@@ -43,6 +43,19 @@ const DEFAULT_SETTINGS = {
   rollingCart: "off",
   rollingIntensity: "minimal",
   spaceRequired: false,
+  toddlerMode: false,
+  antiSmash: {
+    enabled: true,
+    maxSimultaneousKeysAllowed: 1,
+    burstWindowMs: 120,
+    requireAllKeysUpBetweenAccepts: true,
+    escalation: true,
+    maxFreezeMs: 1200,
+    baseFreezeMs: 400,
+    resetAfterCleanPresses: 5,
+    penalizeScore: false,
+    breakStreak: false
+  },
   debugLayout: false,
   showBounds: false,
   apcaDeveloper: false,
@@ -93,6 +106,10 @@ function sanitizeSettings(input = {}) {
     correctEffects: {
       ...DEFAULT_SETTINGS.correctEffects,
       ...(input.correctEffects || {})
+    },
+    antiSmash: {
+      ...DEFAULT_SETTINGS.antiSmash,
+      ...(input.antiSmash || {})
     }
   };
 
@@ -142,6 +159,28 @@ function sanitizeSettings(input = {}) {
   next.rollingCart = ROLLING_CART.includes(next.rollingCart) ? next.rollingCart : DEFAULT_SETTINGS.rollingCart;
   next.rollingIntensity = ROLLING_INTENSITY.includes(next.rollingIntensity) ? next.rollingIntensity : DEFAULT_SETTINGS.rollingIntensity;
   next.spaceRequired = Boolean(next.spaceRequired);
+  next.toddlerMode = Boolean(next.toddlerMode);
+
+  next.antiSmash.enabled = Boolean(next.antiSmash.enabled);
+  next.antiSmash.maxSimultaneousKeysAllowed = clampNumber(
+    next.antiSmash.maxSimultaneousKeysAllowed,
+    1,
+    3,
+    DEFAULT_SETTINGS.antiSmash.maxSimultaneousKeysAllowed
+  );
+  next.antiSmash.burstWindowMs = clampNumber(next.antiSmash.burstWindowMs, 0, 500, DEFAULT_SETTINGS.antiSmash.burstWindowMs);
+  next.antiSmash.requireAllKeysUpBetweenAccepts = Boolean(next.antiSmash.requireAllKeysUpBetweenAccepts);
+  next.antiSmash.escalation = Boolean(next.antiSmash.escalation);
+  next.antiSmash.maxFreezeMs = clampNumber(next.antiSmash.maxFreezeMs, 200, 5000, DEFAULT_SETTINGS.antiSmash.maxFreezeMs);
+  next.antiSmash.baseFreezeMs = clampNumber(next.antiSmash.baseFreezeMs, 100, next.antiSmash.maxFreezeMs, DEFAULT_SETTINGS.antiSmash.baseFreezeMs);
+  next.antiSmash.resetAfterCleanPresses = clampNumber(
+    next.antiSmash.resetAfterCleanPresses,
+    1,
+    50,
+    DEFAULT_SETTINGS.antiSmash.resetAfterCleanPresses
+  );
+  next.antiSmash.penalizeScore = Boolean(next.antiSmash.penalizeScore);
+  next.antiSmash.breakStreak = Boolean(next.antiSmash.breakStreak);
 
   next.debugLayout = Boolean(next.debugLayout);
   next.showBounds = Boolean(next.showBounds);
