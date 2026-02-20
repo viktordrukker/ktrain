@@ -190,17 +190,18 @@ class PostgresAdapter {
     return rows[0] || null;
   }
 
-  async upsertGamePreferences({ userId, mode, level, contentType, language, updatedAt }) {
+  async upsertGamePreferences({ userId, mode, level, contentType, language, selectedPackId, updatedAt }) {
     await this.pool.query(
-      `INSERT INTO game_preferences (userId, mode, level, contentType, language, updatedAt)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO game_preferences (userId, mode, level, contentType, language, selectedPackId, updatedAt)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
        ON CONFLICT(userId) DO UPDATE SET
          mode = EXCLUDED.mode,
          level = EXCLUDED.level,
          contentType = EXCLUDED.contentType,
          language = EXCLUDED.language,
+         selectedPackId = EXCLUDED.selectedPackId,
          updatedAt = EXCLUDED.updatedAt`,
-      [userId, mode, level, contentType, language, updatedAt]
+      [userId, mode, level, contentType, language, selectedPackId || null, updatedAt]
     );
   }
 

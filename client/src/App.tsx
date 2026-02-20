@@ -25,6 +25,9 @@ import {
 } from "@mantine/core";
 import { applyVisibilityGuard, apcaEstimate } from "./contrast";
 import { TaskText, FitConfig, FitMetrics } from "./textFit";
+import { normalizePlayableSettings, toPreferencePayload, toTaskGenerationPayload } from "./gameConfig";
+import { applyGuestGamePreferences, loadGuestGamePreferences, persistGuestGamePreferences } from "./gamePreferencesStorage";
+import { getPreviewControlState } from "./previewControls";
 
 type Mode = "learning" | "contest";
 type ContestType = "time" | "tasks";
@@ -65,6 +68,17 @@ type VocabPack = {
   items: string[];
   active: number;
   createdAt: string;
+};
+
+type PlayableVocabPack = {
+  id: string;
+  name: string;
+  language: string;
+  level: number;
+  type: "words" | "sentences" | "fiction" | "code";
+  status: string;
+  entry_count: number;
+  updated_at?: string | null;
 };
 
 type DbAdminConfig = {
@@ -167,6 +181,7 @@ type GameSettings = {
   contentMode: ContentMode;
   language: string;
   playerName: string;
+  selectedPackId?: string | null;
 };
 
 type GameStats = {
@@ -183,6 +198,7 @@ type GamePreferences = {
   level: number;
   contentType: ContentMode;
   language: string;
+  selectedPackId?: string | null;
   updatedAt?: string;
 };
 
@@ -305,7 +321,8 @@ const defaultSettings: GameSettings = {
   taskTarget: 20,
   contentMode: "default",
   language: "en",
-  playerName: ""
+  playerName: "",
+  selectedPackId: null
 };
 
 const defaultGamePreferences: GamePreferences = {
@@ -313,7 +330,8 @@ const defaultGamePreferences: GamePreferences = {
   mode: "learning",
   level: 1,
   contentType: "default",
-  language: "en"
+  language: "en",
+  selectedPackId: null
 };
 
 const emptyPlayerStats: PlayerStats = {
@@ -559,19 +577,24 @@ const API = {
     count: number,
     contentMode: ContentMode,
     language = "en",
-    options: { sessionId?: string; telemetry?: { cpm?: number } } = {}
+    options: { sessionId?: string; telemetry?: { cpm?: number }; selectedPackId?: string | null } = {}
   ): Promise<{ tasks: Task[]; language: string; fallbackNotice?: string | null }> {
+    const payload = toTaskGenerationPayload(
+      {
+        ...defaultSettings,
+        level,
+        contentMode,
+        language,
+        selectedPackId: options.selectedPackId || null
+      },
+      count,
+      options.sessionId || "",
+      options.telemetry || {}
+    );
     const res = await fetch("/api/tasks/generate", {
       method: "POST",
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({
-        level,
-        count,
-        contentMode,
-        language,
-        sessionId: options.sessionId || null,
-        telemetry: options.telemetry || null
-      })
+      body: JSON.stringify(payload)
     });
     if (!res.ok) throw await parseApiError(res, "Failed to generate tasks");
     return res.json();
@@ -608,7 +631,7 @@ const API = {
     if (!res.ok) throw await parseApiError(res, "Failed to load game preferences");
     return res.json();
   },
-  async saveGamePreferences(payload: Pick<GamePreferences, "mode" | "level" | "contentType" | "language">) {
+  async saveGamePreferences(payload: Pick<GamePreferences, "mode" | "level" | "contentType" | "language" | "selectedPackId">) {
     const res = await fetch("/api/user/preferences", {
       method: "PUT",
       headers: withAuthHeaders({ "Content-Type": "application/json" }),
@@ -798,6 +821,17 @@ const API = {
     const res = await fetch(`/api/packs/languages?${params.toString()}`, { headers: withAuthHeaders() });
     if (!res.ok) throw await parseApiError(res, "Failed to load available languages");
     return res.json();
+  },
+  async getPlayableVocabPacks(level: number, language: string, type: "words" | "sentences") {
+    const params = new URLSearchParams({
+      level: String(level),
+      language: String(language || "").toLowerCase(),
+      type
+    });
+    const res = await fetch(`/api/vocabulary/packs?${params.toString()}`, { headers: withAuthHeaders() });
+    if (!res.ok) throw await parseApiError(res, "Failed to load vocabulary packs");
+    const data = await res.json();
+    return Array.isArray(data?.packs) ? data.packs as PlayableVocabPack[] : [];
   },
   async getLiveStats() {
     const res = await fetch("/api/live/stats", { headers: withAuthHeaders() });
@@ -1220,6 +1254,10 @@ function settingsKey(settings: GameSettings) {
   return `run_${settings.mode}_${settings.level}_${settings.contestType}_${settings.duration}_${settings.taskTarget}_${settings.contentMode}_${settings.language}`;
 }
 
+function getVocabTypeForLevel(level: number): "words" | "sentences" {
+  return Number(level || 1) >= 4 ? "sentences" : "words";
+}
+
 const TEXT_SCALE: Record<TextSize, number> = {
   small: 0.95,
   medium: 1.1,
@@ -1236,6 +1274,13 @@ const VISUAL_SET_FILES: Record<VisualSet, string> = {
 };
 
 const SOUND_OPTIONS: SoundName[] = ["chime", "pop", "bell", "sparkle"];
+const TEST_PLAYGROUND_SAMPLES = {
+  single: ["A", "K", "5"],
+  short: ["cat", "sun", "bee"],
+  long: ["monkey", "rabbit", "rocket"],
+  sentence_short: ["I LIKE CATS", "THE RED BALL", "A HAPPY DOG"],
+  sentence_long: ["WE ARE LEARNING TO TYPE TODAY", "THE HAPPY LITTLE CAT JUMPS"]
+} as const;
 
 const INTENSITY_CONFIG: Record<Intensity, { count: number; size: number; speed: number; volume: number }> = {
   very_low: { count: 6, size: 28, speed: 0.8, volume: 0.25 },
@@ -1399,6 +1444,7 @@ function App() {
   const [menuDrawerOpen, setMenuDrawerOpen] = useState(false);
   const [menuDraftSettings, setMenuDraftSettings] = useState<GameSettings>(defaultSettings);
   const [savedPreferences, setSavedPreferences] = useState<GamePreferences>(defaultGamePreferences);
+  const [guestPrefsHydrated, setGuestPrefsHydrated] = useState(false);
   const [playerStats, setPlayerStats] = useState<PlayerStats>(emptyPlayerStats);
   const [guestSessionStats, setGuestSessionStats] = useState<PlayerStats>(emptyPlayerStats);
   const [isMobileMainMenu, setIsMobileMainMenu] = useState(false);
@@ -1433,6 +1479,7 @@ function App() {
   const [adminPin, setAdminPin] = useState("");
   const [packs, setPacks] = useState<VocabPack[]>([]);
   const [statusMessage, setStatusMessage] = useState("");
+  const [menuStatus, setMenuStatus] = useState("");
   const [currentFit, setCurrentFit] = useState<FitMetrics | null>(null);
   const [compactUI, setCompactUI] = useState(false);
   const [langMismatchCount, setLangMismatchCount] = useState(0);
@@ -1486,6 +1533,7 @@ function App() {
   const [passwordResetPassword, setPasswordResetPassword] = useState("");
   const [sessionUser, setSessionUser] = useState<any>(null);
   const [availableLanguages, setAvailableLanguages] = useState<string[]>(["en", "ru"]);
+  const [playableVocabPacks, setPlayableVocabPacks] = useState<PlayableVocabPack[]>([]);
   const [liveStats, setLiveStats] = useState<{ total: number; authorized: number; guests: number; modes?: Array<{ mode: string; count: number }> }>({
     total: 0,
     authorized: 0,
@@ -1571,7 +1619,8 @@ function App() {
     || settings.level !== menuDraftSettings.level
     || settings.contentMode !== menuDraftSettings.contentMode
     || settings.language !== menuDraftSettings.language
-  ), [settings.mode, settings.level, settings.contentMode, settings.language, menuDraftSettings]);
+    || (settings.selectedPackId || null) !== (menuDraftSettings.selectedPackId || null)
+  ), [settings.mode, settings.level, settings.contentMode, settings.language, settings.selectedPackId, menuDraftSettings]);
   const menuStatsDisplay = sessionUser ? playerStats : guestSessionStats;
   const menuAccuracy = menuStatsDisplay.totalLettersTyped > 0
     ? Math.round((menuStatsDisplay.totalCorrect / menuStatsDisplay.totalLettersTyped) * 100)
@@ -1593,6 +1642,11 @@ function App() {
       details: apiErr?.details
     };
     setClientErrors((prev) => [trace, ...prev].slice(0, 50));
+  }, []);
+  const devTraceGame = useCallback((event: string, payload: Record<string, any>) => {
+    if (!import.meta.env.DEV) return;
+    // eslint-disable-next-line no-console
+    console.debug(`[ktrain:game:${event}]`, payload);
   }, []);
   const themeVars = {
     "--bg": theme.background,
@@ -1720,24 +1774,44 @@ function App() {
 
   useEffect(() => {
     setMenuDraftSettings(settings);
-  }, [settings.mode, settings.level, settings.contentMode, settings.language]);
+  }, [settings.mode, settings.level, settings.contentMode, settings.language, settings.selectedPackId]);
 
   useEffect(() => {
     if (!sessionUser?.isAuthenticated) {
-      setSavedPreferences(defaultGamePreferences);
       setPlayerStats(emptyPlayerStats);
+      if (guestPrefsHydrated) return;
+      const loaded = loadGuestGamePreferences(window.localStorage);
+      const normalizedPayload = loaded.payload || {
+        mode: defaultGamePreferences.mode,
+        level: defaultGamePreferences.level,
+        contentType: defaultGamePreferences.contentType,
+        language: defaultGamePreferences.language,
+        selectedPackId: defaultGamePreferences.selectedPackId || null
+      };
+      setSavedPreferences((prev) => ({
+        ...prev,
+        userId: null,
+        ...normalizedPayload
+      }));
+      setSettings((prev) => ({
+        ...applyGuestGamePreferences(prev, normalizedPayload),
+        playerName: prev.playerName
+      }));
+      setGuestPrefsHydrated(true);
       return;
     }
+    setGuestPrefsHydrated(false);
     API.getGamePreferences()
       .then((data) => {
         const pref = data?.preferences || defaultGamePreferences;
         setSavedPreferences(pref);
-        setSettings((prev) => ({
+        setSettings((prev) => normalizePlayableSettings({
           ...prev,
-          mode: pref.mode === "contest" ? "contest" : "learning",
-          level: Math.max(1, Math.min(5, Number(pref.level || 1))),
+          mode: pref.mode,
+          level: Number(pref.level || 1),
           contentMode: pref.contentType === "vocab" ? "vocab" : "default",
-          language: String(pref.language || "en").toLowerCase()
+          language: String(pref.language || "en").toLowerCase(),
+          selectedPackId: pref.selectedPackId ? String(pref.selectedPackId) : null
         }));
       })
       .catch((err) => reportClientError("load_game_preferences", err));
@@ -1748,7 +1822,25 @@ function App() {
         else setPlayerStats({ ...emptyPlayerStats, userId: Number(sessionUser?.id || 0) || null });
       })
       .catch((err) => reportClientError("load_player_stats", err));
-  }, [sessionUser?.id, sessionUser?.isAuthenticated, reportClientError]);
+  }, [sessionUser?.id, sessionUser?.isAuthenticated, reportClientError, guestPrefsHydrated]);
+
+  useEffect(() => {
+    if (sessionUser?.isAuthenticated || !guestPrefsHydrated) return;
+    const payload = persistGuestGamePreferences(window.localStorage, settings);
+    setSavedPreferences((prev) => ({
+      ...prev,
+      userId: null,
+      ...payload
+    }));
+  }, [
+    sessionUser?.isAuthenticated,
+    guestPrefsHydrated,
+    settings.mode,
+    settings.level,
+    settings.contentMode,
+    settings.language,
+    settings.selectedPackId
+  ]);
 
   useEffect(() => {
     API.getPublicConfigStatus()
@@ -2123,21 +2215,6 @@ function App() {
     setScreen("home");
   };
 
-  const normalizePlayableSettings = useCallback((value: GameSettings): GameSettings => ({
-    ...value,
-    mode: value.mode === "contest" ? "contest" : "learning",
-    level: Math.max(1, Math.min(5, Number(value.level || 1))),
-    contentMode: value.contentMode === "vocab" ? "vocab" : "default",
-    language: String(value.language || "en").toLowerCase()
-  }), []);
-
-  const toPreferencePayload = useCallback((value: GameSettings) => ({
-    mode: value.mode === "contest" ? "contest" : "learning",
-    level: Math.max(1, Math.min(5, Number(value.level || 1))),
-    contentType: value.contentMode === "vocab" ? "vocab" : "default",
-    language: String(value.language || "en").toLowerCase()
-  }), []);
-
   const persistLastPlayedPreferences = useCallback(async (value: GameSettings) => {
     if (!sessionUser?.isAuthenticated) return;
     const payload = toPreferencePayload(value);
@@ -2148,7 +2225,7 @@ function App() {
     } catch (err) {
       reportClientError("persist_last_played_preferences", err);
     }
-  }, [sessionUser?.isAuthenticated, toPreferencePayload, reportClientError]);
+  }, [sessionUser?.isAuthenticated, reportClientError]);
 
   const applyMenuDraftToSettings = () => {
     const next = normalizePlayableSettings({
@@ -2156,18 +2233,22 @@ function App() {
       mode: menuDraftSettings.mode,
       level: menuDraftSettings.level,
       contentMode: menuDraftSettings.contentMode,
-      language: menuDraftSettings.language
+      language: menuDraftSettings.language,
+      selectedPackId: menuDraftSettings.selectedPackId || null
     });
     setSettings((prev) => ({
       ...prev,
       mode: next.mode,
       level: next.level,
       contentMode: next.contentMode,
-      language: next.language
+      language: next.language,
+      selectedPackId: next.selectedPackId || null
     }));
     if (sessionUser?.isAuthenticated) {
       void persistLastPlayedPreferences(next);
     }
+    setMenuStatus("Game settings applied.");
+    setStatusMessage("Game settings applied.");
   };
 
   const resetMenuDraftToDefaults = () => {
@@ -2176,13 +2257,15 @@ function App() {
       mode: "learning",
       level: 1,
       contentMode: "default",
-      language: "en"
+      language: "en",
+      selectedPackId: null
     }));
+    setMenuStatus("Draft reset to defaults. Click Apply Changes to use them.");
   };
 
   const saveMenuDefaults = async () => {
     if (!sessionUser?.isAuthenticated) {
-      setStatusMessage("Sign in to save defaults.");
+      setMenuStatus("Sign in to save defaults.");
       return;
     }
     try {
@@ -2190,13 +2273,14 @@ function App() {
         mode: menuDraftSettings.mode,
         level: menuDraftSettings.level,
         contentType: menuDraftSettings.contentMode,
-        language: menuDraftSettings.language
+        language: menuDraftSettings.language,
+        selectedPackId: menuDraftSettings.selectedPackId || null
       };
       const data = await API.saveGamePreferences(payload);
       setSavedPreferences(data.preferences || { ...defaultGamePreferences, ...payload });
-      setStatusMessage("Defaults saved.");
+      setMenuStatus("Defaults saved.");
     } catch (err) {
-      setStatusMessage("Could not save defaults.");
+      setMenuStatus("Could not save defaults.");
       reportClientError("save_game_preferences", err);
     }
   };
@@ -2212,14 +2296,18 @@ function App() {
         language: menuDraftSettings.language
       });
     } else {
-      nextSettings = {
+      nextSettings = normalizePlayableSettings({
         ...settings,
-        mode: "learning",
-        level: 1,
-        contentMode: "default",
-        language: "en",
-        playerName: String(settings.playerName || "").trim() || "Guest"
-      };
+        mode: menuDraftSettings.mode,
+        level: menuDraftSettings.level,
+        contentMode: menuDraftSettings.contentMode,
+        language: menuDraftSettings.language,
+        selectedPackId: menuDraftSettings.selectedPackId || null,
+        playerName: String(settings.playerName || "").trim() || "Guest",
+        contestType: settings.contestType,
+        duration: settings.duration,
+        taskTarget: settings.taskTarget
+      });
     }
     setSettings(nextSettings);
     if (sessionUser?.isAuthenticated) {
@@ -2235,9 +2323,25 @@ function App() {
     if (!sessionUser && !String(runSettings.playerName || "").trim()) {
       setSettings((prev) => ({ ...prev, playerName: "Guest" }));
     }
+    const requestPayload = toTaskGenerationPayload(runSettings, 40, sessionId, { cpm: 0 });
+    devTraceGame("generate:start", {
+      ...requestPayload,
+      mode: runSettings.mode,
+      contestType: runSettings.contestType
+    });
     const generated = await API.generateTasks(runSettings.level, 40, runSettings.contentMode, runSettings.language, {
       sessionId,
-      telemetry: { cpm: 0 }
+      telemetry: { cpm: 0 },
+      selectedPackId: runSettings.selectedPackId || null
+    });
+    devTraceGame("generate:done", {
+      requestedLevel: runSettings.level,
+      contentMode: runSettings.contentMode,
+      languageRequested: runSettings.language,
+      languageResolved: generated.language,
+      tasks: generated.tasks.length,
+      firstPrompts: generated.tasks.slice(0, 3).map((task) => task.prompt),
+      fallbackNotice: generated.fallbackNotice || null
     });
     if (generated.language !== runSettings.language) {
       setSettings((prev) => ({ ...prev, language: generated.language || prev.language }));
@@ -2317,9 +2421,17 @@ function App() {
   };
 
   const loadMoreTasks = async () => {
+    const requestPayload = toTaskGenerationPayload(settings, 40, resolveActivePlaySessionId(), { cpm });
+    devTraceGame("generate:more:start", requestPayload);
     const generated = await API.generateTasks(settings.level, 40, settings.contentMode, settings.language, {
       sessionId: resolveActivePlaySessionId(),
-      telemetry: { cpm }
+      telemetry: { cpm },
+      selectedPackId: settings.selectedPackId || null
+    });
+    devTraceGame("generate:more:done", {
+      tasks: generated.tasks.length,
+      firstPrompts: generated.tasks.slice(0, 3).map((task) => task.prompt),
+      fallbackNotice: generated.fallbackNotice || null
     });
     if (generated.fallbackNotice) {
       setStatusMessage(generated.fallbackNotice);
@@ -2700,14 +2812,41 @@ function App() {
     }
     API.getAvailableLanguages(settings.level, settings.contentMode)
       .then((data) => {
-        const langs = Array.isArray(data.languages) && data.languages.length > 0 ? data.languages : ["en", "ru"];
+        const fallback = settings.contentMode === "vocab"
+          ? [String(settings.language || "en").toLowerCase()]
+          : ["en", "ru"];
+        const langs = Array.isArray(data.languages) && data.languages.length > 0 ? data.languages : fallback;
         setAvailableLanguages(langs);
         if (!langs.includes(settings.language)) {
           setSettings((prev) => ({ ...prev, language: langs[0] }));
         }
       })
-      .catch(() => setAvailableLanguages(["en", "ru"]));
-  }, [settings.level, settings.contentMode, isSetupRoute, isSetupRequired]);
+      .catch(() => setAvailableLanguages(settings.contentMode === "vocab"
+        ? [String(settings.language || "en").toLowerCase()]
+        : ["en", "ru"]));
+  }, [settings.level, settings.contentMode, settings.language, isSetupRoute, isSetupRequired]);
+
+  useEffect(() => {
+    if (isSetupRoute || isSetupRequired || menuDraftSettings.contentMode !== "vocab") {
+      setPlayableVocabPacks([]);
+      return;
+    }
+    API.getPlayableVocabPacks(menuDraftSettings.level, menuDraftSettings.language, getVocabTypeForLevel(menuDraftSettings.level))
+      .then((rows) => {
+        setPlayableVocabPacks(rows);
+        if (menuDraftSettings.selectedPackId && !rows.some((pack) => pack.id === menuDraftSettings.selectedPackId)) {
+          setMenuDraftSettings((prev) => ({ ...prev, selectedPackId: null }));
+        }
+      })
+      .catch(() => setPlayableVocabPacks([]));
+  }, [
+    isSetupRoute,
+    isSetupRequired,
+    menuDraftSettings.contentMode,
+    menuDraftSettings.level,
+    menuDraftSettings.language,
+    menuDraftSettings.selectedPackId
+  ]);
 
   useEffect(() => {
     if (isSetupRoute || isSetupRequired) return;
@@ -3277,9 +3416,14 @@ function App() {
             <Button size="xl" className="start-now-btn" onClick={() => void startQuickGame()}>
               Start Now
             </Button>
-            <Button variant="light" size="md" onClick={() => { setMenuDraftSettings(settings); setMenuDrawerOpen(true); }}>
+            <Button variant="light" size="md" onClick={() => { setMenuStatus(""); setMenuDraftSettings(settings); setMenuDrawerOpen(true); }}>
               Customize Game
             </Button>
+            {statusMessage && (
+              <Alert color={/failed|could not|error/i.test(statusMessage) ? "red" : "blue"} variant="light" maw={620}>
+                {statusMessage}
+              </Alert>
+            )}
             <div className="menu-stats-row" role="group" aria-label="Session progress stats">
               <Card withBorder className="menu-stat-card">
                 <Text size="xs" c="dimmed">Total letters</Text>
@@ -3343,13 +3487,33 @@ function App() {
                 <Text fw={600}>Content</Text>
                 <SegmentedControl
                   value={menuDraftSettings.contentMode}
-                  onChange={(value) => setMenuDraftSettings((prev) => ({ ...prev, contentMode: value as ContentMode }))}
+                  onChange={(value) => setMenuDraftSettings((prev) => ({
+                    ...prev,
+                    contentMode: value as ContentMode,
+                    selectedPackId: value === "vocab" ? prev.selectedPackId || null : null
+                  }))}
                   data={[
                     { value: "default", label: "Default" },
                     { value: "vocab", label: "Vocab Pack" }
                   ]}
                 />
               </Stack>
+              {menuDraftSettings.contentMode === "vocab" && (
+                <Stack gap="xs">
+                  <Text fw={600}>Pack</Text>
+                  <Select
+                    value={menuDraftSettings.selectedPackId || ""}
+                    onChange={(value) => setMenuDraftSettings((prev) => ({ ...prev, selectedPackId: value || null }))}
+                    data={[
+                      { value: "", label: "Auto (any published)" },
+                      ...playableVocabPacks.map((pack) => ({
+                        value: pack.id,
+                        label: `${pack.name} · ${pack.language.toUpperCase()} · L${pack.level} · ${pack.entry_count} entries`
+                      }))
+                    ]}
+                  />
+                </Stack>
+              )}
               <Stack gap="xs">
                 <Text fw={600}>Language</Text>
                 <Select
@@ -3362,6 +3526,11 @@ function App() {
                 <Button variant="subtle" onClick={resetMenuDraftToDefaults}>Reset to default</Button>
                 <Button variant="light" onClick={() => void saveMenuDefaults()}>Save as my default</Button>
               </Group>
+              {menuStatus && (
+                <Alert color="blue" variant="light">
+                  {menuStatus}
+                </Alert>
+              )}
               <Group justify="space-between">
                 <Button variant="default" onClick={() => {
                   if (hasUnsavedMenuChanges) {
@@ -5222,6 +5391,28 @@ function SettingsScreen({
     }
   };
 
+  const acknowledgeAllCrashes = async () => {
+    if (!adminPin) return;
+    const unresolved = crashEvents.filter((row) => !Number(row.resolved));
+    if (unresolved.length === 0) {
+      setCrashMessage("No unresolved crash events.");
+      return;
+    }
+    setCrashBusy(true);
+    setCrashMessage("");
+    try {
+      for (const row of unresolved) {
+        await API.acknowledgeCrashEvent(Number(row.id));
+      }
+      await refreshCrashes();
+      setCrashMessage(`Acknowledged ${unresolved.length} crash event(s).`);
+    } catch (err: any) {
+      setCrashMessage(err?.message || "Failed to acknowledge all crashes.");
+    } finally {
+      setCrashBusy(false);
+    }
+  };
+
   const refreshPinStatus = async () => {
     if (!adminPin) {
       setPinStatus(null);
@@ -5643,7 +5834,12 @@ function SettingsScreen({
             {isAdmin && configStatusMessage && <Alert color="yellow">{configStatusMessage}</Alert>}
             {isAdmin && crashUnresolvedCount > 0 && (
               <Alert color="red" title="Unresolved crash events">
-                {crashUnresolvedCount} crash event(s) require acknowledgment in Admin Diagnostics.
+                <Group justify="space-between" align="center">
+                  <Text size="sm">{crashUnresolvedCount} crash event(s) require acknowledgment in Admin Diagnostics.</Text>
+                  <Button size="xs" variant="light" color="orange" loading={crashBusy} onClick={() => void acknowledgeAllCrashes()}>
+                    Acknowledge all
+                  </Button>
+                </Group>
               </Alert>
             )}
           </div>
@@ -5877,12 +6073,14 @@ function SettingsScreen({
                 ]}
               />
             </SettingRow>
-            <SettingRow label="Developer: APCA estimate" helper="Informational only (WCAG 3 draft).">
-              <Switch
-                checked={appSettings.apcaDeveloper}
-                onChange={(e) => updateSettings({ apcaDeveloper: e.currentTarget.checked })}
-              />
-            </SettingRow>
+            {import.meta.env.DEV && (
+              <SettingRow label="Developer: APCA estimate" helper="Developer-only debug metric (WCAG 3 draft).">
+                <Switch
+                  checked={appSettings.apcaDeveloper}
+                  onChange={(e) => updateSettings({ apcaDeveloper: e.currentTarget.checked })}
+                />
+              </SettingRow>
+            )}
             {contrastReport?.adjusted && (
               <div className="setting-row full">
                 <Alert color="yellow" title="Adjusted for visibility">
@@ -5899,7 +6097,7 @@ function SettingsScreen({
                       {(contrastReport?.pairs || []).map((pair: any) => (
                         <div key={pair.name}>
                           {pair.name}: {pair.ratio.toFixed(2)} {pair.passAA ? "AA" : "AA fail"} / {pair.passAAA ? "AAA" : "AAA fail"}
-                          {appSettings.apcaDeveloper && (
+                          {import.meta.env.DEV && appSettings.apcaDeveloper && (
                             <span> | APCA≈{apcaEstimate(pair.fg, pair.bg)}</span>
                           )}
                         </div>
@@ -7131,7 +7329,7 @@ function UXDiagnosticsPage({
               <div>{pair.name}</div>
               <div className={pair.passAAA ? "pass" : pair.passAA ? "warn" : "fail"}>
                 {pair.ratio.toFixed(2)} {pair.passAAA ? "AAA" : pair.passAA ? "AA" : "Fail"}
-                {settings.apcaDeveloper && (
+                {import.meta.env.DEV && settings.apcaDeveloper && (
                   <span className="apca"> APCA≈{apcaEstimate(pair.fg, pair.bg)}</span>
                 )}
               </div>
@@ -7400,16 +7598,8 @@ function TestPlayground({
 
   const intensity = settings.lowStimulation ? "very_low" : settings.correctEffects.intensity;
   const sound = useSoundBank(settings.correctEffects.volume * INTENSITY_CONFIG[intensity].volume, !settings.soundEnabled);
-
-  const samples = {
-    single: ["A", "K", "5"],
-    short: ["cat", "sun", "bee"],
-    long: ["monkey", "rabbit", "rocket"],
-    sentence_short: ["I LIKE CATS", "THE RED BALL", "A HAPPY DOG"],
-    sentence_long: ["WE ARE LEARNING TO TYPE TODAY", "THE HAPPY LITTLE CAT JUMPS"]
-  };
-
-  const sentence = samples[mode][sampleIndex % samples[mode].length];
+  const previewControl = useMemo(() => getPreviewControlState(settings), [settings]);
+  const sentence = TEST_PLAYGROUND_SAMPLES[mode][sampleIndex % TEST_PLAYGROUND_SAMPLES[mode].length];
   const words = mode.startsWith("sentence") ? sentence.split(" ") : [];
   const prompt = mode.startsWith("sentence") ? words[wordIndex] || words[0] : sentence;
 
@@ -7618,10 +7808,16 @@ function TestPlayground({
   };
 
   const playSound = () => {
+    if (!previewControl.canPlaySound) return;
     const soundChoice = settings.correctEffects.randomizeSound
       ? SOUND_OPTIONS[Math.floor(Math.random() * SOUND_OPTIONS.length)]
       : settings.correctEffects.sound;
     sound.play(soundChoice);
+  };
+
+  const nextExample = () => {
+    const total = TEST_PLAYGROUND_SAMPLES[mode].length;
+    setSampleIndex((i) => (i + 1) % Math.max(1, total));
   };
 
   return (
@@ -7663,15 +7859,27 @@ function TestPlayground({
 
         <SettingRow label="Examples" helper="Cycle the sample content.">
           <Group>
-            <Button variant="light" onClick={() => setSampleIndex((i) => i + 1)}>Next example</Button>
+            <Button variant="light" onClick={nextExample}>Next example</Button>
+            <Text size="sm" c="dimmed">
+              {Math.min(sampleIndex % TEST_PLAYGROUND_SAMPLES[mode].length, TEST_PLAYGROUND_SAMPLES[mode].length - 1) + 1}
+              /{TEST_PLAYGROUND_SAMPLES[mode].length}
+            </Text>
           </Group>
         </SettingRow>
 
         <SettingRow label="Effects preview" helper="Test visual and audio feedback.">
           <Group>
             <Button onClick={triggerCorrect}>Trigger correct</Button>
-            <Button variant="light" onClick={triggerMistake}>Trigger mistake</Button>
-            <Button variant="light" onClick={playSound}>Play sound</Button>
+            <Tooltip label={previewControl.mistakeHint} withArrow>
+              <Button variant="light" onClick={triggerMistake}>Trigger mistake</Button>
+            </Tooltip>
+            <Tooltip label={previewControl.playSoundHint} withArrow>
+              <span>
+                <Button variant="light" onClick={playSound} disabled={!previewControl.canPlaySound}>
+                  Play sound
+                </Button>
+              </span>
+            </Tooltip>
           </Group>
         </SettingRow>
       </div>
