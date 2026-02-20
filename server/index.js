@@ -30,6 +30,7 @@ const {
   getMigrationStatus,
   rollbackLastMigration,
   buildDbErrorDiagnostics,
+  createAdapter,
   createAdapterWithConfig
 } = require("./db");
 const { loadSettings, saveSettings } = require("./settings");
