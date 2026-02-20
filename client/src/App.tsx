@@ -543,6 +543,16 @@ async function parseApiError(res: Response, fallback: string) {
   }
 }
 
+function formatApiErrorMessage(err: any, fallback: string) {
+  const details = err?.details?.details || err?.details?.result?.diagnostics || err?.details || null;
+  const hint = details?.hint ? ` ${details.hint}` : "";
+  const code = details?.code || err?.code || "";
+  const requestId = err?.requestId || err?.details?.requestId || "";
+  const prefix = code ? `[${code}] ` : "";
+  const suffix = requestId ? ` (request_id=${requestId})` : "";
+  return `${prefix}${err?.message || fallback}${hint}${suffix}`;
+}
+
 const API = {
   async generateTasks(
     level: number,
@@ -1825,17 +1835,28 @@ function App() {
       }
       const result = await API.setupConfigureDb(payload);
       setSetupDbDirty(false);
-      setSetupDbStatus(result);
+      const latestStatus = await API.getSetupDbStatus().catch(() => null);
+      if (latestStatus) setSetupDbStatus(latestStatus);
+      else setSetupDbStatus(result);
+      const effectiveDriver = String(latestStatus?.activeDriver || result?.activeDriver || setupDbDriver || "").toLowerCase() === "postgres"
+        ? "postgres"
+        : "sqlite";
       const provision = result?.postgresProvision;
       const created = provision?.created ? " Created database." : "";
       const dropped = provision?.dropped ? " Reinitialized database from scratch." : "";
-      setSetupMessage(`Database configured with ${result?.activeDriver || setupDbDriver}.${created}${dropped}`);
+      const diagnosticsHint = latestStatus?.diagnostics?.hint ? ` ${latestStatus.diagnostics.hint}` : "";
+      if (effectiveDriver !== setupDbDriver) {
+        setSetupMessage(`Requested ${setupDbDriver.toUpperCase()}, but active driver is ${effectiveDriver.toUpperCase()}.${diagnosticsHint}`);
+      } else {
+        setSetupMessage(`Database configured with ${effectiveDriver}.${created}${dropped}`);
+      }
       await refreshSetupStatus();
     } catch (err: any) {
-      const details = err?.details?.details || err?.details || {};
-      const hint = details?.hint ? ` ${details.hint}` : "";
+      const details = err?.details?.details || err?.details || null;
       const fallbackHint = details?.suggestSQLite ? " You can switch to SQLite setup mode." : "";
-      setSetupMessage(`${err?.message || "Database configuration failed."}${hint}${fallbackHint}`);
+      setSetupMessage(`${formatApiErrorMessage(err, "Database configuration failed.")}${fallbackHint}`);
+      const latestStatus = await API.getSetupDbStatus().catch(() => null);
+      if (latestStatus) setSetupDbStatus(latestStatus);
       reportClientError("setup_configure_database", err);
     } finally {
       setSetupDbBusy(false);
@@ -2962,6 +2983,11 @@ function App() {
                   </Button>
                 )}
               </Group>
+              {setupMessage && (
+                <Alert color={/\b(failed|invalid|error|forbidden)\b/i.test(setupMessage) ? "red" : "yellow"} title="Setup action">
+                  {setupMessage}
+                </Alert>
+              )}
               {setupDbStatus && (
                 <Alert color={setupDbStatus?.database === "READY" ? "green" : "yellow"} title="Database check">
                   Driver: {setupDbStatus?.activeDriver || "unknown"} | State: {setupDbStatus?.database || "unknown"}
@@ -5321,7 +5347,7 @@ function SettingsScreen({
       setDbMessage("Postgres connection successful.");
     } catch (err: any) {
       if (handleAdminAuthError(err, setDbMessage)) return;
-      setDbMessage(err?.message || "Postgres connection failed");
+      setDbMessage(formatApiErrorMessage(err, "Postgres connection failed"));
     } finally {
       setDbBusy(false);
     }
