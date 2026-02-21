@@ -27,6 +27,6 @@ describe("learningSetPlanner", () => {
     const plan = buildLearningSetPreviewPlan(config);
     expect(plan.countsByLevel[1]).toBeGreaterThan(0);
     expect(plan.sampleByLevel[1].length).toBe(3);
+    expect(plan.sampleByLevel[1].every((item) => item.length === 1)).toBe(true);
   });
 });
-

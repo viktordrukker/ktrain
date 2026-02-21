@@ -38,6 +38,18 @@ describe("learningSetGenerator", () => {
     expect(avg(l4.entries)).toBeGreaterThan(avg(l1.entries));
   });
 
+  it("generates level 1 as single-letter entries", () => {
+    const config = createDefaultLearningSetConfig();
+    config.name = "Level 1 Letters";
+    config.language = "en";
+    config.topic = "animals";
+    const generated = generateLearningSet(config);
+    const l1 = generated.packs.find((pack) => pack.level === 1);
+    expect(l1).toBeTruthy();
+    expect((l1?.entries || []).length).toBeGreaterThan(0);
+    expect((l1?.entries || []).every((entry) => entry.length === 1)).toBe(true);
+  });
+
   it("schema validator reports malformed payloads", () => {
     const errors = validateLearningSetSchema({ kind: "wrong", schemaVersion: "0" });
     expect(errors.length).toBeGreaterThan(0);

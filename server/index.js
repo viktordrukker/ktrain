@@ -764,10 +764,12 @@ function safeParseJsonArrayOfStrings(raw, maxCount = 500) {
 function buildVocabularyGenerationPrompts({ language, level, type, count, theme }) {
   const safeTheme = String(theme || "").trim();
   const typeRules = type === "words"
-    ? "Return single vocabulary words only. No spaces, no numbering, no markdown."
+    ? Number(level) <= 1
+      ? "Return single-character items only (one letter or digit per item). No spaces, no numbering, no markdown."
+      : "Return single vocabulary words only. No spaces, no numbering, no markdown."
     : "Return complete short sentences or chunks. Spaces are allowed, but punctuation and special symbols are not allowed.";
   const levelRules = {
-    1: "Very short and basic items only.",
+    1: "Only single characters for beginner warm-up (letters or digits).",
     2: "Beginner level. Keep words/sentences simple and easy to type.",
     3: "Intermediate beginner level with slightly longer vocabulary.",
     4: "Intermediate level with richer sentence structure and varied vocabulary.",
@@ -802,7 +804,7 @@ function validateGeneratedVocabularyItems(items, { type, level, language = "en" 
   const errors = [];
   const validated = [];
   const numericLevel = clampNumber(level, 1, 5, 1);
-  const wordMaxByLevel = { 1: 2, 2: 4, 3: 7, 4: 10, 5: 14 };
+  const wordMaxByLevel = { 1: 1, 2: 4, 3: 7, 4: 10, 5: 14 };
   const sentenceMaxByLevel = { 1: 24, 2: 36, 3: 52, 4: 72, 5: 96 };
   const wordMaxLen = wordMaxByLevel[numericLevel] || 7;
   const sentenceMaxLen = sentenceMaxByLevel[numericLevel] || 52;
@@ -818,6 +820,7 @@ function validateGeneratedVocabularyItems(items, { type, level, language = "en" 
     if (type === "words") {
       const normalizedWord = sanitizeGameplayWordText(text, lang);
       if (!normalizedWord) continue;
+      if (numericLevel <= 1 && normalizedWord.length !== 1) continue;
       if (normalizedWord.length > wordMaxLen) continue;
       if (normalizedWord.includes(" ")) continue;
       if (lang === "ru" && !ruWordPattern.test(normalizedWord)) continue;

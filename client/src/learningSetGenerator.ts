@@ -120,7 +120,7 @@ function levelRange(level: number, type: LearningSetLevelType): { min: number; m
     if (level === 4) return { min: 14, max: 64 };
     return { min: 16, max: 88 };
   }
-  if (level <= 1) return { min: 3, max: 4 };
+  if (level <= 1) return { min: 1, max: 1 };
   if (level === 2) return { min: 4, max: 5 };
   if (level === 3) return { min: 5, max: 7 };
   if (level === 4) return { min: 7, max: 10 };
@@ -206,6 +206,39 @@ function pickWordPool(language: string, topic: LearningSetTopic): string[] {
   return (bank[topic] || bank.custom || BASE_WORDS.en.custom).slice();
 }
 
+function uniqueChars(input: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const rawCh of [...String(input || "")]) {
+    const ch = rawCh.trim();
+    if (!ch) continue;
+    if (!/[\p{L}\p{N}]/u.test(ch)) continue;
+    const key = ch.toLocaleLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(ch.toLocaleLowerCase());
+  }
+  return out;
+}
+
+function pickLevelOneLetterPool(config: LearningSetWizardConfig, basePool: string[]): string[] {
+  const fromAllowed = uniqueChars(config.allowedChars || "");
+  if (fromAllowed.length > 0) return fromAllowed;
+
+  if (config.script === "custom") {
+    const custom = uniqueChars(config.customAlphabet || "");
+    if (custom.length > 0) return custom;
+  }
+
+  const fromWords = uniqueChars(basePool.join(""));
+  if (fromWords.length > 0) return fromWords;
+
+  if (config.script === "cyrillic") {
+    return uniqueChars("абвгдежзийклмнопрстуфхцчшщьыъэюя");
+  }
+  return uniqueChars("abcdefghijklmnopqrstuvwxyz");
+}
+
 export function generateLearningSet(config: LearningSetWizardConfig): GeneratedLearningSet {
   const levels = normalizeLearningSetLevels(config.levels);
   const seed = String(config.seed || `${config.language}-${config.topic}-${levels.join("-")}`);
@@ -228,6 +261,9 @@ export function generateLearningSet(config: LearningSetWizardConfig): GeneratedL
 
     const entries: string[] = [];
     const dedupe = new Set<string>();
+    const levelOnePool = level === 1 && type === "words"
+      ? pickLevelOneLetterPool(config, basePool)
+      : [];
     let safety = 0;
     while (entries.length < targetCount && safety < targetCount * 40) {
       safety += 1;
@@ -235,6 +271,13 @@ export function generateLearningSet(config: LearningSetWizardConfig): GeneratedL
       const sourceB = basePool[Math.floor(rng() * basePool.length)] || "typing";
       const sourceC = basePool[Math.floor(rng() * basePool.length)] || "daily";
       let candidate = sourceA;
+      if (level === 1 && type === "words") {
+        if (levelOnePool.length > 0) {
+          candidate = levelOnePool[Math.floor(rng() * levelOnePool.length)] || "a";
+        } else {
+          candidate = "a";
+        }
+      }
       if (type === "sentences") candidate = sentenceFromWords(sourceA, sourceB, sourceC);
       const sanitized = sanitizeEntry(candidate, {
         script: config.script,
@@ -247,11 +290,12 @@ export function generateLearningSet(config: LearningSetWizardConfig): GeneratedL
       }, levelReport);
       if (!sanitized) continue;
       const key = sanitized.toLocaleLowerCase();
-      if (dedupe.has(key)) {
+      const enforceUnique = !(level === 1 && type === "words");
+      if (enforceUnique && dedupe.has(key)) {
         levelReport.removedDuplicate += 1;
         continue;
       }
-      dedupe.add(key);
+      if (enforceUnique) dedupe.add(key);
       entries.push(sanitized);
     }
 

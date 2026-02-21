@@ -70,7 +70,7 @@ export function createDefaultLearningSetConfig(): LearningSetWizardConfig {
     disallowedChars: "",
     includeDiacritics: false,
     maxWordLengthByLevel: {
-      1: 4,
+      1: 1,
       2: 5,
       3: 7,
       4: 10,
@@ -123,6 +123,10 @@ export function buildLearningSetPreviewPlan(config: LearningSetWizardConfig): Le
   levels.forEach((level) => {
     const count = DEFAULT_COUNTS[level] || 20;
     countsByLevel[level] = count;
+    if (level === 1 && (config.levelTypeOverrides[level] || "words") === "words") {
+      sampleByLevel[level] = ["a", "s", "d"];
+      return;
+    }
     sampleByLevel[level] = samples.slice(0, 3).map((item, idx) => {
       if ((config.levelTypeOverrides[level] || "words") === "sentences") {
         return `${item[0]?.toUpperCase() || "A"}${item.slice(1)} is sample ${idx + 1}.`;
@@ -132,4 +136,3 @@ export function buildLearningSetPreviewPlan(config: LearningSetWizardConfig): Le
   });
   return { countsByLevel, sampleByLevel };
 }
-
