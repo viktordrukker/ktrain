@@ -44,6 +44,26 @@ import {
   parseVocabularyImportInput,
   sortEntryLines
 } from "./vocabularyStudio";
+import {
+  canUseSplitMode,
+  computeVocabularyGridTemplate,
+  resolveWorkspaceMode,
+  type VocabWorkspaceMode
+} from "./vocabLayout";
+import {
+  buildLearningSetPreviewPlan,
+  createDefaultLearningSetConfig,
+  normalizeLearningSetLevels,
+  validateLearningSetConfig,
+  type LearningSetLevelType,
+  type LearningSetWizardConfig
+} from "./learningSetPlanner";
+import {
+  buildLearningSetPackPayloads,
+  generateLearningSet,
+  parseLearningSetImportInput,
+  type GeneratedLearningSet
+} from "./learningSetGenerator";
 
 type Mode = "learning" | "contest";
 type ContestType = "time" | "tasks";
@@ -4326,9 +4346,10 @@ function VocabularyCenterScreen({
   }, []);
   const [leftPanePercent, setLeftPanePercent] = useState(initialPaneState.left);
   const [rightPanePercent, setRightPanePercent] = useState(initialPaneState.right);
+  const [viewportWidth, setViewportWidth] = useState(window.innerWidth);
   const [isMobile, setIsMobile] = useState(window.innerWidth <= 1024);
   const [mobileTab, setMobileTab] = useState<"tree" | "table" | "inspector">("table");
-  const [workspaceMode, setWorkspaceMode] = useState<"studio" | "table">("studio");
+  const [workspaceMode, setWorkspaceMode] = useState<VocabWorkspaceMode>("studio");
   const [tree, setTree] = useState<any>({});
   const [treeSearch, setTreeSearch] = useState(query.get("search") || "");
   const [collapsedLangs, setCollapsedLangs] = useState<Record<string, boolean>>({});
@@ -4359,6 +4380,13 @@ function VocabularyCenterScreen({
   const [generatorEnabled, setGeneratorEnabled] = useState(false);
   const [createStep, setCreateStep] = useState(1);
   const [showCreateWizard, setShowCreateWizard] = useState(window.location.pathname === "/admin/vocabulary/new");
+  const [showLearningSetWizard, setShowLearningSetWizard] = useState(false);
+  const [learningSetStep, setLearningSetStep] = useState(1);
+  const [learningSetConfig, setLearningSetConfig] = useState<LearningSetWizardConfig>(() => createDefaultLearningSetConfig());
+  const [learningSetErrors, setLearningSetErrors] = useState<string[]>([]);
+  const [learningSetBusy, setLearningSetBusy] = useState(false);
+  const [lastGeneratedLearningSet, setLastGeneratedLearningSet] = useState<GeneratedLearningSet | null>(null);
+  const [lastGeneratedPrimaryPackId, setLastGeneratedPrimaryPackId] = useState<string | null>(null);
   const [showImportPanel, setShowImportPanel] = useState(false);
   const [showAdvancedFilters, setShowAdvancedFilters] = useState(false);
   const [inspectorTab, setInspectorTab] = useState<"details" | "entries" | "preview" | "history" | "diagnostics">("details");
@@ -4406,6 +4434,7 @@ function VocabularyCenterScreen({
 
   useEffect(() => {
     const onResize = () => {
+      setViewportWidth(window.innerWidth);
       setIsMobile(window.innerWidth <= 1024);
       if (window.innerWidth > 1024) setMobileTab("table");
     };
@@ -4419,6 +4448,18 @@ function VocabularyCenterScreen({
       window.removeEventListener("popstate", onPopState);
     };
   }, []);
+
+  const splitModeEnabled = useMemo(() => canUseSplitMode(viewportWidth, isMobile), [viewportWidth, isMobile]);
+  const effectiveWorkspaceMode = useMemo(
+    () => resolveWorkspaceMode(workspaceMode, viewportWidth, isMobile),
+    [workspaceMode, viewportWidth, isMobile]
+  );
+
+  useEffect(() => {
+    if (workspaceMode === "split" && !splitModeEnabled) {
+      setWorkspaceMode("studio");
+    }
+  }, [workspaceMode, splitModeEnabled]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setDebouncedSearch(filters.search), 250);
@@ -4526,10 +4567,26 @@ function VocabularyCenterScreen({
     }
     return out;
   }, [parsedLines.cleanedLines, entries, previewSeed]);
-  const importPreview = useMemo(() => {
+  const importLearningSetPreview = useMemo(() => {
+    const source = String(importJson || "").trim();
+    if (!source) return null;
+    try {
+      const root = JSON.parse(source || "{}");
+      const normalized = root?.payload && typeof root.payload === "object" ? root.payload : root;
+      if (normalized?.kind !== "ktrain.learningSet") return null;
+    } catch {
+      return null;
+    }
+    return parseLearningSetImportInput(source);
+  }, [importJson]);
+  const importPackPreview = useMemo(() => {
     if (!String(importJson || "").trim()) return null;
     return parseVocabularyImportInput(importJson, { importAsDraft });
   }, [importJson, importAsDraft]);
+  const learningSetPlan = useMemo(
+    () => buildLearningSetPreviewPlan(learningSetConfig),
+    [learningSetConfig]
+  );
   const hasUnsavedInspectorChanges = useMemo(() => {
     if (!pack || !originalSnapshotRef.current) return false;
     const prev = originalSnapshotRef.current;
@@ -4634,14 +4691,62 @@ function VocabularyCenterScreen({
   };
 
   const importPack = async () => {
-    const parsed = parseVocabularyImportInput(importJson, { importAsDraft });
-    if (!parsed.ok) {
-      setImportErrors(parsed.errors);
-      onStatus(parsed.errors[0] || "Import JSON is invalid.");
-      return;
-    }
-    setImportErrors([]);
     try {
+      const source = String(importJson || "").trim();
+      if (!source) {
+        setImportErrors(["Import JSON is empty."]);
+        return;
+      }
+      let learningSetParsed: ReturnType<typeof parseLearningSetImportInput> | null = null;
+      try {
+        const probe = JSON.parse(source || "{}");
+        const root = probe?.payload && typeof probe.payload === "object" ? probe.payload : probe;
+        if (root?.kind === "ktrain.learningSet") {
+          learningSetParsed = parseLearningSetImportInput(source);
+        }
+      } catch {
+        learningSetParsed = null;
+      }
+      if (learningSetParsed?.ok) {
+        const payloads = buildLearningSetPackPayloads(learningSetParsed.payload, {
+          importAsDraft,
+          learningSetId: learningSetParsed.payload.set.seed
+        });
+        if (!payloads.length) {
+          setImportErrors(["Learning set has no packs to import."]);
+          return;
+        }
+        const createdIds: string[] = [];
+        for (const payload of payloads) {
+          const created = await API.createVocabularyPack(payload);
+          createdIds.push(String(created.id));
+          if (!importAsDraft && payload.status === "published") {
+            await API.publishVocabularyPack(String(created.id));
+          }
+        }
+        setImportErrors([]);
+        setShowImportPanel(false);
+        setImportJson("");
+        await refreshAll();
+        if (createdIds[0]) {
+          await loadPackDetail(createdIds[0]);
+          setInspectorTab("entries");
+          setWorkspaceMode("studio");
+        }
+        onStatus(`Learning set imported (${createdIds.length} packs).`);
+        return;
+      }
+      const parsed = parseVocabularyImportInput(source, { importAsDraft });
+      if (!parsed.ok) {
+        const mergedErrors = learningSetParsed && !learningSetParsed.ok
+          ? [...parsed.errors, ...learningSetParsed.errors]
+          : [...parsed.errors];
+        const uniqueErrors = Array.from(new Set(mergedErrors));
+        setImportErrors(uniqueErrors);
+        onStatus(uniqueErrors[0] || "Import JSON is invalid.");
+        return;
+      }
+      setImportErrors([]);
       const data = await API.importVocabularyPack(parsed.payload);
       setShowImportPanel(false);
       setImportJson("");
@@ -4758,6 +4863,191 @@ function VocabularyCenterScreen({
     setShowCreateWizard(true);
     setCreateStep(1);
     window.history.pushState({}, "", "/admin/vocabulary/new");
+  };
+
+  const openLearningSetWizard = () => {
+    setLearningSetErrors([]);
+    setLearningSetStep(1);
+    setShowLearningSetWizard(true);
+  };
+
+  const toggleLearningSetLevel = (level: number, checked: boolean) => {
+    setLearningSetConfig((prev) => {
+      const current = normalizeLearningSetLevels(prev.levels);
+      const nextLevels = checked
+        ? normalizeLearningSetLevels([...current, level])
+        : current.filter((item) => item !== level);
+      return { ...prev, levels: nextLevels };
+    });
+  };
+
+  const setLearningSetLevelType = (level: number, type: LearningSetLevelType) => {
+    setLearningSetConfig((prev) => ({
+      ...prev,
+      levelTypeOverrides: {
+        ...prev.levelTypeOverrides,
+        [level]: type
+      }
+    }));
+  };
+
+  const goNextLearningSetStep = () => {
+    if (learningSetStep === 1) {
+      const errors = validateLearningSetConfig(learningSetConfig);
+      if (errors.length > 0) {
+        setLearningSetErrors(errors);
+        return;
+      }
+      setLearningSetErrors([]);
+    }
+    setLearningSetStep((prev) => Math.min(3, prev + 1));
+  };
+
+  const completeLearningSetWizard = async () => {
+    const validationErrors = validateLearningSetConfig(learningSetConfig);
+    if (validationErrors.length > 0) {
+      setLearningSetErrors(validationErrors);
+      setLearningSetStep(1);
+      return;
+    }
+    setLearningSetBusy(true);
+    try {
+      const generated = generateLearningSet(learningSetConfig);
+      const payloads = buildLearningSetPackPayloads(generated, {
+        importAsDraft: !learningSetConfig.autoPublish,
+        learningSetId: generated.set.seed
+      });
+      const createdIds: string[] = [];
+      for (const payload of payloads) {
+        const created = await API.createVocabularyPack(payload);
+        const createdId = String(created.id);
+        createdIds.push(createdId);
+        if (learningSetConfig.autoPublish) {
+          await API.publishVocabularyPack(createdId);
+        }
+      }
+      setLastGeneratedLearningSet(generated);
+      setLastGeneratedPrimaryPackId(createdIds[0] || null);
+      await refreshAll();
+      const firstLevelId = createdIds[0] || null;
+      if (firstLevelId) {
+        setSelectedId(firstLevelId);
+        await loadPackDetail(firstLevelId);
+        setInspectorTab("entries");
+        setWorkspaceMode("studio");
+      }
+      setShowLearningSetWizard(false);
+      onStatus(`Generated ${createdIds.length} packs for ${generated.set.name}.`);
+    } catch (err: any) {
+      setLearningSetErrors([String(err?.message || "Failed to generate learning set.")]);
+      setLearningSetStep(3);
+      onStatus(String(err?.message || "Failed to generate learning set."));
+    } finally {
+      setLearningSetBusy(false);
+    }
+  };
+
+  const copyGeneratedLearningSet = async () => {
+    if (!lastGeneratedLearningSet) {
+      onStatus("Generate a learning set first.");
+      return;
+    }
+    await navigator.clipboard.writeText(JSON.stringify(lastGeneratedLearningSet, null, 2));
+    onStatus("Learning set JSON copied to clipboard.");
+  };
+
+  const playGeneratedSetLevelOne = async () => {
+    if (!lastGeneratedPrimaryPackId) {
+      onStatus("Generate a learning set first.");
+      return;
+    }
+    const localRow = rows.find((row) => String(row.id) === String(lastGeneratedPrimaryPackId));
+    if (localRow) {
+      await onPlayPack(localRow);
+      return;
+    }
+    const detail = await API.getVocabularyPack(lastGeneratedPrimaryPackId);
+    const loadedPack = detail?.pack;
+    if (!loadedPack) {
+      onStatus("Generated pack not found.");
+      return;
+    }
+    await onPlayPack({
+      id: String(loadedPack.id),
+      name: String(loadedPack.name || "Generated Pack"),
+      language: String(loadedPack.language || "en"),
+      level: Number(loadedPack.level || 1),
+      type: String(loadedPack.type || "words") as any,
+      status: String(loadedPack.status || "draft") as any,
+      source: String(loadedPack.source || "manual") as any,
+      version: Number(loadedPack.version || 1),
+      entry_count: Number(detail?.entries?.length || 0),
+      generator_config: loadedPack.generator_config || null,
+      metadata: loadedPack.metadata || null,
+      created_at: String(loadedPack.created_at || new Date().toISOString()),
+      updated_at: String(loadedPack.updated_at || new Date().toISOString())
+    });
+  };
+
+  const exportLearningSetFromCurrentPack = async () => {
+    if (!pack) return;
+    const learningSetId = String((pack.metadata as any)?.learningSetId || "").trim();
+    if (!learningSetId) {
+      onStatus("This pack is not linked to a learning set.");
+      return;
+    }
+    const list = await API.listVocabularyPacks({
+      language: pack.language,
+      page: 1,
+      pageSize: 500,
+      sort: "level",
+      order: "asc"
+    });
+    const relatedRows = (list?.rows || [])
+      .filter((row: VocabularyPackRow) => String((row.metadata as any)?.learningSetId || "") === learningSetId)
+      .sort((a: VocabularyPackRow, b: VocabularyPackRow) => Number(a.level || 1) - Number(b.level || 1));
+    if (!relatedRows.length) {
+      onStatus("No related packs found for this learning set.");
+      return;
+    }
+    const details = await Promise.all(relatedRows.map((row: VocabularyPackRow) => API.getVocabularyPack(row.id)));
+    const exportPayload: GeneratedLearningSet = {
+      schemaVersion: "1.0",
+      kind: "ktrain.learningSet",
+      set: ((pack.metadata as any)?.learningSet || {
+        name: `Learning Set ${learningSetId}`,
+        language: String(pack.language || "en").toUpperCase(),
+        topic: "custom",
+        script: "latin",
+        seed: learningSetId,
+        constraints: {
+          allowedChars: "",
+          disallowedChars: "",
+          includeDiacritics: false
+        },
+        levels: relatedRows.map((row: VocabularyPackRow) => Number(row.level || 1)),
+        generatedAt: new Date().toISOString()
+      }) as any,
+      packs: details.map((detail: any) => {
+        const detailPack = detail?.pack || {};
+        return {
+          name: String(detailPack.name || "Pack"),
+          language: String(detailPack.language || "en"),
+          level: Number(detailPack.level || 1),
+          type: String(detailPack.type || "words") as LearningSetLevelType,
+          status: String(detailPack.status || "draft") as "draft" | "published",
+          entries: (detail?.entries || []).map((entry: any) => String(entry.text || "")).filter(Boolean),
+          meta: {
+            notes: String((detailPack.metadata as any)?.notes || ""),
+            tags: Array.isArray((detailPack.metadata as any)?.tags) ? (detailPack.metadata as any).tags : []
+          }
+        };
+      }),
+      report: {}
+    };
+    setLastGeneratedLearningSet(exportPayload);
+    await navigator.clipboard.writeText(JSON.stringify(exportPayload, null, 2));
+    onStatus(`Learning set JSON copied (${relatedRows.length} packs).`);
   };
 
   const closeNewWizard = () => {
@@ -4974,6 +5264,13 @@ function VocabularyCenterScreen({
                 <Button variant="light" onClick={() => void exportPack()}>Export JSON</Button>
                 <Button
                   variant="light"
+                  onClick={() => void exportLearningSetFromCurrentPack()}
+                  disabled={!String((pack.metadata as any)?.learningSetId || "").trim()}
+                >
+                  Export Set JSON
+                </Button>
+                <Button
+                  variant="light"
                   onClick={async () => {
                     const shareUrl = `${window.location.origin}/admin/vocabulary?packId=${pack.id}`;
                     await navigator.clipboard.writeText(shareUrl);
@@ -5134,6 +5431,9 @@ function VocabularyCenterScreen({
         </div>
         <Group>
           <Button onClick={openNewWizard}>New Pack</Button>
+          <Button variant="light" onClick={openLearningSetWizard}>Generate Learning Set ✨</Button>
+          <Button variant="light" onClick={() => void copyGeneratedLearningSet()} disabled={!lastGeneratedLearningSet}>Export Last Set JSON</Button>
+          <Button variant="light" onClick={() => void playGeneratedSetLevelOne()} disabled={!lastGeneratedPrimaryPackId}>Play L1 Now</Button>
           <Button variant="light" onClick={() => setShowImportPanel((v) => !v)}>Import JSON</Button>
           <Button variant="light" onClick={onBack}>Back</Button>
         </Group>
@@ -5156,10 +5456,11 @@ function VocabularyCenterScreen({
           <Button variant="default" onClick={() => setShowAdvancedFilters(true)}>Advanced filters</Button>
           <SegmentedControl
             value={workspaceMode}
-            onChange={(value) => setWorkspaceMode((value as "studio" | "table") || "studio")}
+            onChange={(value) => setWorkspaceMode((value as VocabWorkspaceMode) || "studio")}
             data={[
               { value: "studio", label: "Studio" },
-              { value: "table", label: "Table" }
+              { value: "table", label: "Table" },
+              { value: "split", label: "Split", disabled: !splitModeEnabled }
             ]}
           />
         </Group>
@@ -5204,28 +5505,201 @@ function VocabularyCenterScreen({
         </div>
       </Modal>
 
-      <Modal opened={showImportPanel} onClose={() => setShowImportPanel(false)} title="Import Pack JSON" size="xl" centered>
+      <Modal
+        opened={showLearningSetWizard}
+        onClose={() => setShowLearningSetWizard(false)}
+        title="Generate Learning Set ✨"
+        size="xl"
+        centered
+      >
+        <div className="vocab-create-wizard">
+          <Text size="sm" c="dimmed">Step {learningSetStep} of 3</Text>
+          {learningSetStep === 1 && (
+            <Stack>
+              <div className="vocab-form-grid">
+                <TextInput
+                  label="Set name"
+                  value={learningSetConfig.name}
+                  onChange={(e) => setLearningSetConfig((prev) => ({ ...prev, name: e.currentTarget.value }))}
+                  placeholder="Animals EN Set"
+                />
+                <Select
+                  label="Language"
+                  value={learningSetConfig.language}
+                  onChange={(v) => setLearningSetConfig((prev) => ({ ...prev, language: (v || "en").toLowerCase() }))}
+                  data={[{ value: "en", label: "EN" }, { value: "ru", label: "RU" }, { value: "uz", label: "UZ" }]}
+                />
+                <Select
+                  label="Topic"
+                  value={learningSetConfig.topic}
+                  onChange={(v) => setLearningSetConfig((prev) => ({ ...prev, topic: (v as any) || "animals" }))}
+                  data={[
+                    { value: "animals", label: "Animals" },
+                    { value: "food", label: "Food" },
+                    { value: "colors", label: "Colors" },
+                    { value: "alphabet", label: "Alphabet" },
+                    { value: "phonics", label: "Phonics" },
+                    { value: "custom", label: "Custom" }
+                  ]}
+                />
+                <Select
+                  label="Script"
+                  value={learningSetConfig.script}
+                  onChange={(v) => setLearningSetConfig((prev) => ({ ...prev, script: (v as any) || "latin" }))}
+                  data={[
+                    { value: "latin", label: "Latin" },
+                    { value: "cyrillic", label: "Cyrillic" },
+                    { value: "custom", label: "Custom alphabet" }
+                  ]}
+                />
+                {learningSetConfig.script === "custom" && (
+                  <TextInput
+                    label="Custom alphabet"
+                    value={learningSetConfig.customAlphabet}
+                    onChange={(e) => setLearningSetConfig((prev) => ({ ...prev, customAlphabet: e.currentTarget.value }))}
+                    placeholder="abc..."
+                  />
+                )}
+                <TextInput
+                  label="Seed (optional)"
+                  value={learningSetConfig.seed}
+                  onChange={(e) => setLearningSetConfig((prev) => ({ ...prev, seed: e.currentTarget.value }))}
+                  placeholder="deterministic-seed"
+                />
+                <TextInput
+                  label="Allowed chars (optional)"
+                  value={learningSetConfig.allowedChars}
+                  onChange={(e) => setLearningSetConfig((prev) => ({ ...prev, allowedChars: e.currentTarget.value }))}
+                />
+                <TextInput
+                  label="Disallowed chars (optional)"
+                  value={learningSetConfig.disallowedChars}
+                  onChange={(e) => setLearningSetConfig((prev) => ({ ...prev, disallowedChars: e.currentTarget.value }))}
+                />
+              </div>
+              <Group>
+                {[1, 2, 3, 4, 5].map((level) => (
+                  <Checkbox
+                    key={level}
+                    label={`L${level}`}
+                    checked={learningSetConfig.levels.includes(level)}
+                    onChange={(e) => toggleLearningSetLevel(level, e.currentTarget.checked)}
+                  />
+                ))}
+              </Group>
+              <Group>
+                <Select
+                  label="Level 5 type"
+                  value={learningSetConfig.levelTypeOverrides[5] || "sentences"}
+                  onChange={(v) => setLearningSetLevelType(5, (v as LearningSetLevelType) || "sentences")}
+                  data={[
+                    { value: "sentences", label: "Sentences" },
+                    { value: "words", label: "Words" }
+                  ]}
+                />
+                <Switch
+                  mt={24}
+                  label="Include diacritics"
+                  checked={learningSetConfig.includeDiacritics}
+                  onChange={(e) => setLearningSetConfig((prev) => ({ ...prev, includeDiacritics: e.currentTarget.checked }))}
+                />
+                <Switch
+                  mt={24}
+                  label="Auto publish"
+                  checked={learningSetConfig.autoPublish}
+                  onChange={(e) => setLearningSetConfig((prev) => ({ ...prev, autoPublish: e.currentTarget.checked }))}
+                />
+              </Group>
+              {learningSetErrors.length > 0 && (
+                <Alert color="red" title="Please fix the following">
+                  {learningSetErrors.map((error) => <div key={error}>{error}</div>)}
+                </Alert>
+              )}
+            </Stack>
+          )}
+
+          {learningSetStep === 2 && (
+            <Stack>
+              <Alert color="blue" title="Preview plan">
+                {normalizeLearningSetLevels(learningSetConfig.levels).map((level) => (
+                  <div key={level}>
+                    Level {level}: {learningSetPlan.countsByLevel[level] || 0} items, type {learningSetConfig.levelTypeOverrides[level] || "words"}
+                  </div>
+                ))}
+              </Alert>
+              <Card withBorder>
+                <Stack gap={8}>
+                  {normalizeLearningSetLevels(learningSetConfig.levels).map((level) => (
+                    <div key={`sample-${level}`}>
+                      <Text fw={700}>L{level} samples</Text>
+                      <Text size="sm" c="dimmed">{(learningSetPlan.sampleByLevel[level] || []).join(" • ") || "—"}</Text>
+                    </div>
+                  ))}
+                </Stack>
+              </Card>
+            </Stack>
+          )}
+
+          {learningSetStep === 3 && (
+            <Stack>
+              <Alert color="green" title="Ready to generate">
+                This will create {normalizeLearningSetLevels(learningSetConfig.levels).length} packs for levels {normalizeLearningSetLevels(learningSetConfig.levels).join(", ")}.
+              </Alert>
+              <Text size="sm" c="dimmed">
+                Output schema: <code>ktrain.learningSet@1.0</code>. Packs are created as {learningSetConfig.autoPublish ? "published" : "draft"}.
+              </Text>
+            </Stack>
+          )}
+
+          <Group mt="sm">
+            <Button variant="default" disabled={learningSetStep <= 1 || learningSetBusy} onClick={() => setLearningSetStep((prev) => Math.max(1, prev - 1))}>Back</Button>
+            {learningSetStep < 3 ? (
+              <Button onClick={goNextLearningSetStep} disabled={learningSetBusy}>Next</Button>
+            ) : (
+              <Button onClick={() => void completeLearningSetWizard()} loading={learningSetBusy}>Generate Set</Button>
+            )}
+          </Group>
+        </div>
+      </Modal>
+
+      <Modal opened={showImportPanel} onClose={() => setShowImportPanel(false)} title="Import JSON" size="xl" centered>
         <div className="vocab-import-panel">
-          <Textarea label="Import pack JSON" value={importJson} onChange={(e) => { setImportErrors([]); setImportJson(e.currentTarget.value); }} minRows={8} />
+          <Textarea label="Import JSON (single pack or learning set)" value={importJson} onChange={(e) => { setImportErrors([]); setImportJson(e.currentTarget.value); }} minRows={8} />
           <Switch
             mt="sm"
             label="Import as Draft"
             checked={importAsDraft}
             onChange={(e) => setImportAsDraft(e.currentTarget.checked)}
           />
-          {importPreview && !importPreview.ok && (
+          {importLearningSetPreview && !importLearningSetPreview.ok && (
             <Alert mt="sm" color="red" title="Import validation failed">
-              {importPreview.errors.map((error) => <div key={error}>{error}</div>)}
+              {importLearningSetPreview.errors.map((error) => <div key={error}>{error}</div>)}
             </Alert>
           )}
-          {importPreview && importPreview.ok && (
-            <Alert mt="sm" color="green" title="Import preview">
-              <div><strong>Name:</strong> {importPreview.preview.name}</div>
-              <div><strong>Language:</strong> {importPreview.preview.language.toUpperCase()}</div>
-              <div><strong>Level:</strong> {importPreview.preview.level}</div>
-              <div><strong>Type:</strong> {importPreview.preview.type}</div>
-              <div><strong>Status:</strong> {importPreview.preview.status}</div>
-              <div><strong>Entries:</strong> {importPreview.preview.entryCount}</div>
+          {importLearningSetPreview && importLearningSetPreview.ok && (
+            <Alert mt="sm" color="green" title="Learning set preview">
+              <div><strong>Name:</strong> {importLearningSetPreview.preview.name}</div>
+              <div><strong>Language:</strong> {importLearningSetPreview.preview.language}</div>
+              <div><strong>Topic:</strong> {importLearningSetPreview.preview.topic}</div>
+              <div><strong>Script:</strong> {importLearningSetPreview.preview.script}</div>
+              <div><strong>Levels:</strong> {importLearningSetPreview.preview.levels.join(", ")}</div>
+              <div><strong>Packs:</strong> {importLearningSetPreview.preview.packs}</div>
+              <div><strong>Total entries:</strong> {importLearningSetPreview.preview.entries}</div>
+            </Alert>
+          )}
+          {!importLearningSetPreview && importPackPreview && !importPackPreview.ok && (
+            <Alert mt="sm" color="red" title="Import validation failed">
+              {importPackPreview.errors.map((error) => <div key={error}>{error}</div>)}
+            </Alert>
+          )}
+          {!importLearningSetPreview && importPackPreview && importPackPreview.ok && (
+            <Alert mt="sm" color="green" title="Pack preview">
+              <div><strong>Name:</strong> {importPackPreview.preview.name}</div>
+              <div><strong>Language:</strong> {importPackPreview.preview.language.toUpperCase()}</div>
+              <div><strong>Level:</strong> {importPackPreview.preview.level}</div>
+              <div><strong>Type:</strong> {importPackPreview.preview.type}</div>
+              <div><strong>Status:</strong> {importPackPreview.preview.status}</div>
+              <div><strong>Entries:</strong> {importPackPreview.preview.entryCount}</div>
             </Alert>
           )}
           {importErrors.length > 0 && (
@@ -5234,7 +5708,13 @@ function VocabularyCenterScreen({
             </Alert>
           )}
           <Group mt="sm">
-            <Button variant="light" onClick={() => void importPack()} disabled={Boolean(importPreview && !importPreview.ok)}>Import JSON</Button>
+            <Button
+              variant="light"
+              onClick={() => void importPack()}
+              disabled={Boolean(importLearningSetPreview && !importLearningSetPreview.ok) || Boolean(!importLearningSetPreview && importPackPreview && !importPackPreview.ok)}
+            >
+              Import JSON
+            </Button>
           </Group>
         </div>
       </Modal>
@@ -5270,13 +5750,16 @@ function VocabularyCenterScreen({
       <div
         ref={containerRef}
         className="vocab-layout"
-        style={!isMobile ? {
-          gridTemplateColumns: inspectorMaximized
-            ? `minmax(220px, ${leftPanePercent}%) minmax(0, ${100 - leftPanePercent}%)`
-            : workspaceMode === "table"
-              ? `minmax(220px, ${leftPanePercent}%) 10px minmax(0, ${100 - leftPanePercent - rightPanePercent}%) 10px minmax(320px, ${rightPanePercent}%)`
-              : `minmax(220px, ${leftPanePercent}%) 10px minmax(320px, ${100 - leftPanePercent}%)`
-        } : undefined}
+        style={{
+          gridTemplateColumns: computeVocabularyGridTemplate({
+            mode: effectiveWorkspaceMode,
+            viewportWidth,
+            isMobile,
+            leftPanePercent,
+            rightPanePercent,
+            inspectorMaximized
+          })
+        }}
       >
         {(!isMobile || mobileTab === "tree") && renderTreePanel}
         {!isMobile && !inspectorMaximized && (
@@ -5288,8 +5771,8 @@ function VocabularyCenterScreen({
             tabIndex={0}
           />
         )}
-        {((isMobile && mobileTab === "table") || (!isMobile && !inspectorMaximized && workspaceMode === "table")) && renderTablePanel}
-        {!isMobile && !inspectorMaximized && workspaceMode === "table" && (
+        {((isMobile && mobileTab === "table") || (!isMobile && !inspectorMaximized && (effectiveWorkspaceMode === "table" || effectiveWorkspaceMode === "split"))) && renderTablePanel}
+        {!isMobile && !inspectorMaximized && effectiveWorkspaceMode === "split" && (
           <div
             className="vocab-resizer"
             onMouseDown={(e) => startResize("right", e.clientX)}
@@ -5298,7 +5781,7 @@ function VocabularyCenterScreen({
             tabIndex={0}
           />
         )}
-        {(!isMobile || mobileTab === "inspector") && renderInspectorPanel}
+        {((isMobile && mobileTab === "inspector") || (!isMobile && (effectiveWorkspaceMode === "studio" || effectiveWorkspaceMode === "split"))) && renderInspectorPanel}
       </div>
     </div>
   );

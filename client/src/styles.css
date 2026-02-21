@@ -1000,12 +1000,13 @@ input, select, textarea {
 }
 
 .vocab-center-screen {
+  width: 100%;
   align-items: stretch;
   gap: 12px;
 }
 
 .vocab-toolbar {
-  width: min(1480px, 98vw);
+  width: 100%;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1031,7 +1032,7 @@ input, select, textarea {
 }
 
 .vocab-toolbar-controls {
-  width: min(1480px, 98vw);
+  width: 100%;
   display: flex;
   align-items: end;
   justify-content: space-between;
@@ -1056,7 +1057,7 @@ input, select, textarea {
 }
 
 .vocab-layout {
-  width: min(1480px, 98vw);
+  width: 100%;
   display: grid;
   gap: 10px;
   align-items: start;
